@@ -1,0 +1,62 @@
+# Al pushear un tag "v*" (p. ej. v0.1.0), compila el instalador NSIS de SaurioLLM en Windows y lo sube
+# como asset al Release de ese tag. No usa más secreto que el GITHUB_TOKEN que Actions provee solo
+# (permissions: contents: write, más abajo) — no hace falta configurar nada en el repo para que esto
+# corra.
+#
+# El instalador que sube este workflow NO está firmado digitalmente (no hay certificado de firma de
+# código): quien lo baje de Releases va a ver el aviso de Windows SmartScreen documentado en
+# docs/INSTALAR.md. Es esperable para un proyecto sin ese certificado (pago), no un error del workflow.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Habilitar Corepack (pnpm vía corepack, sin instalar una versión aparte)
+        run: corepack enable
+
+      - name: Instalar pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.33.0"
+
+      - name: Instalar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.14.1"
+          cache: "pnpm"
+
+      - name: Instalar dependencias (pnpm install)
+        run: pnpm install --frozen-lockfile
+
+      - name: Compilar main/preload/renderer
+        run: pnpm build
+
+      - name: Verificar tipos y tests antes de empaquetar
+        run: |
+          pnpm typecheck
+          pnpm test
+
+      - name: Empaquetar (carpeta desempaquetada + instalador NSIS x64)
+        run: pnpm --filter @saurio/desktop run build:installer
+
+      - name: Subir instalador al Release del tag
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apps/desktop/release/SaurioLLM Setup *.exe
+            apps/desktop/release/SaurioLLM Setup *.exe.blockmap
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,198 @@
+// Mapa channel -> { input, output } (zod) — fuente de verdad de IPC. packages/shared/src/ipc.ts.
+// Define: doc 04 §16. Canales sin comentario de versión son MVP; `// v0.2` / `// v0.3` quedan
+// tipados (para que el resto del monorepo compile contra ellos) pero sin handler real todavía
+// (principio 8 de la columna vertebral).
+import { z } from 'zod';
+import { Mode } from './enums.js';
+import {
+  ProjectSchema, ChatSchema, ChatMessageSchema, ToolCallRecordSchema, CheckpointSchema, TaskSchema,
+  ModelRefSchema, ModelInfoSchema, ModelDescriptionSchema, LoadedModelSchema, MemoryEstimateSchema,
+  DiffResultSchema, RevertPlanSchema, RevertResultSchema, PermissionAnswerSchema, PermissionRequestSchema, ProviderHealthSchema,
+  MetricsSnapshotSchema, BenchmarkConfigSchema, BenchmarkRunSchema, ProfileSchema,
+  FileTreeNodeSchema, FileReadResultSchema, ModelsFolderInfoSchema,
+  CatalogItemSchema, RecommendationSchema, DownloadJobSchema,
+  ProviderConfigSchema, ProviderPresetSchema, ProviderTestResultSchema, NonLocalCallAuditEntrySchema,
+} from './domain.js';
+import { RunEventSchema } from './events.js';
+
+const ChatHistorySchema = z.object({
+  messages: z.array(ChatMessageSchema),
+  toolCalls: z.array(ToolCallRecordSchema),
+  checkpoints: z.array(CheckpointSchema),
+  tasks: z.array(TaskSchema),
+});
+
+const BenchRequestSchema = z.object({
+  suiteId: z.string(), modelRef: ModelRefSchema, config: BenchmarkConfigSchema,
+});
+
+/** Canal de prueba usado por el smoke test del scaffolding (renderer -> main -> renderer, doc 02
+ *  §1). No forma parte del contrato del doc 04 §16; se mantiene además de los canales del doc 04
+ *  ("todos los canales del doc 04" no implica "solo esos") para no romper apps/desktop, que no es
+ *  un directorio de esta tarea (regla "tocá solo los directorios que te asigna tu tarea"). */
+const AppPingInputSchema = z.object({ sentAt: z.number() });
+const AppPingOutputSchema = z.object({
+  pong: z.literal(true),
+  receivedAt: z.number(),
+  versions: z.object({ node: z.string(), electron: z.string(), chrome: z.string() }),
+});
+
+export const ipc = {
+  'app:ping':               { input: AppPingInputSchema, output: AppPingOutputSchema },
+  // Asistente de primer arranque (punto 5 del encargo): "abre la descarga oficial de Ollama con
+  // consentimiento explícito" — el consentimiento se pide en la UI (OnboardingWizard) ANTES de
+  // invocar esto; este canal solo hace `shell.openExternal(url)`, nunca descarga ni ejecuta nada.
+  'app:openExternal':       { input: z.object({ url: z.string().url() }), output: z.void() },
+  'project:open':          { input: z.object({ path: z.string().optional() }), output: ProjectSchema },
+  'project:list':          { input: z.void(), output: z.array(ProjectSchema) },
+  // `confirmed`: mismo mecanismo que `chat:setModel` (frontera local/nube, punto 4 del encargo) —
+  // crear un chat nuevo directamente con un modelRef NUBE es otra forma de "elegir un modelo NUBE
+  // para un chat", así que pasa por la misma confirmación explícita la primera vez por proyecto.
+  'chat:create':           { input: z.object({ projectId: z.string(), agentId: z.string(), mode: Mode, modelRef: ModelRefSchema, confirmed: z.boolean().optional() }), output: ChatSchema },
+  'chat:list':             { input: z.object({ projectId: z.string() }), output: z.array(ChatSchema) },
+  'chat:history':          { input: z.object({ chatId: z.string() }), output: ChatHistorySchema },
+  // Cambiar modelo/modo de un chat existente (punto 3 del encargo; doc 04 §16 no traía este canal
+  // porque el MVP fijaba modelo/modo al crear el chat — `chats.model_ref_json`/`chats.mode` son
+  // columnas mutables desde el principio, así que no hace falta migración nueva).
+  // `confirmed` (punto 4 del encargo, frontera local/nube): obligatorio implícito para un modelRef
+  // NUBE la primera vez por proyecto — el handler devuelve `CloudConfirmationRequiredError` si falta
+  // y el modelo no es local; la UI lo captura, muestra el diálogo de confirmación explícito ("el
+  // contenido de este chat saldrá de tu PC hacia <proveedor>") y reintenta con `confirmed: true`, que
+  // además persiste el consentimiento del proyecto (`settings` scope `project`, key
+  // `providers.cloudConsent`) para no volver a preguntar. Sin efecto para modelos `local`.
+  'chat:setModel':         { input: z.object({ chatId: z.string(), modelRef: ModelRefSchema, confirmed: z.boolean().optional() }), output: ChatSchema },
+  'chat:setMode':          { input: z.object({ chatId: z.string(), mode: Mode }), output: ChatSchema },
+  'run:start':             { input: z.object({ chatId: z.string(), text: z.string(), mode: Mode }), output: z.object({ runId: z.string() }) },
+  'run:cancel':            { input: z.object({ runId: z.string() }), output: z.void() },
+  'run:continue':          { input: z.object({ runId: z.string(), extraIterations: z.number().optional() }), output: z.object({ runId: z.string() }) },
+  'permission:answer':     { input: PermissionAnswerSchema, output: z.void() },
+  'checkpoint:list':       { input: z.object({ chatId: z.string() }), output: z.array(CheckpointSchema) },
+  'checkpoint:diff':       { input: z.object({ checkpointId: z.string(), relPath: z.string() }), output: DiffResultSchema },
+  'checkpoint:planRevert': { input: z.object({ checkpointIds: z.array(z.string()) }), output: RevertPlanSchema },
+  'checkpoint:revert':     { input: z.object({ checkpointIds: z.array(z.string()), resolution: z.record(z.string(), z.enum(['restore', 'keep_mine', 'skip'])) }), output: RevertResultSchema },  // zod 4.6.5: z.record exige key+value schema
+  'models:list':           { input: z.object({ refresh: z.boolean().optional() }), output: z.array(ModelInfoSchema) },
+  'models:loaded':         { input: z.void(), output: z.array(LoadedModelSchema) },
+  'models:describe':       { input: z.object({ ref: ModelRefSchema }), output: ModelDescriptionSchema },
+  'models:fits':           { input: z.object({ ref: ModelRefSchema, numCtx: z.number() }), output: MemoryEstimateSchema },
+  'models:pull':           { input: z.object({ name: z.string() }), output: z.object({ downloadId: z.string() }) },
+  'models:pullCancel':     { input: z.object({ downloadId: z.string() }), output: z.void() },
+  'models:delete':         { input: z.object({ name: z.string() }), output: z.void() },
+  'models:folderInfo':     { input: z.void(), output: ModelsFolderInfoSchema },
+  // Centro de modelos v0.2/v0.3 (doc 13 §10): pestañas "Explorar" y "Recomendaciones". No estaban en
+  // la tabla de canales de spine §5 (el catálogo curado es posterior a ese documento); se agregan acá
+  // porque el Centro de modelos (mi zona) es el único consumidor.
+  'models:catalog':        { input: z.void(), output: z.array(CatalogItemSchema) },
+  'models:recommend':      { input: z.object({ use: z.enum(['coding', 'chat', 'analysis', 'vision']), goal: z.enum(['speed', 'quality']) }), output: z.array(RecommendationSchema) },
+  'models:downloads':      { input: z.void(), output: z.array(DownloadJobSchema) },
+  'provider:health':       { input: z.void(), output: z.array(ProviderHealthSchema) },
+  // Ajustes > Proveedores (punto 3 del encargo, doc 18 §3 "qué necesita el host"): CRUD sobre la
+  // tabla `providers` (ya existía, doc 03) + almacén seguro de claves (Electron `safeStorage`, punto 1)
+  // + `health()`/`listModels()` real contra el provider recién agregado ("probar conexión").
+  'providers:list':        { input: z.void(), output: z.array(ProviderConfigSchema) },
+  'providers:add':         {
+    input: z.object({
+      preset: ProviderPresetSchema, label: z.string(), baseUrl: z.string(),
+      apiKey: z.string().optional(), headers: z.record(z.string(), z.string()).optional(),
+    }),
+    output: ProviderConfigSchema,
+  },
+  'providers:update':      {
+    input: z.object({
+      id: z.string(), label: z.string().optional(), baseUrl: z.string().optional(),
+      enabled: z.boolean().optional(),
+      // string: reemplaza la clave guardada; null: la borra del almacén seguro; undefined: no la toca.
+      apiKey: z.string().nullable().optional(),
+      headers: z.record(z.string(), z.string()).optional(),
+    }),
+    output: ProviderConfigSchema,
+  },
+  'providers:remove':      { input: z.object({ id: z.string() }), output: z.void() },
+  'providers:test':        { input: z.object({ id: z.string() }), output: ProviderTestResultSchema },
+  // Punto 4 del encargo ("visor simple del audit_log de llamadas no locales en Ajustes >
+  // Proveedores"): `SqlAuditLogRepository.listNonLocalCalls()` ya existía y ya estaba probado
+  // (doc 16 §10.9, "listo para un canal futuro si hace falta") — este es ese canal.
+  'providers:auditLog':    { input: z.void(), output: z.array(NonLocalCallAuditEntrySchema) },
+  // Punto 5 del encargo ("reanudar permisos pendientes tras reinicio... tarjeta de permiso
+  // rehidratada"): al abrir un proyecto (o al arrancar la app con un proyecto ya activo), la UI llama
+  // esto para repoblar `PermissionCard` con lo que quedó `awaiting_permission` de una sesión anterior
+  // — sin esto, la tarjeta solo aparecía si el evento `tool.permission` llegaba en vivo (doc 10 §5.2).
+  'permission:pending':    { input: z.void(), output: z.array(z.object({ runId: z.string(), chatId: z.string(), request: PermissionRequestSchema })) },
+  // Árbol de archivos del proyecto, perezoso por carpeta (punto 1 del encargo; doc 16 §11: canal
+  // que faltaba en este contrato, FilesPanel lo invocaba con invokeRaw y se degradaba).
+  'files:tree':            { input: z.object({ projectId: z.string(), relPath: z.string().optional() }), output: z.array(FileTreeNodeSchema) },
+  'files:read':            { input: z.object({ projectId: z.string(), relPath: z.string() }), output: FileReadResultSchema },
+  'terminal:create':       { input: z.object({ projectId: z.string(), shell: z.string().optional() }), output: z.object({ terminalId: z.string() }) },
+  'terminal:resize':       { input: z.object({ terminalId: z.string(), cols: z.number(), rows: z.number() }), output: z.void() },
+  'terminal:close':        { input: z.object({ terminalId: z.string() }), output: z.void() },
+  'metrics:snapshot':      { input: z.void(), output: MetricsSnapshotSchema },
+  // Doc 14 §6/§8: "metrics:tick... solo mientras el panel está abierto" — el renderer avisa acá
+  // cuando el Panel de rendimiento se monta/desmonta para que main arranque/pare el muestreo
+  // continuo (v0.2); no existía un canal para esto, `perfStore.setPanelOpen` solo tocaba estado local.
+  'metrics:setPanelOpen':  { input: z.object({ open: z.boolean() }), output: z.void() },
+  'settings:get':          { input: z.object({ key: z.string(), projectId: z.string().optional() }), output: z.unknown() },
+  'settings:set':          { input: z.object({ key: z.string(), value: z.unknown(), projectId: z.string().optional() }), output: z.void() },
+  'bench:run':             { input: BenchRequestSchema, output: z.object({ benchmarkRunId: z.string() }) },   // v0.3
+  'bench:cancel':          { input: z.object({ benchmarkRunId: z.string() }), output: z.void() },             // v0.3
+  'bench:list':            { input: z.object({ modelName: z.string().optional() }), output: z.array(BenchmarkRunSchema) },  // v0.3
+  'profiles:list':         { input: z.object({ projectId: z.string().optional() }), output: z.array(ProfileSchema) },  // v0.2
+  'profiles:save':         { input: ProfileSchema, output: ProfileSchema },                                    // v0.2
+  'profiles:setDefault':   { input: z.object({ projectId: z.string(), profileId: z.string() }), output: z.void() },  // v0.2
+} as const;
+
+export type IpcChannel = keyof typeof ipc;
+export type IpcInput<C extends IpcChannel> = z.infer<(typeof ipc)[C]['input']>;
+export type IpcOutput<C extends IpcChannel> = z.infer<(typeof ipc)[C]['output']>;
+
+/** Alias retrocompatible con el scaffolding (`ipcContract`/`IpcContract`) del smoke test de
+ *  apps/desktop; `ipc`/`IpcChannel`/`IpcInput`/`IpcOutput` (arriba) son los nombres canónicos del
+ *  doc 04 §16 y lo que debe importar código nuevo. */
+export const ipcContract = ipc;
+export type IpcContract = typeof ipc;
+
+// Eventos main -> renderer (webContents.send), sin invoke/response:
+export interface RendererEvents {
+  'runtime:event': z.infer<typeof RunEventSchema>[];                          // batched cada 30 ms
+  'models:changed': { installed: z.infer<typeof ModelInfoSchema>[]; loaded: z.infer<typeof LoadedModelSchema>[] };
+  'download:progress': z.infer<typeof DownloadJobSchema>;
+  'download:done': z.infer<typeof DownloadJobSchema>;
+  'download:failed': { downloadId: string; error: string };
+  'metrics:tick': z.infer<typeof MetricsSnapshotSchema>;                        // solo con el panel de rendimiento abierto
+  'provider:health': { providerId: string; ok: boolean; version?: string; error?: string };
+  'bench:progress': { benchmarkRunId: string; taskId: string; completed: number; total: number };  // v0.3
+  'bench:done': { benchmarkRunId: string; result: z.infer<typeof BenchmarkRunSchema> };             // v0.3
+  'bench:failed': { benchmarkRunId: string; error: string };                     // v0.3
+  // fs.watch sobre la raíz del proyecto abierto (punto 1 del encargo, "modificado externamente"):
+  // se emite cuando un archivo cambia en disco por fuera de una escritura hecha por una tool de
+  // SaurioLLM; `relPath` en POSIX, relativo a la raíz del proyecto.
+  'files:changed': { projectId: string; relPath: string; kind: 'modified' | 'removed' };
+  // el puerto de datos de la terminal NO viaja por acá: ver 'terminal:port' más abajo
+}
+
+/** Firma de registerHandler en main: valida input con zod, ejecuta y valida output antes de
+ *  responder; valida además event.senderFrame contra el BrowserWindow dueño de la sesión
+ *  [VERIFICADO EN DOC OFICIAL: electronjs.org/docs/latest/tutorial/security]. */
+export type IpcHandler<C extends IpcChannel> = (input: IpcInput<C>, meta: { senderFrame: unknown }) => Promise<IpcOutput<C>>;
+
+export declare function registerHandler<C extends IpcChannel>(channel: C, handler: IpcHandler<C>): void;
+
+/** MessagePort de Electron/DOM; packages/shared no incluye lib DOM (doc 02 §4.2, tsconfig "Node
+ *  puro, sin DOM ni Electron"), así que se tipa acá con la forma mínima que necesita el preload
+ *  real. `apps/desktop/src/preload` sí tiene lib DOM y su `MessagePort` nativo es estructuralmente
+ *  compatible con esta interfaz — ver doc 04, Desvíos §5. */
+export interface MessagePortLike {
+  postMessage(message: unknown, transfer?: unknown[]): void;
+  start(): void;
+  close(): void;
+}
+
+/** Firma expuesta por el preload vía contextBridge; el renderer nunca ve ipcRenderer crudo.
+ *  `terminalPort` NO puede devolver un `MessagePort` como valor de retorno síncrono de una
+ *  función de contextBridge [VERIFICADO EN DOC OFICIAL: electronjs.org/docs/latest/tutorial/message-ports].
+ *  Contrato real: `terminal:create` (invoke) da `{ terminalId }`; main crea el canal con
+ *  `MessageChannelMain` y hace `webContents.postMessage('terminal:port', { terminalId }, [port1])`;
+ *  el preload escucha ese canal, guarda `event.ports[0]` y lo reexpone acá vía `onTerminalPort`. */
+export interface PreloadApi {
+  invoke<C extends IpcChannel>(channel: C, input: IpcInput<C>): Promise<IpcOutput<C>>;
+  onEvent<E extends keyof RendererEvents>(channel: E, cb: (payload: RendererEvents[E]) => void): () => void;
+  onTerminalPort(cb: (terminalId: string, port: MessagePortLike) => void): () => void;
+}

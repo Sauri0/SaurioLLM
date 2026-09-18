@@ -1,0 +1,62 @@
+# Config de empaquetado de SaurioLLM (doc 02 §4.4, doc 01 §5).
+#
+# Se invoca SIEMPRE desde apps/desktop (pnpm --filter @saurio/desktop run build:installer, que corre
+# `electron-builder --config ../../electron-builder.yml` con cwd=apps/desktop): electron-builder toma
+# ese cwd como projectDir/appDir, así que TODAS las rutas de este archivo (files, extraResources.from,
+# directories.buildResources) son relativas a apps/desktop, no a la raíz del repo. Antes de este arreglo
+# `files` apuntaba a "apps/desktop/out/**/*" (buscaba apps/desktop/apps/desktop/out, que no existe) y
+# `extraResources.from` a "resources/model-catalog.json" (buscaba apps/desktop/resources/..., que
+# tampoco existe) — de ahí el "Application entry file ... was not found in this archive".
+appId: com.saurio.desktop
+productName: SaurioLLM
+directories:
+  # Relativos a apps/desktop (projectDir): output aterriza en apps/desktop/release (pedido explícito),
+  # buildResources en apps/desktop/build (no existe todavía — sin ícono propio, ver nsis abajo).
+  output: release
+  buildResources: build
+# No hay toolset C++ (MSVC) instalado en las máquinas de build: better-sqlite3 y node-pty traen
+# prebuilds N-API bundleados (prebuilds/win32-x64.node) que YA funcionan con el ABI de Electron 44 sin
+# recompilar. Con npmRebuild en true (default), electron-builder corre @electron/rebuild igual, y si
+# algún día un módulo no trae prebuild para esa versión de Electron, cae a node-gyp y rompe el build
+# por falta de MSVC. Se desactiva explícitamente: los prebuilds ya están en node_modules tal cual los
+# instaló pnpm.
+npmRebuild: false
+files:
+  - out/**/*
+extraResources:
+  # Catálogo curado del Centro de modelos (doc 13 §3), grammars de tree-sitter, queries de repo map
+  # y prompts del sistema: ninguno viaja dentro del asar porque se leen en tiempo de ejecución fuera
+  # de app.asar (asar es de solo lectura y algunos de estos paths además los espera código que corre
+  # tests con vitest fuera de Electron). Todos quedan PLANOS bajo resources/ (junto al .exe), un
+  # único destino simple para los cuatro:
+  #  - model-catalog.json y prompts/: `apps/desktop/src/main/services/resources.ts` busca
+  #    `process.resourcesPath + relPath` tal cual (candidatePaths(), sin agregar ningún prefijo).
+  #  - grammars/ y repomap-queries/ (punto 5 del encargo, doc 16): antes `grammars/` quedaba anidado
+  #    como resources/resources/grammars/ porque packages/repomap/src/loader.ts calculaba su ruta
+  #    empaquetada subiendo 3 niveles desde el bundle (out/main/index.js dentro de app.asar) — una
+  #    cuenta frágil que funcionaba por coincidencia aritmética de profundidad, no por diseño (y que
+  #    ni siquiera alcanzaba a `queries/`, que ni se copiaba). Ahora `resolveRepoMapResourceDirs()`
+  #    (apps/desktop/src/main/services/resources.ts) resuelve `process.resourcesPath/grammars` y
+  #    `process.resourcesPath/repomap-queries` directo, y `createRuntime.ts` se lo inyecta a
+  #    @saurio/repomap vía `configureRepoMapResources()` — así que el destino acá es simple y plano.
+  - from: ../../resources/model-catalog.json
+    to: model-catalog.json
+  - from: ../../resources/prompts
+    to: prompts
+  - from: ../../resources/grammars
+    to: grammars
+  - from: ../../packages/repomap/queries
+    to: repomap-queries
+asar: true
+asarUnpack:
+  - "**/*.node"
+  - "node_modules/@vscode/ripgrep*/**"
+  - "**/*.wasm"
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

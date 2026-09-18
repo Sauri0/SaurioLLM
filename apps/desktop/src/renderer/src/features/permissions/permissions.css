@@ -1,0 +1,85 @@
+/* Tarjeta de permiso: destacada pero no agresiva — borde de acento suave según el riesgo, fondo
+   apenas distinto del resto del chat (nunca rojo pleno). Usa los tokens de layout/theme.css. */
+.permission-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warning);
+  background: var(--bg-3);
+  color: var(--text-primary);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-4);
+  margin: var(--space-3) 0;
+  font-size: var(--text-base);
+  box-shadow: var(--shadow-sm);
+}
+.permission-card.risk-high { border-left-color: var(--danger); }
+.permission-card.risk-medium { border-left-color: var(--warning); }
+.permission-card.risk-low { border-left-color: var(--accent); }
+
+.permission-card__header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.permission-card__icon { display: flex; color: var(--warning); }
+.permission-card.risk-high .permission-card__icon { color: var(--danger); }
+.permission-card.risk-low .permission-card__icon { color: var(--accent); }
+.permission-card__category {
+  font-weight: 600;
+  font-size: var(--text-xs);
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  background: var(--bg-4);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.permission-card__category.cat-write,
+.permission-card__category.cat-delete { background: var(--warning-subtle); color: var(--warning); }
+.permission-card__category.cat-terminal { background: var(--accent-subtle); color: var(--accent); }
+.permission-card__category.cat-git_commit,
+.permission-card__category.cat-git_push { background: var(--accent-subtle); color: var(--accent); }
+.permission-card__category.cat-network,
+.permission-card__category.cat-mcp,
+.permission-card__category.cat-delete { background: var(--danger-subtle); color: var(--danger); }
+.permission-card__risk { color: var(--text-muted); font-size: var(--text-sm); }
+.permission-card__warning { color: var(--danger); font-weight: 600; font-size: var(--text-sm); }
+
+.permission-card__summary { font-weight: 500; margin: var(--space-1) 0; }
+.permission-card__triggered-by { color: var(--text-muted); margin: var(--space-1) 0; font-size: var(--text-sm); }
+
+.permission-card__preview { margin: var(--space-2) 0; }
+.permission-card__command,
+.permission-card__diff {
+  background: var(--bg-1);
+  border: 1px solid var(--border-subtle);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  max-height: 160px;
+  overflow-y: auto;
+}
+.permission-card__paths { margin: var(--space-1) 0 0 var(--space-4); font-size: var(--text-sm); font-family: var(--font-mono); }
+
+.permission-card__pattern,
+.permission-card__deny-reason { margin: var(--space-2) 0; display: flex; flex-direction: column; gap: var(--space-1); }
+.permission-card__pattern input,
+.permission-card__deny-reason input {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  padding: 5px 7px;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.permission-card__actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-3);
+}
+.permission-card__actions button { font-size: var(--text-sm); }

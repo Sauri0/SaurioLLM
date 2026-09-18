@@ -1,0 +1,521 @@
+/* Sistema de tokens de diseño + shell de la app (doc 01 §4.1: la UI solo pinta, sin lógica de
+   negocio) — apps/desktop/src/renderer/src/layout/theme.css.
+
+   Pasada de diseño visual: antes cada feature (chat.css, permissions.css, tasks.css) tenía su
+   propia paleta hardcodeada (#17161a, #1d1c21, #201f24…), todas parecidas pero no idénticas. Este
+   archivo es ahora la única fuente de verdad de color/espaciado/tipografía/radios — el resto de los
+   .css del renderer consume estas variables. */
+
+:root {
+  /* Color — superficies (de más oscura/atrás a más clara/arriba) */
+  --bg-0: #131417;         /* fondo de la ventana */
+  --bg-1: #17181c;         /* sidebar, panel derecho, barra de estado */
+  --bg-2: #1c1d22;         /* centro de chat */
+  --bg-3: #232429;         /* tarjetas (tool call, checkpoint, permiso) */
+  --bg-4: #2a2b31;         /* elementos interactivos sobre una tarjeta (inputs, hover) */
+  --bg-overlay: rgba(10, 10, 12, 0.6);
+
+  /* Color — bordes */
+  --border-subtle: #2a2b30;
+  --border: #34363c;
+  --border-strong: #46474f;
+
+  /* Color — texto */
+  --text-primary: #eceef1;
+  --text-secondary: #a8abb3;
+  --text-muted: #74777f;
+  --text-on-accent: #0d1117;
+
+  /* Color — acento y semántica */
+  --accent: #5b9dff;
+  --accent-hover: #7bb0ff;
+  --accent-subtle: rgba(91, 157, 255, 0.14);
+  --success: #4fb473;
+  --success-subtle: rgba(79, 180, 115, 0.14);
+  --warning: #d9a441;
+  --warning-subtle: rgba(217, 164, 65, 0.14);
+  --danger: #e5645c;
+  --danger-subtle: rgba(229, 100, 92, 0.14);
+  --info: #5b9dff;
+
+  /* Tipografía */
+  --font-sans: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'Cascadia Code', 'JetBrains Mono', ui-monospace, 'Consolas', monospace;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --leading-tight: 1.3;
+  --leading-normal: 1.55;
+
+  /* Espaciado — escala de 4px */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Radios */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-full: 999px;
+
+  /* Sombras */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
+
+  /* Foco accesible (AA): anillo de 2px, siempre visible con teclado */
+  --focus-ring: 0 0 0 2px var(--bg-1), 0 0 0 4px var(--accent);
+
+  /* Layout */
+  --sidebar-width: 232px;
+  --right-panel-width: 380px;
+  --statusbar-height: 28px;
+
+  /* Alias retrocompatibles (features todavía no migradas del todo) */
+  --saurio-bg: var(--bg-0);
+  --saurio-bg-alt: var(--bg-1);
+  --saurio-bg-raised: var(--bg-3);
+  --saurio-border: var(--border);
+  --saurio-text: var(--text-primary);
+  --saurio-text-dim: var(--text-secondary);
+  --saurio-accent: var(--accent);
+  --saurio-danger: var(--danger);
+  --saurio-warning: var(--warning);
+  --saurio-ok: var(--success);
+  --saurio-font: var(--font-sans);
+  --saurio-mono: var(--font-mono);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbars finos y oscuros (Chromium/Electron) en toda la app */
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: var(--radius-full); border: 2px solid transparent; background-clip: padding-box; }
+*::-webkit-scrollbar-thumb:hover { background: var(--text-muted); background-clip: padding-box; }
+
+/* Foco visible consistente (accesibilidad: nunca `outline: none` sin reemplazo) */
+:focus { outline: none; }
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-sm);
+}
+
+h1, h2, h3, h4 { margin: 0; font-weight: 600; color: var(--text-primary); }
+
+button {
+  font-family: inherit;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+button:hover:not(:disabled) { background: var(--bg-4); border-color: var(--border-strong); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+button.saurio-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--text-on-accent); font-weight: 600; }
+button.saurio-btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.saurio-btn-danger { color: var(--danger); }
+button.saurio-btn-danger:hover:not(:disabled) { border-color: var(--danger); background: var(--danger-subtle); }
+button.saurio-btn-ghost { background: transparent; border-color: transparent; }
+button.saurio-btn-ghost:hover:not(:disabled) { background: var(--bg-4); }
+
+input[type="text"], input[type="number"], select, textarea {
+  font-family: inherit;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 6px 8px;
+}
+input::placeholder, textarea::placeholder { color: var(--text-muted); }
+label { font-size: var(--text-xs); color: var(--text-secondary); }
+
+code, pre, kbd { font-family: var(--font-mono); }
+kbd {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-4);
+  color: var(--text-secondary);
+}
+
+/* ── Shell de la app: sidebar + centro + panel derecho + barra de estado ─────────────────── */
+
+.saurio-app {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) 1fr var(--right-panel-width);
+  grid-template-rows: 1fr var(--statusbar-height);
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+.saurio-sidebar {
+  grid-row: 1;
+  background: var(--bg-1);
+  border-right: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  /* La lista de chats (`.saurio-sidebar-chats`) es la que scrollea; el proyecto arriba y el bloque
+     "próximo chat" abajo quedan siempre visibles (pasada de diseño #1). */
+  overflow: hidden;
+  padding-bottom: var(--space-3);
+}
+
+.saurio-sidebar h2 {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: var(--space-4) var(--space-3) var(--space-1);
+  margin: 0;
+}
+
+.saurio-sidebar-section {
+  padding: 0 var(--space-2);
+}
+
+.saurio-sidebar-item {
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  color: var(--text-secondary);
+  margin: 1px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.saurio-sidebar-item:hover { background: var(--bg-3); color: var(--text-primary); }
+.saurio-sidebar-item.active { background: var(--accent-subtle); color: var(--text-primary); font-weight: 500; }
+.saurio-sidebar-item__title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.saurio-sidebar-item__badges { display: flex; gap: 4px; overflow: hidden; }
+.saurio-sidebar-item__badges .saurio-badge { margin-left: 0; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+
+.saurio-sidebar-new-chat { width: 100%; }
+
+/* Punto 7 del encargo: reemplazan los `style={{...}}` inline que quedaban en Sidebar.tsx. */
+.saurio-sidebar-open-project-btn { width: 100%; margin-bottom: var(--space-2); }
+.saurio-sidebar-error { margin: 0 var(--space-2); }
+.saurio-sidebar-empty-state { padding: 24px var(--space-3); }
+
+.saurio-sidebar-chats {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 60px;
+}
+
+/* Bloque "próximo chat": fijo abajo de la barra lateral (no scrollea con la lista de chats),
+   compacto — modelo (con badge LOCAL) + modo, para el próximo `chat:create` (pasada de diseño #1). */
+.saurio-sidebar-next-chat {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border-subtle);
+  margin-top: auto;
+  padding-top: var(--space-1);
+}
+.saurio-next-chat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.saurio-next-chat__label {
+  display: flex;
+  align-items: center;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+.saurio-next-chat select {
+  width: 100%;
+  background: var(--bg-1);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 6px;
+  font-size: var(--text-sm);
+}
+
+.saurio-project-card {
+  margin: 0 var(--space-2) var(--space-2);
+  padding: var(--space-2) var(--space-2);
+  border-radius: var(--radius-md);
+  background: var(--bg-3);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.saurio-project-card__icon { flex: 0 0 auto; color: var(--accent); display: flex; }
+.saurio-project-card__text { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.saurio-project-card__name { font-weight: 600; font-size: var(--text-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.saurio-project-card__path { font-size: var(--text-xs); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.saurio-main {
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-2);
+  border-right: 1px solid var(--border-subtle);
+  min-width: 0;
+}
+
+/* Centro de chat (layout/ChatCenter.tsx): antes estos dos wrappers no tenían ninguna regla propia,
+   así que `.chat-panel` (height: 100%, feature chat) no tenía de qué altura heredar y el chat
+   quedaba sin poder crecer/hacer scroll correctamente dentro de `.saurio-main`. */
+.saurio-chat-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.saurio-chat-center__panel {
+  flex: 1;
+  min-height: 0;
+}
+
+.saurio-right-panel {
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-1);
+  min-width: 0;
+}
+
+/* Pasada de diseño #3: nunca scroll horizontal acá — cada pestaña es flex:1 (se reparten el ancho
+   disponible) con ícono + etiqueta corta que se recorta con ellipsis antes de desbordar; el `title`
+   de cada pestaña conserva el nombre completo para el tooltip. */
+.saurio-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  overflow: hidden;
+  padding: 0 var(--space-1);
+}
+
+/* 6 pestañas en 380px no entran como texto completo sin recortarse feo ("Arc…", "Ren…"). En vez de
+   eso: ícono siempre visible (nunca se corta) + etiqueta corta que solo se muestra en la pestaña
+   activa (con `title` en todas para el nombre completo al pasar el mouse) — ninguna pestaña queda
+   nunca con texto truncado a la mitad, y las 6 siguen entrando sin scroll horizontal. */
+.saurio-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 9px 4px;
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+}
+.saurio-tab svg { flex: 0 0 auto; }
+.saurio-tab__label {
+  display: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.saurio-tab:hover { color: var(--text-primary); }
+.saurio-tab.active { color: var(--text-primary); border-bottom-color: var(--accent); font-weight: 500; }
+.saurio-tab.active .saurio-tab__label { display: inline; }
+
+.saurio-tab-body {
+  flex: 1;
+  overflow: auto;
+  padding: var(--space-3);
+  min-height: 0;
+  font-size: var(--text-sm);
+}
+.saurio-tab-body h3 { font-size: var(--text-sm); margin: var(--space-3) 0 var(--space-2); color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }
+.saurio-tab-body h3:first-child { margin-top: 0; }
+
+/* ── Barra de estado inferior ─────────────────────────────────────────────────────────────── */
+
+.saurio-statusbar {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: 0 var(--space-3);
+  height: var(--statusbar-height);
+  background: var(--bg-1);
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.saurio-statusbar__item { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.saurio-statusbar__item svg { flex: 0 0 auto; opacity: 0.85; }
+.saurio-statusbar__dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+.saurio-statusbar__dot.ok { background: var(--success); box-shadow: 0 0 0 2px var(--success-subtle); }
+.saurio-statusbar__dot.down { background: var(--danger); box-shadow: 0 0 0 2px var(--danger-subtle); }
+.saurio-statusbar__spacer { flex: 1; }
+.saurio-statusbar__sep { width: 1px; height: 14px; background: var(--border); }
+
+/* ── Badges ───────────────────────────────────────────────────────────────────────────────── */
+
+.saurio-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  margin-left: 4px;
+  line-height: 1.6;
+}
+.saurio-badge.measured { color: var(--success); border-color: var(--success); background: var(--success-subtle); }
+.saurio-badge.estimated { color: var(--warning); border-color: var(--warning); background: var(--warning-subtle); }
+.saurio-badge.unavailable { color: var(--danger); border-color: var(--danger); background: var(--danger-subtle); }
+.saurio-badge.local { color: var(--accent); border-color: var(--accent); background: var(--accent-subtle); }
+/* Punto 3/4 del encargo (frontera local/nube, badges LOCAL/LAN/NUBE del selector de modelo y la
+   cabecera del chat): antes solo existían en features/models/models.css (Centro de modelos), que no
+   se carga siempre — se mueven acá (ya global vía theme.css) para que ChatHeader/el selector de
+   modelo las tengan disponibles sin depender de que el Centro de modelos ya se haya montado. */
+.saurio-badge.lan { color: var(--warning); border-color: var(--warning); background: var(--warning-subtle); }
+.saurio-badge.cloud { color: var(--danger); border-color: var(--danger); background: var(--danger-subtle); }
+
+/* ── Avisos ───────────────────────────────────────────────────────────────────────────────── */
+
+.saurio-banner {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  line-height: var(--leading-tight);
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--warning);
+  background: var(--warning-subtle);
+  color: var(--text-primary);
+}
+.saurio-banner.danger { border-color: var(--danger); background: var(--danger-subtle); }
+/* Punto 3 del encargo ("probar conexión con resultado claro"): variante para un resultado ok
+   (ProvidersSection.tsx) — antes no existía ninguna variante positiva, solo la de advertencia/error. */
+.saurio-banner.success { border-color: var(--success); background: var(--success-subtle); }
+
+/* ── Estados vacíos (con guía, no solo texto en gris) ────────────────────────────────────── */
+
+.saurio-empty {
+  color: var(--text-muted);
+  padding: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.saurio-empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-8);
+  text-align: center;
+  color: var(--text-secondary);
+}
+/* Punto 7 del encargo: reemplaza el `style={{ height: '100%' }}` inline que traían
+   features/chat/ChatPanel.tsx y layout/ChatCenter.tsx para el mismo estado vacío. */
+.saurio-empty-state--fill { height: 100%; }
+.saurio-empty-state__icon {
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-lg);
+  background: var(--bg-3);
+  color: var(--accent);
+}
+.saurio-empty-state__title { font-size: var(--text-md); font-weight: 600; color: var(--text-primary); }
+.saurio-empty-state__hint { font-size: var(--text-sm); color: var(--text-muted); max-width: 280px; line-height: var(--leading-normal); }
+
+.saurio-mono { font-family: var(--font-mono); }
+
+/* ── Paneles de listas (Modelos / Rendimiento / Ajustes) ─────────────────────────────────────
+   Pasada de diseño #6: antes cada panel usaba `style={{...}}` inline suelto (bordes/paddings
+   ligeramente distintos entre sí). Estas clases son la base común: header con título + acción,
+   filas con separador sutil y una franja de metadatos en gris. */
+
+.saurio-panel__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.saurio-panel__title {
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+}
+
+.saurio-row-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.saurio-row {
+  background: var(--bg-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+}
+.saurio-row__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+}
+.saurio-row__title { font-weight: 600; font-size: var(--text-sm); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.saurio-row__badges { display: flex; align-items: center; flex: 0 0 auto; }
+.saurio-row__meta { font-size: var(--text-xs); color: var(--text-secondary); margin-top: 3px; }
+.saurio-row__line { font-size: var(--text-xs); color: var(--text-secondary); margin-top: 3px; }
+
+.saurio-metric-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); margin-bottom: var(--space-3); }
+.saurio-metric-table td { padding: 5px 0; border-bottom: 1px solid var(--border-subtle); }
+.saurio-metric-table td:first-child { color: var(--text-secondary); width: 45%; }
+.saurio-metric-table tr:last-child td { border-bottom: none; }

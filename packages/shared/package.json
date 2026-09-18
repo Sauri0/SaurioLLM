@@ -1,0 +1,19 @@
+{
+  "name": "@saurio/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Contratos puros de SaurioLLM (dominio, enums, eventos, IPC); cero dependencias de Electron o React (doc 02 §3)",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "dependencies": {
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

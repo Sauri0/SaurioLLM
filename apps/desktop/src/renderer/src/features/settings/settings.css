@@ -1,0 +1,36 @@
+/* Panel de Ajustes — reemplaza los `style={{...}}` inline que quedaban (punto 4 del encargo:
+   "quitar estilos inline que queden"). Consume los tokens de layout/theme.css. */
+
+.saurio-settings-title-icon { margin-right: 6px; }
+.saurio-settings-empty { padding: var(--space-4); }
+.saurio-settings-hint { font-size: var(--text-sm); color: var(--text-secondary); }
+.saurio-settings-label { display: block; font-size: var(--text-sm); margin: var(--space-2) 0; }
+
+.saurio-settings-numctx-row { display: flex; align-items: center; gap: var(--space-2); }
+.saurio-settings-numctx-input { width: 90px; }
+
+/* Ajustes > Proveedores (punto 3 del encargo) — apps/desktop/src/renderer/src/features/settings/
+   ProvidersSection.tsx. */
+.saurio-providers-form { display: flex; flex-direction: column; gap: var(--space-2); }
+.saurio-providers-form__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-2) var(--space-3);
+}
+.saurio-providers-row { display: flex; flex-direction: column; gap: var(--space-2); }
+.saurio-providers-enable { display: inline-flex; align-items: center; gap: 4px; margin: 0; }
+.saurio-providers-row__actions { display: flex; gap: var(--space-2); }
+.saurio-providers-row__key-edit { display: flex; gap: var(--space-2); align-items: center; }
+.saurio-providers-row__key-edit input { flex: 1; min-width: 0; }
+
+/* Visor de audit_log (punto 4 del encargo) — NonLocalCallAuditLog en ProvidersSection.tsx. */
+.saurio-settings-subtitle { font-size: var(--text-md); margin: 0; }
+.saurio-providers-audit { margin-top: var(--space-4); }
+.saurio-providers-audit__list { margin-top: var(--space-2); }
+.saurio-providers-audit__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+.saurio-providers-audit__ts { color: var(--text-secondary); min-width: 160px; }

@@ -1,0 +1,7 @@
+/* Ruta de verificación de scaffolding (?smoke=1, doc 02 §1) — apps/desktop/src/renderer/src/App.tsx.
+   Punto 7 del encargo: quitar los estilos inline restantes del renderer. */
+.saurio-scaffold-smoke {
+  font-family: system-ui, sans-serif;
+  padding: var(--space-8);
+}
+.saurio-scaffold-smoke__error { color: var(--danger); }

@@ -1,0 +1,4 @@
+# Declara los paquetes del workspace pnpm (doc 02 §1: apps/* y packages/*).
+packages:
+  - "apps/*"
+  - "packages/*"

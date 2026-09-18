@@ -1,0 +1,35 @@
+{
+  "name": "@saurio/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "@saurio/runtime — paquete Node puro (sin Electron ni React), corre en el proceso main vía RuntimeHost (doc 02 §3, ADR-002)",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "db:rebuild": "tsx src/persistence/rebuild.ts"
+  },
+  "dependencies": {
+    "@saurio/repomap": "workspace:*",
+    "@saurio/shared": "workspace:*",
+    "@vscode/ripgrep": "1.18.0",
+    "better-sqlite3": "13.0.3",
+    "diff": "9.0.0",
+    "drizzle-orm": "0.45.2",
+    "ignore": "7.0.9",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "26.6.1",
+    "drizzle-kit": "0.31.10",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "vitest": "5.0.1"
+  }
+}

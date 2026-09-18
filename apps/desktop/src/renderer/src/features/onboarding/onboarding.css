@@ -1,0 +1,46 @@
+/* Asistente de primer arranque (punto 5 del encargo) — modal simple, sin librería de diálogos.
+   Consume los tokens de layout/theme.css; sin estilos inline. */
+
+.saurio-onboarding-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.saurio-onboarding-card {
+  width: 420px;
+  max-width: calc(100vw - var(--space-6));
+  max-height: calc(100vh - var(--space-6));
+  overflow: auto;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg, 10px);
+  padding: var(--space-4);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+}
+
+.saurio-onboarding-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-3);
+  font-size: var(--text-md, 14px);
+}
+.saurio-onboarding-header button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 18px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.saurio-onboarding-choices {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}

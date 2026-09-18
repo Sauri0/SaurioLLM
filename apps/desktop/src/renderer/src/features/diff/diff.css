@@ -1,0 +1,74 @@
+/* Panel "Diff" (doc 09 §2-§5, doc 01 §4.1) — apps/desktop/src/renderer/src/features/diff/. Punto 7
+   del encargo: reemplaza los `style={{...}}` inline que quedaban en DiffPanel.tsx, MergeViewHost.tsx
+   y RevertDialog.tsx por clases con los tokens de layout/theme.css. */
+
+.diff-panel { display: flex; gap: var(--space-3); height: 100%; }
+
+.diff-panel__checkpoints { width: 260px; overflow: auto; flex-shrink: 0; }
+
+.diff-panel__checkpoint-card {
+  border: 1px solid var(--saurio-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.diff-panel__checkpoint-label {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  font-size: var(--text-sm);
+}
+.diff-panel__checkpoint-files { margin-top: var(--space-1); }
+
+.diff-panel__revert-btn { margin-top: var(--space-2); width: 100%; }
+.diff-panel__revert-banner { margin-top: var(--space-2); }
+
+.diff-panel__content { flex: 1; min-width: 0; }
+.diff-panel__file-label { font-size: var(--text-sm); }
+
+.diff-merge-view {
+  height: 420px;
+  overflow: auto;
+  border: 1px solid var(--saurio-border);
+  border-radius: var(--radius-sm);
+}
+
+/* RevertDialog.tsx: diálogo de revert (doc 09 §5-§6). */
+.revert-dialog__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.revert-dialog__card {
+  background: var(--saurio-bg-raised);
+  border: 1px solid var(--saurio-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  width: 720px;
+  max-height: 80vh;
+  overflow: auto;
+}
+.revert-dialog__does-not-cover-list { margin: var(--space-1) 0 0; padding-left: 18px; }
+.revert-dialog__actions { display: flex; gap: var(--space-2); margin-top: var(--space-3); }
+.revert-dialog__cancel-only { margin-top: var(--space-3); }
+
+.revert-conflict-row {
+  border: 1px solid var(--saurio-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.revert-conflict-row__path { margin-bottom: var(--space-1); }
+.revert-conflict-row__columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+.revert-conflict-row__snippet { max-height: 100px; overflow: auto; margin: 0; }
+.revert-conflict-row__options { margin-top: var(--space-2); display: flex; gap: var(--space-2); }
+.revert-conflict-row__option { font-size: var(--text-sm); }

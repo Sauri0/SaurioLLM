@@ -1,0 +1,11 @@
+/* Panel de rendimiento — reemplaza los `style={{...}}` inline que quedaban en PerfPanel.tsx (punto 4
+   del encargo: "quitar estilos inline que queden"). Consume los tokens de layout/theme.css. */
+
+.saurio-perf-title-icon { margin-right: 6px; }
+
+.saurio-perf-meta { font-size: var(--text-sm); color: var(--text-secondary); margin: 4px 0; }
+
+.saurio-perf-history { display: flex; flex-direction: column; gap: 10px; }
+.saurio-perf-history__label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 2px; }
+
+.saurio-perf-diagnostic__action { color: var(--accent); }

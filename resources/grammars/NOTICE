@@ -1,0 +1,18 @@
+Atribución de licencia — queries `*-tags.scm` de packages/repomap/queries/
+
+Las queries `typescript-tags.scm`, `tsx-tags.scm`, `javascript-tags.scm` y `python-tags.scm` de
+`packages/repomap/queries/` están derivadas (simplificadas y adaptadas al alcance del MVP de
+SaurioLLM) de las queries de tags de Aider:
+
+  https://github.com/Aider-AI/aider
+  Directorio original: aider/queries/tree-sitter-languages/*-tags.scm
+
+Aider está licenciado bajo Apache License 2.0. Copyright de las queries originales: Aider-AI y
+contribuidores del proyecto Aider.
+
+Texto de la licencia Apache-2.0: https://www.apache.org/licenses/LICENSE-2.0
+
+Esta atribución cumple con la sección 4(b) de la licencia Apache-2.0 (mantener avisos de
+copyright/atribución en archivos derivados). No se reclama copyright de SaurioLLM sobre las
+queries originales de Aider; las modificaciones específicas de SaurioLLM (recorte de capturas,
+adaptación de nombres) están cubiertas por la licencia general de este repositorio.

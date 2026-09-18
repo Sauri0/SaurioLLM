@@ -1,0 +1,6 @@
+/* ModelSelect.tsx — selector agrupado por proveedor + badge de localidad (punto 3 del encargo). */
+.saurio-model-select {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}

@@ -1,0 +1,20 @@
+/* Pantalla de último recurso cuando un error de render escapa a todo el árbol de React —
+   apps/desktop/src/renderer/src/ErrorBoundary.tsx. Punto 7 del encargo: quitar los estilos inline
+   restantes del renderer. Usa los tokens de layout/theme.css (siempre cargado, independiente de
+   este componente) en vez de valores hardcodeados. */
+.saurio-error-boundary {
+  font-family: system-ui, sans-serif;
+  padding: var(--space-8);
+  color: var(--text-primary);
+  background: var(--bg-0);
+  min-height: 100vh;
+  box-sizing: border-box;
+}
+.saurio-error-boundary__title { color: var(--danger); }
+.saurio-error-boundary__stack {
+  white-space: pre-wrap;
+  background: var(--bg-1);
+  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  overflow: auto;
+}

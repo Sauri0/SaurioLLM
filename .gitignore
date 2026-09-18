@@ -1,0 +1,29 @@
+node_modules/
+dist/
+out/
+.saurio/
+*.log
+.DS_Store
+Thumbs.db
+
+# SaurioLLM — agregado por el scaffolding del monorepo (doc 02, §4.1 y §6)
+build/
+release/
+*.db
+*.db-wal
+*.db-shm
+smoke/
+smoke-*.json
+smoke-*.png
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Secretos locales (claves de API de proveedores, etc.) — nunca deberían llegar a un commit.
+.env
+.env.*
+!.env.example
+
+# Carpetas de trabajo locales de Claude Code (worktrees de agentes en paralelo, etc.): ya excluidas
+# para este clon en .git/info/exclude, pero un clon nuevo (o CI) también debería ignorarlas.
+.claude/

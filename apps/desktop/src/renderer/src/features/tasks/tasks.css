@@ -1,0 +1,42 @@
+/* Checklist de tareas del plan — usa los tokens de layout/theme.css. */
+.task-checklist { list-style: none; margin: 0; padding: 0; }
+.task-checklist__empty { color: var(--text-muted); font-size: var(--text-base); padding: var(--space-2) 0; }
+
+.task-checklist__progress {
+  height: 3px;
+  background: var(--bg-4);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  margin-bottom: var(--space-2);
+}
+.task-checklist__progress-fill {
+  height: 100%;
+  background: var(--success);
+  border-radius: var(--radius-full);
+  transition: width 200ms ease;
+}
+
+.task-checklist__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 3px 0;
+  font-size: var(--text-base);
+  color: var(--text-primary);
+}
+.task-checklist__marker {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.task-checklist__item.status-done .task-checklist__marker { background: var(--success); border-color: var(--success); }
+.task-checklist__item.status-in_progress .task-checklist__marker { border-color: var(--warning); }
+.task-checklist__item.status-skipped .task-checklist__marker { border-color: var(--text-muted); background: var(--text-muted); }
+.task-checklist__item.status-done .task-checklist__title { text-decoration: line-through; color: var(--text-muted); }
+.task-checklist__title { flex: 1; }
+.task-checklist__status { color: var(--text-muted); font-size: var(--text-xs); }

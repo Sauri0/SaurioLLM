@@ -1,0 +1,43 @@
+{
+  "name": "saurio",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SaurioLLM — monorepo raíz (workspace pnpm); sin dependencias de runtime propias (doc 02 §4.1)",
+  "author": "Sauri0",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24.14.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @saurio/desktop run dev",
+    "build": "pnpm --filter @saurio/desktop run build",
+    "typecheck": "tsc --build",
+    "test": "pnpm --filter @saurio/runtime --filter @saurio/repomap --filter @saurio/desktop run test",
+    "test:eval": "tsx eval/harness.ts",
+    "db:rebuild": "pnpm --filter @saurio/runtime run db:rebuild",
+    "lint": "eslint .",
+    "postinstall": "node scripts/ensure-electron-dist.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@saurio/repomap": "workspace:*",
+    "@saurio/runtime": "workspace:*",
+    "@saurio/shared": "workspace:*",
+    "@types/node": "26.6.1",
+    "eslint": "10.10.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.12.0",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "5.0.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild",
+      "node-pty"
+    ]
+  }
+}

@@ -1,0 +1,69 @@
+/* Centro de modelos — pestañas Instalados/Explorar/Descargas (doc 13 §10), barra de progreso de
+   descarga (doc 13 §5) y badges de localidad LAN/NUBE (doc 13 §9: "LOCAL/LAN/NUBE, con color
+   distinto" — .local ya existía en theme.css). Consume los mismos tokens de layout/theme.css. */
+
+.saurio-subtabs {
+  display: flex;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: var(--space-3);
+}
+.saurio-subtab {
+  padding: 6px 10px;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  background: none;
+  border-top: none;
+  border-left: none;
+  border-right: none;
+}
+.saurio-subtab:hover { color: var(--text-primary); }
+.saurio-subtab.active { color: var(--text-primary); border-bottom-color: var(--accent); font-weight: 500; }
+
+/* `.saurio-badge.lan`/`.cloud` se movieron a layout/theme.css (global) — punto 3/4 del encargo,
+   ChatHeader/el selector de modelo las necesitan sin depender de este archivo. */
+
+.saurio-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-bottom: var(--space-3);
+}
+.saurio-filter-chip {
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.saurio-filter-chip.active { color: var(--accent); border-color: var(--accent); background: var(--accent-subtle); }
+
+.saurio-progress {
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--bg-2);
+  overflow: hidden;
+  margin: var(--space-1) 0;
+}
+.saurio-progress__fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+.saurio-progress__fill.failed { background: var(--danger); }
+.saurio-progress__fill.insufficient_space { background: var(--danger); }
+.saurio-progress__fill.done { background: var(--success); }
+
+/* Reemplazan los `style={{...}}` inline que quedaban en ExploreTab/DownloadsTab/ModelsPanel (punto 4
+   del encargo: "quitar estilos inline que queden"). `saurio-progress__fill`'s `width` dinámico sigue
+   inline a propósito (es un valor calculado por descarga, no un estado con clase fija). */
+.saurio-filter-row__spacer { flex: 1; }
+.saurio-row__line--muted { color: var(--text-muted); }
+.saurio-row__line--danger { color: var(--danger); }
+.saurio-inline-action { margin-left: var(--space-2); }
+.saurio-models-title-icon { margin-right: 6px; }
+.saurio-models-folder-row { margin-bottom: var(--space-2); }

@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/runtime" },
+    { "path": "packages/repomap" },
+    { "path": "apps/desktop/src/main" },
+    { "path": "apps/desktop/src/preload" },
+    { "path": "apps/desktop/src/renderer" }
+  ]
+}
