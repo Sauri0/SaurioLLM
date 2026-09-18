@@ -60,7 +60,13 @@ export function MessageBubble({ message, metrics, streaming, currentModelLocalit
         )}
       </div>
 
-      {metrics && <MessageMetrics metrics={metrics} />}
+      {/* PRIORIDAD CERO punto 5 (bloqueo real: el mensaje del USUARIO mostraba "costo: no
+          disponible" / "NO DISPONIBLE"): `RunController.start()` persiste el mensaje del usuario
+          reusando el evento `message.done` (ResponseMetricsSchema exige `metrics`, así que ese
+          mensaje queda con `{quality:'unavailable'}` como relleno técnico, no como un dato real de
+          esa respuesta) — nunca hubo una respuesta que medir para un mensaje que el usuario mismo
+          escribió. Las métricas solo tienen sentido para lo que generó el modelo. */}
+      {metrics && message.role === 'assistant' && <MessageMetrics metrics={metrics} />}
     </div>
   );
 }

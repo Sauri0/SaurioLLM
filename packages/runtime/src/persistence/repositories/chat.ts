@@ -7,6 +7,7 @@ interface ChatRow extends SqliteRow {
   id: string; project_id: string; agent_id: string; title: string | null; mode: string;
   model_ref_json: string | null; profile_id: string | null; override_json: string | null;
   created_at: number; updated_at: number; archived: number;
+  origin_run_id: string | null;
 }
 
 function rowToChat(row: ChatRow): Chat {
@@ -21,6 +22,8 @@ function rowToChat(row: ChatRow): Chat {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     archived: row.archived === 1,
+    // Doc 19 §2.1 (E3a delegación, migración 0005): chat hijo -> run padre que lo creó.
+    originRunId: row.origin_run_id ?? undefined,
   };
 }
 
@@ -28,12 +31,12 @@ export function createChatRepository(driver: SqliteDriver): ChatRepository {
   return {
     async create(chat: Chat): Promise<Chat> {
       driver.prepare(
-        `INSERT INTO chats (id, project_id, agent_id, title, mode, model_ref_json, profile_id, override_json, created_at, updated_at, archived)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+        `INSERT INTO chats (id, project_id, agent_id, title, mode, model_ref_json, profile_id, override_json, created_at, updated_at, archived, origin_run_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
       ).run(
         chat.id, chat.projectId, chat.agentId, chat.title ?? null, chat.mode,
         chat.modelRef ? JSON.stringify(chat.modelRef) : null, chat.profileId ?? null,
-        chat.createdAt, chat.updatedAt, chat.archived ? 1 : 0,
+        chat.createdAt, chat.updatedAt, chat.archived ? 1 : 0, chat.originRunId ?? null,
       );
       return chat;
     },

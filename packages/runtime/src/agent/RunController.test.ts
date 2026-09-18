@@ -3,10 +3,11 @@
 import { describe, expect, it } from 'vitest';
 import { RunController, type RunControllerDeps } from './RunController.js';
 import type { ChatChunk, ChatRequest, ModelGateway } from '../gateway/types.js';
-import type { ChatMessage, RunEvent } from '@saurio/shared';
+import type { AgentCreateInput, AgentOwnerKind, AgentProfile, ChatMessage, RunEvent } from '@saurio/shared';
 import type { PermissionDecision, PermissionEngine } from '../permissions/types.js';
 import type { ContextBuilder } from '../context/types.js';
 import type { ToolDefinition } from '../tools/types.js';
+import type { AgentConfigResolver, AgentProfilePort } from './ports.js';
 import {
   makeFakeClock, makeFakeIds, makeFakeEventStore, makeFakeRunRepository, makeFakeChatRepository,
   makeFakeMessageRepository, makeFakeToolCallRepository, makeFakeCheckpointRepository,
@@ -609,5 +610,388 @@ describe('RunController — stop tokens del ToolProtocol', () => {
     expect((await runs.get(runId))?.state).toBe('completed');
     expect(capturedRequests).toHaveLength(1);
     expect(capturedRequests[0]?.options.stop).toEqual(['</tool_call>']);
+  });
+});
+
+// ── PRIORIDAD CERO punto 2: "Ollama caído" no puede colgar el run en 'generating' para siempre ──
+
+describe('RunController — provider caído (connection_refused) falla rápido en vez de reintentar sin límite', () => {
+  it('tras MAX_CONNECTION_RETRIES+1 errores connection_refused seguidos, el run termina failed/provider_down', async () => {
+    // Antes del fix, `retryOrFail` reintentaba este código para siempre (cada `chat()` de la cola
+    // de abajo devuelve el mismo error) y el test nunca llegaba a un estado terminal — quedaría
+    // colgado esperando `waitTerminal` hasta el timeout de vitest. Con el fix, falla a la cuarta.
+    const errorScript: ChatChunk[] = [{ type: 'error', code: 'connection_refused', message: 'fetch failed: ECONNREFUSED' }];
+    const gateway = makeScriptedGateway([errorScript, errorScript, errorScript, errorScript, errorScript]);
+    const { deps, runs } = baseDeps({ gateway });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.state).toBe('failed');
+    expect(run?.error?.code).toBe('provider_down');
+    // 1 intento inicial + 3 reintentos (MAX_CONNECTION_RETRIES) = 4 llamadas a gateway.chat, nunca 5.
+    expect(gateway.calls).toBe(4);
+  });
+
+  it('un connection_refused aislado se recupera si el siguiente intento sí conecta (no queda una racha arrastrada)', async () => {
+    const scripts: ChatChunk[][] = [
+      [{ type: 'error', code: 'connection_refused', message: 'fetch failed: ECONNREFUSED' }],
+      [
+        { type: 'tool_call', call: { id: 'call_finish', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const { deps, runs } = baseDeps({ gateway: makeScriptedGateway(scripts) });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.state).toBe('completed');
+  });
+});
+
+describe('RunController — oom_load reintenta bajando numGpu antes de fallar (tarea "carga de modelo")', () => {
+  const oomScript: ChatChunk[] = [{
+    type: 'error', code: 'oom_load',
+    message: 'llama-server reported out-of-memory during startup: GGML_ASSERT(buffer) failed alloc_tensor_range: failed to allocate Vulkan0 buffer of size 1072462848',
+  }];
+  const finishScript: ChatChunk[] = [
+    { type: 'tool_call', call: { id: 'call_finish', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+    { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+  ];
+
+  it('con block_count conocido, reintenta 75% -> 50% -> CPU (0) y registra un run.adjustment por paso', async () => {
+    const gateway = makeScriptedGateway([oomScript, oomScript, oomScript, finishScript]);
+    const modelLayerCountProbe = { getBlockCount: async () => 32 };
+    const { deps, runs } = baseDeps({ gateway, modelLayerCountProbe });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.state).toBe('completed');
+    expect(gateway.calls).toBe(4);
+    // 75% de 32 = 24, 50% de 32 = 16, último paso forzado a 0 (CPU).
+    expect(gateway.requests.map((r) => r.options.numGpu)).toEqual([undefined, 24, 16, 0]);
+  });
+
+  it('sin modelLayerCountProbe, va directo a un único intento con numGpu 0 antes de rendirse', async () => {
+    const gateway = makeScriptedGateway([oomScript, oomScript]);
+    const { deps, runs } = baseDeps({ gateway });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.state).toBe('failed');
+    expect(run?.error?.code).toBe('oom_load');
+    expect(gateway.calls).toBe(2);
+    expect(gateway.requests.map((r) => r.options.numGpu)).toEqual([undefined, 0]);
+  });
+
+  it('si ni siquiera con 0 (CPU) entra, el run termina failed/oom_load tras agotar la escalera', async () => {
+    const gateway = makeScriptedGateway([oomScript, oomScript, oomScript, oomScript]);
+    const modelLayerCountProbe = { getBlockCount: async () => 32 };
+    const { deps, runs } = baseDeps({ gateway, modelLayerCountProbe });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.state).toBe('failed');
+    expect(run?.error?.code).toBe('oom_load');
+    expect(gateway.calls).toBe(4); // 1 intento inicial + 3 pasos de la escalera, nunca un 5º
+  });
+
+  it('un run/chat nuevo vuelve a numGpu automático ("reversible": el ajuste no se pega para siempre)', async () => {
+    const gatewayA = makeScriptedGateway([oomScript, finishScript]);
+    const modelLayerCountProbe = { getBlockCount: async () => 32 };
+    const { deps: depsA, runs: runsA } = baseDeps({ gateway: gatewayA, modelLayerCountProbe });
+    const controllerA = new RunController(depsA);
+    const { runId: runIdA } = await controllerA.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runsA, runIdA);
+    expect(gatewayA.requests.map((r) => r.options.numGpu)).toEqual([undefined, 24]);
+
+    const gatewayB = makeScriptedGateway([finishScript]);
+    const { deps: depsB, runs: runsB } = baseDeps({ gateway: gatewayB, modelLayerCountProbe });
+    const controllerB = new RunController(depsB);
+    const { runId: runIdB } = await controllerB.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runsB, runIdB);
+    // Nuevo run (nueva instancia de RunController + LiveRun): sin herencia del ajuste anterior.
+    expect(gatewayB.requests.map((r) => r.options.numGpu)).toEqual([undefined]);
+  });
+});
+
+// ── delegate (doc 19 §2, E3a "Delegación desde el chat") ─────────────────────
+
+/** Stub de la tool `delegate` para el `ToolRegistry` del test: RunController la intercepta ANTES de
+ *  llamar a `def.handler` (mismo patrón que `finish`), así que este handler nunca debería ejecutarse
+ *  en ninguno de los tests de abajo — solo hace falta que la tool esté REGISTRADA (doc 19 §2.5). */
+function makeDelegateToolStub(): ToolDefinition {
+  return {
+    name: 'delegate', description: 'delega', inputSchema: {}, category: 'delegate',
+    mutating: false, idempotent: false, allowedInModes: ['plan', 'edit', 'agent'],
+    source: { kind: 'delegate' },
+    handler: async () => { throw new Error('no debería llamarse: RunController intercepta delegate'); },
+  };
+}
+
+function makeMultiAgentConfigResolver(byId: Record<string, ReturnType<typeof makeTestAgentConfig>>): AgentConfigResolver {
+  return {
+    async resolve(agentId: string) {
+      const found = byId[agentId];
+      if (!found) throw new Error(`no existe el agente "${agentId}"`);
+      return found;
+    },
+  };
+}
+
+function makeFakeAgentProfilePort(): AgentProfilePort & { created: { input: AgentCreateInput; ownerKind?: AgentOwnerKind }[] } {
+  const created: { input: AgentCreateInput; ownerKind?: AgentOwnerKind }[] = [];
+  return {
+    created,
+    async createProfile(input: AgentCreateInput, ownerKind?: AgentOwnerKind): Promise<AgentProfile> {
+      created.push({ input, ownerKind });
+      return {
+        id: `worker_${created.length}`, ownerKind: ownerKind ?? 'personal', name: input.name,
+        role: input.role ?? 'custom', modelMode: input.modelMode ?? 'fixed', model: input.model,
+        systemPrompt: 'sos un worker temporal', allowedTools: [], permissionPreset: input.permissionPreset ?? 'balanced',
+        createdAt: 0,
+      };
+    },
+  };
+}
+
+const doneChunk: ChatChunk = { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } };
+
+describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
+  it('T06: delega a un agente existente — crea el run/chat hijo con parent_run_id/delegation_depth y el padre recibe el DelegationResult', async () => {
+    const scripts: ChatChunk[][] = [
+      // Turno 1 del PADRE: llama a delegate.
+      [
+        { type: 'tool_call', call: { id: 'call_delegate', name: 'delegate', args: { targetAgentId: 'agent_reviewer', task: 'revisar el módulo X', expectedDeliverable: 'resumen de hallazgos' }, transport: 'native' } },
+        doneChunk,
+      ],
+      // Turno único del HIJO (disparado dentro del procesamiento del turno 1 del padre): cierra con
+      // finish cuyo summary es el JSON de DelegationResultSchema.
+      [
+        { type: 'tool_call', call: { id: 'call_finish_child', name: 'finish', args: { summary: JSON.stringify({ status: 'completed', summary: 'módulo X revisado, sin hallazgos' }) }, transport: 'native' } },
+        doneChunk,
+      ],
+      // Turno 2 del PADRE: ya con el resultado de la delegación en su historial, termina.
+      [
+        { type: 'tool_call', call: { id: 'call_finish_parent', name: 'finish', args: { summary: 'listo, delegado' }, transport: 'native' } },
+        doneChunk,
+      ],
+    ];
+    const gateway = makeScriptedGateway(scripts);
+    const { deps, runs } = baseDeps({
+      gateway,
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agents: makeMultiAgentConfigResolver({
+        agent_1: makeTestAgentConfig({ allowedTools: ['finish', 'delegate'] }),
+        agent_reviewer: makeTestAgentConfig({ id: 'agent_reviewer', name: 'Revisor', allowedTools: ['finish'] }),
+      }),
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'delegale la revisión del módulo X a mi agente revisor', 'agent');
+    await waitTerminal(runs, runId);
+
+    const parentRun = await runs.get(runId);
+    expect(parentRun?.state).toBe('completed');
+    expect(parentRun?.delegationDepth ?? 0).toBe(0);
+
+    const toolCallsAll = [...(deps.toolCalls as ReturnType<typeof makeFakeToolCallRepository>).all.values()];
+    const delegateCall = toolCallsAll.find((c) => c.toolName === 'delegate');
+    expect(delegateCall?.category).toBe('delegate');
+    expect(delegateCall?.status).toBe('done');
+    expect(delegateCall?.resultIsError).toBe(false);
+
+    const events = (deps.events as ReturnType<typeof makeFakeEventStore>).all;
+    const delegatedEvent = events.find((e): e is Extract<RunEvent, { type: 'run.delegated' }> => e.type === 'run.delegated');
+    expect(delegatedEvent).toBeDefined();
+    expect(delegatedEvent?.targetAgentId).toBe('agent_reviewer');
+    expect(delegatedEvent?.parentRunId).toBe(runId);
+
+    const childRun = await runs.get(delegatedEvent!.childRunId);
+    expect(childRun?.parentRunId).toBe(runId);
+    expect(childRun?.delegationDepth).toBe(1);
+    expect(childRun?.state).toBe('completed');
+
+    const childChat = await deps.chats.get(delegatedEvent!.childChatId);
+    expect(childChat?.originRunId).toBe(runId);
+    expect(childChat?.agentId).toBe('agent_reviewer');
+  });
+
+  it('T07: sin targetAgentId crea un worker efímero (owner_kind worker) vía agentProfiles, nunca uno "personal"', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_delegate', name: 'delegate', args: { role: 'explorer', task: 'explorar el repo', expectedDeliverable: 'mapa de módulos' }, transport: 'native' } },
+        doneChunk,
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_finish_child', name: 'finish', args: { summary: 'listo' } , transport: 'native' } },
+        doneChunk,
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_finish_parent', name: 'finish', args: { summary: 'listo, delegado a un worker' }, transport: 'native' } },
+        doneChunk,
+      ],
+    ];
+    const agentProfiles = makeFakeAgentProfilePort();
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agentProfiles,
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'exploración rápida, no me importa quién', 'agent');
+    await waitTerminal(runs, runId);
+
+    expect(agentProfiles.created).toHaveLength(1);
+    expect(agentProfiles.created[0]?.ownerKind).toBe('worker');
+    expect(agentProfiles.created[0]?.input.role).toBe('explorer');
+
+    const parentRun = await runs.get(runId);
+    expect(parentRun?.state).toBe('completed');
+  });
+
+  it('sin targetAgentId y sin agentProfiles inyectado, falla la delegación con un ToolResult de error (no rompe el run)', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_delegate', name: 'delegate', args: { task: 't', expectedDeliverable: 'd' }, transport: 'native' } },
+        doneChunk,
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_finish', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        doneChunk,
+      ],
+    ];
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'delegá sin decir a quién', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.state).toBe('completed'); // el error de delegate no rompe el run padre
+    const delegateCall = [...(deps.toolCalls as ReturnType<typeof makeFakeToolCallRepository>).all.values()]
+      .find((c) => c.toolName === 'delegate');
+    expect(delegateCall?.resultIsError).toBe(true);
+    expect(delegateCall?.resultPreview).toMatch(/agentProfiles/);
+  });
+
+  it('profundidad máxima 1: un run que ya es hijo de una delegación no puede delegar de nuevo', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_delegate', name: 'delegate', args: { task: 't', expectedDeliverable: 'd' }, transport: 'native' } },
+        doneChunk,
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_finish', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        doneChunk,
+      ],
+    ];
+    const childChat = makeTestChat({ id: 'chat_child', originRunId: 'parent_run_x' });
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      chats: makeFakeChatRepository([makeTestChat(), childChat]),
+    });
+    // Run padre pre-sembrado (profundidad 0) para que `start()` pueda derivar delegationDepth = 1
+    // del chat hijo (chats.origin_run_id -> parent_run_x).
+    await deps.runs.create({
+      id: 'parent_run_x', chatId: 'chat_1', agentId: 'agent_1', mode: 'agent', state: 'completed',
+      iteration: 1, lastEventSeq: 1, createdAt: 0, delegationDepth: 0,
+    });
+
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_child', 'seguí la tarea delegada', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.delegationDepth).toBe(1);
+    expect(run?.state).toBe('completed');
+
+    const delegateCall = [...(deps.toolCalls as ReturnType<typeof makeFakeToolCallRepository>).all.values()]
+      .find((c) => c.toolName === 'delegate');
+    expect(delegateCall?.resultIsError).toBe(true);
+    expect(delegateCall?.resultPreview).toMatch(/profundidad máxima/);
+
+    // Ningún chat nuevo se creó (solo los dos ya sembrados: el original + el "hijo" de prueba).
+    const chatsInProject = await deps.chats.listByProject('project_1');
+    expect(chatsInProject).toHaveLength(2);
+  });
+
+  it('máximo 3 delegaciones por run: la 4ta se rechaza sin crear un run/chat nuevo', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_delegate_4', name: 'delegate', args: { task: 't4', expectedDeliverable: 'd4' }, transport: 'native' } },
+        doneChunk,
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_finish', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        doneChunk,
+      ],
+    ];
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+    });
+    // Primer id que asigna start() es el runId (ver RunController.start(): `ids.next()` antes que
+    // cualquier otro consumidor) — con `makeFakeIds()` fresco eso es siempre 'id_1'.
+    const runId = 'id_1';
+    for (let i = 0; i < 3; i += 1) {
+      await deps.toolCalls.upsert({
+        id: `prior_delegate_${i}`, runId, iteration: 0, toolName: 'delegate', args: {},
+        argsHash: `hash_${i}`, category: 'delegate', risk: 'low', transport: 'native', status: 'done',
+      });
+    }
+
+    const controller = new RunController(deps);
+    const started = await controller.start('chat_1', 'delegá una cuarta vez', 'agent');
+    expect(started.runId).toBe(runId);
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.state).toBe('completed');
+
+    const delegateCall = [...(deps.toolCalls as ReturnType<typeof makeFakeToolCallRepository>).all.values()]
+      .find((c) => c.id === 'call_delegate_4');
+    expect(delegateCall?.resultIsError).toBe(true);
+    expect(delegateCall?.resultPreview).toMatch(/límite de delegaciones/);
+
+    const chatsInProject = await deps.chats.listByProject('project_1');
+    expect(chatsInProject).toHaveLength(1); // ningún chat hijo nuevo
+  });
+
+  it('targetAgentId inexistente se rechaza sin inventar un destino (el modelo no puede alucinar un id)', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_delegate', name: 'delegate', args: { targetAgentId: 'agent_no_existe', task: 't', expectedDeliverable: 'd' }, transport: 'native' } },
+        doneChunk,
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_finish', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        doneChunk,
+      ],
+    ];
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agents: makeMultiAgentConfigResolver({ agent_1: makeTestAgentConfig() }),
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'delegale a un agente que no existe', 'agent');
+    await waitTerminal(runs, runId);
+
+    const delegateCall = [...(deps.toolCalls as ReturnType<typeof makeFakeToolCallRepository>).all.values()]
+      .find((c) => c.toolName === 'delegate');
+    expect(delegateCall?.resultIsError).toBe(true);
+    expect(delegateCall?.resultPreview).toMatch(/no existe el agente/);
+    const chatsInProject = await deps.chats.listByProject('project_1');
+    expect(chatsInProject).toHaveLength(1);
   });
 });

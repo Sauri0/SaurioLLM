@@ -14,17 +14,28 @@ import { DiffPanel } from '../features/diff/index.js';
 import { ModelsPanel } from '../features/models/index.js';
 import { PerfPanel } from '../features/perf/index.js';
 import { SettingsPanel } from '../features/settings/index.js';
+import { AgentsPanel } from '../features/agents/index.js';
+import { useModelsStore } from '../stores/modelsStore.js';
+import { useProvidersStore } from '../stores/providersStore.js';
+import { useChatStore } from '../stores/chatStore.js';
+import { pickDefaultModelRef } from './defaultModel.js';
 
 // Punto 7 del encargo (code-splitting): `@xterm/xterm` no tiene por qué ir en el chunk inicial del
 // renderer si el usuario nunca abre la pestaña Terminal — mismo criterio que `FileViewer` (CodeMirror)
 // en `features/files/FilesPanel.tsx`.
 const TerminalPanel = lazy(() => import('../features/terminal/index.js').then((m) => ({ default: m.TerminalPanel })));
-import { FileIcon, GitBranchIcon, TerminalIcon, CpuIcon, GaugeIcon, SettingsIcon } from '../ui/icons.js';
+import { FileIcon, GitBranchIcon, TerminalIcon, CpuIcon, GaugeIcon, SettingsIcon, UserIcon } from '../ui/icons.js';
 import { getDemoRightPanelTab } from '../demo/demoState.js';
 
-type Tab = 'Archivos' | 'Diff' | 'Terminal' | 'Modelos' | 'Rendimiento' | 'Ajustes';
+type Tab = 'Archivos' | 'Diff' | 'Terminal' | 'Modelos' | 'Agentes' | 'Rendimiento' | 'Ajustes';
 
-const TAB_IDS: Tab[] = ['Archivos', 'Diff', 'Terminal', 'Modelos', 'Rendimiento', 'Ajustes'];
+const TAB_IDS: Tab[] = ['Archivos', 'Diff', 'Terminal', 'Modelos', 'Agentes', 'Rendimiento', 'Ajustes'];
+
+/** Doc 19 §0: proyecto personal sintético (packages/runtime/src/agent/personalProject.ts,
+ *  PERSONAL_PROJECT_ID) — se repite acá el literal en vez de importarlo (la UI no depende
+ *  directamente de @saurio/runtime, doc 01 §2 principio 9; mismo criterio que DEFAULT_AGENT_ID en
+ *  Sidebar.tsx/ChatCenter.tsx). Un chat directo con un agente personal, sin proyecto abierto, vive ahí. */
+const PERSONAL_PROJECT_ID = 'project_personal';
 
 function initialTab(): Tab {
   const requested = getDemoRightPanelTab();
@@ -39,6 +50,7 @@ const TABS: { id: Tab; label: string; fullLabel: string; icon: ComponentType<SVG
   { id: 'Diff', label: 'Diff', fullLabel: 'Diff', icon: GitBranchIcon },
   { id: 'Terminal', label: 'Term.', fullLabel: 'Terminal', icon: TerminalIcon },
   { id: 'Modelos', label: 'Mod.', fullLabel: 'Modelos', icon: CpuIcon },
+  { id: 'Agentes', label: 'Ag.', fullLabel: 'Agentes', icon: UserIcon },
   { id: 'Rendimiento', label: 'Rend.', fullLabel: 'Rendimiento', icon: GaugeIcon },
   { id: 'Ajustes', label: 'Ajus.', fullLabel: 'Ajustes', icon: SettingsIcon },
 ];
@@ -46,12 +58,18 @@ const TABS: { id: Tab; label: string; fullLabel: string; icon: ComponentType<SVG
 export interface RightPanelProps {
   projectId: string | null;
   chatId: string | null;
+  /** Doc 19 §1.6: click en un agente de la pestaña "Agentes" abre (o crea) un chat directo con él,
+   *  reusando el flujo de creación de chat existente — mismo criterio que Sidebar.tsx. */
+  onSelectChat?: (chatId: string) => void;
 }
 
-export function RightPanel({ projectId, chatId }: RightPanelProps): React.JSX.Element {
+export function RightPanel({ projectId, chatId, onSelectChat }: RightPanelProps): React.JSX.Element {
   const [tab, setTab] = useState<Tab>(initialTab);
   const requestedTab = useUiNavStore((s) => s.requestedTab);
   const clearRequestedTab = useUiNavStore((s) => s.clearRequestedTab);
+  const installedModels = useModelsStore((s) => s.installed);
+  const providers = useProvidersStore((s) => s.providers);
+  const createChat = useChatStore((s) => s.createChat);
 
   // Navegación pedida desde afuera del panel (doc del asistente de primer arranque, punto 5:
   // "Tengo una clave de API" lleva a Ajustes > Proveedores) — ver stores/uiNavStore.ts.
@@ -88,6 +106,18 @@ export function RightPanel({ projectId, chatId }: RightPanelProps): React.JSX.El
           </Suspense>
         )}
         {tab === 'Modelos' && <ModelsPanel />}
+        {tab === 'Agentes' && (
+          <AgentsPanel
+            installedModels={installedModels}
+            providers={providers}
+            onChatWithAgent={(agent) => {
+              const targetProjectId = projectId ?? PERSONAL_PROJECT_ID;
+              const modelRef = agent.model ?? pickDefaultModelRef(installedModels);
+              if (!modelRef) return; // sin ningún modelo instalado, igual que Sidebar.tsx
+              void createChat(targetProjectId, agent.id, 'agent', modelRef).then((chat) => onSelectChat?.(chat.id));
+            }}
+          />
+        )}
         {tab === 'Rendimiento' && <PerfPanel />}
         {tab === 'Ajustes' && <SettingsPanel />}
       </div>

@@ -18,6 +18,11 @@ export interface ChatRequest {                // puro y serializable; se graba t
   options: {
     numCtx: number;                            // SIEMPRE explícito (condición 12.b); nunca se confía en el default del server
     temperature: number; numPredict: number; topP?: number; topK?: number; seed?: number; stop?: string[];
+    /** Cambio aditivo (tarea "carga de modelo/oom_load"): capas del modelo a offloadear a GPU.
+     *  `undefined` deja que Ollama decida solo (comportamiento previo); `RunController` lo baja
+     *  automáticamente (~75% -> ~50% -> 0 = solo CPU) cuando el provider devuelve `oom_load`, doc
+     *  16 "Cerrá lo que falta" punto 1. Mapeado a `num_gpu` en OllamaProvider. */
+    numGpu?: number;
   };
   think?: boolean | 'low' | 'medium' | 'high' | 'max';
   format?: 'json' | object;                    // rescate de formato tras 2 fallos de parseo (columna §6.5)

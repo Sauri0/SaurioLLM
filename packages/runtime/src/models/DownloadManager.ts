@@ -205,6 +205,48 @@ export class DownloadManager extends EventEmitter implements DownloadManagerCont
       }
     }
 
+    return this.beginJob(modelName, manifestTotalBytes(manifest), baselineCompletedBytes, pendingLayers);
+  }
+
+  /** Punto 3/4 del encargo (doc 16 §12.6): descarga de un modelo que NO vive en el registry de Ollama
+   *  (`hf.co/<usuario>/<repo>:<quant>` vía `HuggingFaceClient`, o "descargar por nombre" cuando el
+   *  nombre no resuelve contra `registry.ollama.ai`) — `checkSpace()`/`pull()` no sirven acá porque
+   *  ambos dependen de `ManifestFetcher.fetchManifest()`, que solo entiende el namespace `library` del
+   *  registry de Ollama (`RegistryClient.ts`, doc 13 §3 MVP). El propio Ollama sí sabe descargar estas
+   *  referencias (`POST /api/pull` las resuelve él mismo contra Hugging Face) — lo único que este
+   *  método no puede hacer es descontar capas ya presentes en `blobs/` (no hay manifest previo para
+   *  diffear, `[DECISIÓN DE DISEÑO]`: se verifica espacio contra el tamaño total conocido, más
+   *  conservador que de más — nunca de menos). El progreso por capa sigue funcionando igual que en
+   *  `pull()` (mismo NDJSON de `/api/pull`, `runPull` no distingue el origen del job). */
+  async pullKnownSize(modelName: string, knownTotalBytes: number): Promise<{ downloadId: string }> {
+    if (this.isDownloading(modelName)) {
+      const id = this.downloadIdByModel.get(modelName);
+      if (id) return { downloadId: id };
+    }
+    if (!this.provider.pull) {
+      throw new Error(`el provider "${this.provider.id}" no soporta pull()`);
+    }
+
+    const modelsFolder = await this.opts.modelsFolder();
+    const freeBytes = (await this.opts.diskSpace.freeBytes(modelsFolder)) ?? 0;
+    const ok = freeBytes >= knownTotalBytes + this.freeSpaceMarginBytes;
+    if (!ok) {
+      await this.recordInsufficientSpace(modelName, { neededBytes: knownTotalBytes, freeBytes });
+      const err = new Error(
+        `espacio insuficiente para descargar "${modelName}": faltan ` +
+        `${Math.ceil((knownTotalBytes + this.freeSpaceMarginBytes - freeBytes) / GIB)} GB`,
+      );
+      err.name = 'InsufficientSpaceError';
+      throw err;
+    }
+
+    return this.beginJob(modelName, knownTotalBytes, 0, []);
+  }
+
+  private async beginJob(
+    modelName: string, totalBytes: number, baselineCompletedBytes: number,
+    pendingLayers: { digest: string; size: number }[],
+  ): Promise<{ downloadId: string }> {
     const downloadId = this.downloadIdByModel.get(modelName) ?? this.idGenerator();
     this.downloadIdByModel.set(modelName, downloadId);
 
@@ -214,7 +256,7 @@ export class DownloadManager extends EventEmitter implements DownloadManagerCont
       providerId: this.provider.id,
       controller: new AbortController(),
       startedAt: this.now(),
-      totalBytes: manifestTotalBytes(manifest),
+      totalBytes,
       baselineCompletedBytes,
       layers: new Map(),
       speedSamples: [],

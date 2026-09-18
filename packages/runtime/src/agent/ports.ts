@@ -10,7 +10,9 @@
 //   2) resolver el `AgentConfig` a partir de `chat.agentId` (no hay AgentRepository documentado);
 //   3) el diagnóstico por hash de tool calls `orphaned` (doc 10 §5.4), que depende de WorkspaceFs y
 //      del BlobStore — ambos viven en otros módulos (tools/checkpoint) fuera del alcance de esta tarea.
-import type { Mode, ModelRef, RunState } from '@saurio/shared';
+import type {
+  Mode, ModelRef, RunState, AgentCreateInput, AgentOwnerKind, AgentProfile,
+} from '@saurio/shared';
 import type { AgentConfig, EffectiveConfig, RunError, ToolCallRecord } from './types.js';
 import type { Checkpoint } from '@saurio/shared';
 
@@ -33,6 +35,10 @@ export interface RunRecord {
   ownerSessionId?: string;
   heartbeatAt?: number;
   createdAt: number;
+  /** Doc 19 §2.1/§2.5 (E3a delegación): 0 = run normal (default); 1 = run hijo de una delegación.
+   *  `RunController.runDelegateTool` la lee para negar una segunda delegación en cadena (profundidad
+   *  máxima 1, doc 19 §5) y para elegir `priority: 'subagent'` en `gateway.chat()`. */
+  delegationDepth?: number;
 }
 
 export interface RunRepository {
@@ -74,6 +80,20 @@ export interface ModelContextProbe {
   getContextMax(ref: ModelRef): Promise<number | undefined>;
 }
 
+/** Puerto local (tarea "carga de modelo/oom_load"): al recibir `oom_load` de verdad,
+ *  `RunController` quiere reintentar con menos capas offloadeadas a GPU (`ChatRequest.options.
+ *  numGpu`, gateway/types.ts) en vez de fallar directo — pero calcular "~75%/~50% de las capas"
+ *  necesita saber cuántas capas tiene el modelo (`block_count`, `ModelDescription.modelInfo['
+ *  <arch>.block_count']`, `/api/show`), y `ModelManager` vive en packages/runtime/src/models (fuera
+ *  del alcance de esta tarea, mismo criterio que `ModelContextProbe`). El host implementa esto
+ *  envolviendo `ModelManager.describeModel` (ver apps/desktop/src/main/host/createRuntime.ts).
+ *  Opcional en `RunControllerDeps`: sin él (o si nunca devuelve un valor), el reintento de oom_load
+ *  salta directo a un único intento con `numGpu: 0` (CPU pura) — no hay forma honesta de calcular
+ *  un porcentaje de capas sin saber cuántas hay (nunca inventar un dato medido). */
+export interface ModelLayerCountProbe {
+  getBlockCount(ref: ModelRef): Promise<number | undefined>;
+}
+
 /** Puerto local (doc 16 §4 ítem 16 / doc 10 §3, §5.2: "expected_pre_hash sobrevive a un reinicio"):
  *  al registrar (write-ahead) una tool call mutante de archivo (`edit_file`/`write_file`/
  *  `delete_file`), `RunController` necesita saber "¿cuál fue el último hash que ESTE run vio para
@@ -88,6 +108,17 @@ export interface ModelContextProbe {
  *  expectedPreHash`). */
 export interface LastReadHashes {
   lastHash(runId: string, relPath: string): string | undefined;
+}
+
+/** Doc 19 §2.5 (E3a delegación): `RunController.runDelegateTool` necesita poder crear un worker
+ *  efímero (`owner_kind: 'worker'`) cuando la tool `delegate` no trae `targetAgentId` — algo que
+ *  `AgentConfigResolver.resolve()` (arriba) no expone (es de solo lectura). Estructuralmente
+ *  idéntica a `AgentRepository.createProfile` (packages/runtime/src/persistence/repositories/
+ *  agent.ts), para que quien arma `RunControllerDeps` (createRuntime.ts) pueda pasar el mismo
+ *  repositorio sin adaptarlo. Opcional: sin este puerto, `delegate` sin `targetAgentId` falla con un
+ *  `ToolResult` de error explícito en vez de romper el run (ver deviations). */
+export interface AgentProfilePort {
+  createProfile(input: AgentCreateInput, ownerKind?: AgentOwnerKind): Promise<AgentProfile>;
 }
 
 export interface Clock { now(): number }

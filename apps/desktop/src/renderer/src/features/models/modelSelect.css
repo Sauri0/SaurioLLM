@@ -4,3 +4,12 @@
   align-items: center;
   gap: var(--space-1);
 }
+
+/* Tarea "ModelSelect: estados explícitos": "Iniciando motor local…" / "Ollama no está corriendo" /
+   "No hay modelos instalados", en vez de un <select> vacío o engañoso. */
+.saurio-model-select--status {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  gap: var(--space-2);
+}
+.saurio-model-select__action { flex-shrink: 0; }

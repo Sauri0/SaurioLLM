@@ -54,6 +54,17 @@ export const RunEventSchema = z.discriminatedUnion('type', [
   z.object({ ...runEventBase, type: z.literal('run.adjustment'), adjustment: AdjustmentSchema }),
   z.object({ ...runEventBase, type: z.literal('run.error'), error: RunErrorSchema, recoverable: z.boolean() }),
   z.object({ ...runEventBase, type: z.literal('run.recovered'), orphaned: z.array(ToolCallRecordSchema), abandoned: z.array(ToolCallRecordSchema) }),
+  // Doc 19 §2.3 (E3a delegación): emitido por el run PADRE (runId/chatId de la base son los del
+  // padre) cuando la tool `delegate` crea el run/chat hijo. `parentRunId` repite `runId` a propósito
+  // (literal del doc 19 §2.3) para que el payload sea autocontenido sin que un consumidor tenga que
+  // saber que `runId` de la base ES el padre. `childChatId` es un campo agregado (additive, no está
+  // en la letra literal del doc): sin él, `DelegationCard` no tiene forma de resolver a qué chat abrir
+  // con "ver conversación completa" sin escanear todo el stream de eventos del hijo primero.
+  z.object({
+    ...runEventBase, type: z.literal('run.delegated'),
+    parentRunId: z.string(), childRunId: z.string(), childChatId: z.string(),
+    targetAgentId: z.string(), task: z.string(),
+  }),
 ]);
 export type RunEvent = z.infer<typeof RunEventSchema>;
 

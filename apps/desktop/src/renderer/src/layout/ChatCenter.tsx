@@ -6,15 +6,17 @@
 // Ahora esa franja es `ChatHeader` (features/chat), que además colapsa la checklist por defecto
 // cuando hay más de 3 tareas — la conversación se queda con la mayor parte de la altura disponible.
 import { useEffect, useState } from 'react';
-import type { Chat, Mode, ModelRef, Task } from '@saurio/shared';
+import type { Chat, Mode, ModelRef, Project, Task } from '@saurio/shared';
 import { ChatPanel, ChatHeader } from '../features/chat/index.js';
 import { findActiveRunId } from '../features/chat/runStatus.js';
 import { useChatStore } from '../stores/chatStore.js';
 import { useRunStore } from '../stores/runStore.js';
 import { useModelsStore } from '../stores/modelsStore.js';
 import { useProvidersStore } from '../stores/providersStore.js';
+import { useAgentsStore } from '../stores/agentsStore.js';
 import { invoke } from '../ipc/client.js';
-import { FolderIcon } from '../ui/icons.js';
+import { pickDefaultModelRef } from './defaultModel.js';
+import { HomeScreen } from './HomeScreen.js';
 
 /** Referencia estable para "sin tareas". CAUSA RAÍZ (pantalla en blanco en dev, ver sesión de
  *  debugging): el selector de useRunStore devolvía `[]` como literal inline cuando no había
@@ -28,21 +30,24 @@ const EMPTY_TASKS: Task[] = [];
 const EMPTY_CHATS: Chat[] = [];
 const DEFAULT_MODE: Mode = 'agent';
 
-/** Agente builtin sembrado por el runtime al arrancar (packages/runtime/src/agent/defaults.ts) y
- *  modelo por defecto medido para este equipo (qwen3:8b, num_ctx 8192, 100% en GPU), usado como
- *  fallback antes de que `models:list` responda. El Centro de agentes (elegir otro agente por
- *  chat) es v0.2. Crear el chat en sí ahora lo dispara `layout/Sidebar.tsx` (pasada de diseño #1:
- *  único lugar con "+ Nuevo chat"); acá solo queda como semilla para el estado vacío de `ChatPanel`. */
+/** Agente builtin sembrado por el runtime al arrancar (packages/runtime/src/agent/defaults.ts). El
+ *  Centro de agentes (elegir otro agente por chat) es v0.2. Crear el chat en sí ahora lo dispara
+ *  `layout/Sidebar.tsx` (pasada de diseño #1: único lugar con "+ Nuevo chat"); acá solo queda como
+ *  semilla para el estado vacío de `ChatPanel`. PRIORIDAD CERO punto 6: ya no hay un modelo
+ *  hardcodeado acá — `pickDefaultModelRef` sale de los modelos REALMENTE instalados. */
 const DEFAULT_AGENT_ID = 'agent_builtin_lead';
-const DEFAULT_MODEL_REF = { providerId: 'ollama', name: 'qwen3:8b', locality: 'local' as const };
 
 export interface ChatCenterProps {
-  projectId: string | null;
+  project: Project | null;
+  onProjectChange: (project: Project) => void;
+  onSelectChat: (chatId: string) => void;
   onOpenDiff: (checkpointId: string, relPath: string) => void;
 }
 
-export function ChatCenter({ projectId, onOpenDiff }: ChatCenterProps): React.JSX.Element {
+export function ChatCenter({ project, onProjectChange, onSelectChat, onOpenDiff }: ChatCenterProps): React.JSX.Element {
+  const projectId = project?.id ?? null;
   const currentChatId = useChatStore((s) => s.currentChatId);
+  const chatsForProject = useChatStore((s) => (projectId ? (s.chatsByProject[projectId] ?? EMPTY_CHATS) : EMPTY_CHATS));
   const chat = useChatStore((s) => {
     if (!projectId || !currentChatId) return undefined;
     return (s.chatsByProject[projectId] ?? EMPTY_CHATS).find((c) => c.id === currentChatId);
@@ -59,6 +64,16 @@ export function ChatCenter({ projectId, onOpenDiff }: ChatCenterProps): React.JS
   const setChatModel = useChatStore((s) => s.setChatModel);
   const setChatMode = useChatStore((s) => s.setChatMode);
   const [changingChatConfig, setChangingChatConfig] = useState(false);
+  // Doc 19 §1.6/R04 ("identidad y alcance visibles"): resuelve el agente PERSONAL de este chat (si
+  // hay uno) para que ChatHeader muestre nombre+avatar; `undefined` para el agente builtin, sin
+  // cambio de comportamiento.
+  const personalAgents = useAgentsStore((s) => s.personalAgents);
+  const loadAgents = useAgentsStore((s) => s.load);
+  const chatAgent = chat ? personalAgents.find((a) => a.id === chat.agentId) : undefined;
+
+  useEffect(() => {
+    void loadAgents();
+  }, [loadAgents]);
 
   // Punto 3 del encargo (selector agrupado por proveedor): `providersStore` alimenta el `<optgroup>`
   // de `ModelSelect` con la etiqueta real de cada proveedor — se carga acá porque ChatCenter es lo
@@ -93,17 +108,11 @@ export function ChatCenter({ projectId, onOpenDiff }: ChatCenterProps): React.JS
     void setChatMode(currentChatId, nextMode).finally(() => setChangingChatConfig(false));
   };
 
-  if (!projectId) {
-    return (
-      <div className="saurio-empty-state saurio-empty-state--fill">
-        <span className="saurio-empty-state__icon"><FolderIcon width={22} height={22} /></span>
-        <span className="saurio-empty-state__title">Abrí una carpeta para empezar</span>
-        <span className="saurio-empty-state__hint">
-          SaurioLLM trabaja sobre un proyecto local. Usá &quot;Abrir carpeta…&quot; en la barra
-          lateral para elegir dónde va a leer y editar archivos.
-        </span>
-      </div>
-    );
+  // Punto 3 de la tarea "Cerrá lo que falta": pantalla de inicio unificada, sin proyecto Y con
+  // proyecto-pero-sin-chat (antes eran dos estados vacíos separados y más pobres — ninguno mostraba
+  // el estado del motor local/modelos ni ofrecía "Nuevo chat"/"Proveedores por API" directo).
+  if (!projectId || !currentChatId) {
+    return <HomeScreen project={project} onProjectChange={onProjectChange} onSelectChat={onSelectChat} />;
   }
 
   return (
@@ -119,6 +128,7 @@ export function ChatCenter({ projectId, onOpenDiff }: ChatCenterProps): React.JS
           onChangeModel={handleChangeModel}
           onChangeMode={handleChangeMode}
           changing={changingChatConfig}
+          agent={chatAgent}
         />
       )}
       <div className="saurio-chat-center__panel">
@@ -126,7 +136,7 @@ export function ChatCenter({ projectId, onOpenDiff }: ChatCenterProps): React.JS
           projectId={projectId}
           chat={chat}
           defaultAgentId={DEFAULT_AGENT_ID}
-          defaultModelRef={DEFAULT_MODEL_REF}
+          defaultModelRef={pickDefaultModelRef(installedModels, chatsForProject)}
           onOpenDiff={onOpenDiff}
         />
       </div>

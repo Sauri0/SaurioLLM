@@ -33,6 +33,10 @@ export interface StreamingMessage {
 export interface RunStoreState {
   /** Estado de máquina de cada run (doc 05 §1), por `runId`. */
   runStates: Record<string, RunState>;
+  /** `ts` (evento) del primer `run.state` visto de cada run — ver `reduceRunEvent`, "Cargando
+   *  modelo… mm:ss" (tarea "carga de modelo/oom_load"). No se borra en `clearChat` a propósito: es
+   *  información liviana y un run viejo no vuelve a usarse como referencia de tiempo activo. */
+  runStartedAt: Record<string, number>;
   /** `chatId` de cada run visto (para poder derivar qué chat corresponde a un runId suelto). */
   runChatIds: Record<string, string>;
   /** Mensajes ya cerrados (`message.done`) por chat, en orden de llegada. */
@@ -61,6 +65,13 @@ export interface RunStoreState {
   interrupted: Record<string, InterruptedInfo>;
   /** Último `seq` de evento aplicado, por run (para detectar huecos/duplicados si hiciera falta). */
   lastSeqByRun: Record<string, number>;
+  /** Doc 19 §2.6 (E3a delegación): runs hijo creados por `delegate`, por run PADRE (`run.delegated`).
+   *  `DelegationCard` los usa para saber a qué `childRunId`/`childChatId` corresponde una tool call
+   *  de categoría `delegate`. */
+  childRunsByParent: Record<string, string[]>;
+  /** `childChatId` de cada `childRunId` visto en `run.delegated` — `DelegationCard` lo necesita para
+   *  el link "ver conversación completa" sin escanear el stream de eventos del hijo. */
+  childChatIdByRun: Record<string, string>;
 
   applyEvents: (events: RunEvent[]) => void;
   clearChat: (chatId: string) => void;
@@ -89,9 +100,18 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
 
   switch (event.type) {
     case 'run.state': {
+      // Tarea "carga de modelo/oom_load", punto "Cargando modelo… mm:ss": se guarda cuándo empezó
+      // ESTE run (primer `run.state` que se ve de él) para poder mostrar un cronómetro mientras no
+      // llegó ningún `message.delta` todavía — Ollama puede tardar bastante en cargar el modelo antes
+      // de emitir el primer token, y para el usuario eso se ve igual que "generando" sin indicación
+      // de por qué tarda. No se pisa si ya existía (mismo run, vuelta siguiente del loop).
+      const runStartedAt = state.runStartedAt[event.runId] !== undefined
+        ? state.runStartedAt
+        : { ...state.runStartedAt, [event.runId]: event.ts };
       return {
         ...state,
         runChatIds,
+        runStartedAt,
         runStates: { ...state.runStates, [event.runId]: event.to },
       };
     }
@@ -196,6 +216,18 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
       };
       return { ...state, runChatIds, interrupted: { ...state.interrupted, [event.runId]: info } };
     }
+    case 'run.delegated': {
+      const children = state.childRunsByParent[event.parentRunId] ?? [];
+      return {
+        ...state,
+        runChatIds,
+        childRunsByParent: {
+          ...state.childRunsByParent,
+          [event.parentRunId]: children.includes(event.childRunId) ? children : [...children, event.childRunId],
+        },
+        childChatIdByRun: { ...state.childChatIdByRun, [event.childRunId]: event.childChatId },
+      };
+    }
     default: {
       const _exhaustive: never = event;
       return _exhaustive;
@@ -205,6 +237,7 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
 
 const initialState: Omit<RunStoreState, 'applyEvents' | 'clearChat' | 'dismissInterrupted' | 'hydratePendingPermissions'> = {
   runStates: {},
+  runStartedAt: {},
   runChatIds: {},
   messagesByChat: {},
   metricsByMessage: {},
@@ -218,6 +251,8 @@ const initialState: Omit<RunStoreState, 'applyEvents' | 'clearChat' | 'dismissIn
   errorsByRun: {},
   interrupted: {},
   lastSeqByRun: {},
+  childRunsByParent: {},
+  childChatIdByRun: {},
 };
 
 export const useRunStore = create<RunStoreState>((set) => ({

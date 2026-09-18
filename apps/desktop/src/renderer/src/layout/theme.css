@@ -237,6 +237,22 @@ kbd {
   min-height: 60px;
 }
 
+/* Accesos directos a Modelos/Ajustes (punto 3 de la tarea "Cerrá lo que falta"). */
+.saurio-sidebar-quicklinks {
+  flex: 0 0 auto;
+  display: flex;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+}
+.saurio-sidebar-quicklinks button {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+}
+
 /* Bloque "próximo chat": fijo abajo de la barra lateral (no scrollea con la lista de chats),
    compacto — modelo (con badge LOCAL) + modo, para el próximo `chat:create` (pasada de diseño #1). */
 .saurio-sidebar-next-chat {
@@ -344,15 +360,20 @@ kbd {
   border-bottom: 2px solid transparent;
 }
 .saurio-tab svg { flex: 0 0 auto; }
+/* PRIORIDAD CERO punto 4 (bloqueo real reportado tras instalar v0.1: "las pestañas del panel
+   derecho son iconos sin texto" — la app se sentía "solo chat"). Antes esto era `display: none` por
+   defecto y solo `.saurio-tab.active .saurio-tab__label` lo mostraba: CADA pestaña YA traía su
+   `label` en el JSX (`layout/RightPanel.tsx`, "Arch.", "Diff", "Term.", "Mod.", "Rend.", "Ajus."),
+   pero el CSS los escondía para las 5 que no estaban activas — confirmado con una captura real
+   (SAURIO_SMOKE_SHOT) antes de este cambio. Ahora el texto se ve siempre, no solo en la pestaña
+   activa. */
 .saurio-tab__label {
-  display: none;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .saurio-tab:hover { color: var(--text-primary); }
 .saurio-tab.active { color: var(--text-primary); border-bottom-color: var(--accent); font-weight: 500; }
-.saurio-tab.active .saurio-tab__label { display: inline; }
 
 .saurio-tab-body {
   flex: 1;
@@ -386,6 +407,9 @@ kbd {
 .saurio-statusbar__dot.down { background: var(--danger); box-shadow: 0 0 0 2px var(--danger-subtle); }
 .saurio-statusbar__spacer { flex: 1; }
 .saurio-statusbar__sep { width: 1px; height: 14px; background: var(--border); }
+/* PRIORIDAD CERO puntos 1/7: botón "Iniciar Ollama" cuando el health check falla, del tamaño de la
+   barra de estado (no el botón grande de la barra lateral). */
+.saurio-statusbar__start-ollama { padding: 2px var(--space-2); font-size: var(--text-xs); line-height: 1.2; }
 
 /* ── Badges ───────────────────────────────────────────────────────────────────────────────── */
 

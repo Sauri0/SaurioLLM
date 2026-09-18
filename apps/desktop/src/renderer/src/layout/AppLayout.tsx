@@ -45,13 +45,15 @@ export function AppLayout(): React.JSX.Element {
       />
       <main className="saurio-main">
         <ChatCenter
-          projectId={project?.id ?? null}
+          project={project}
+          onProjectChange={(next) => { setProject(next); setCurrentChat(undefined); }}
+          onSelectChat={setCurrentChat}
           // El diff en sí vive en la pestaña "Diff" del panel derecho (features/diff): abrir un
           // diff desde el chat es equivalente a mirar los checkpoints de ese chat ahí.
           onOpenDiff={() => { /* la pestaña Diff del panel derecho ya lista los checkpoints del chat */ }}
         />
       </main>
-      <RightPanel projectId={project?.id ?? null} chatId={currentChatId ?? null} />
+      <RightPanel projectId={project?.id ?? null} chatId={currentChatId ?? null} onSelectChat={setCurrentChat} />
       <StatusBar projectId={project?.id ?? null} chatId={currentChatId ?? null} />
       {/* Punto 5 del encargo: se muestra una sola vez (settings.onboarding.completed) y se puede
           reabrir desde Ajustes. En modo demo (herramienta de verificación visual) no se monta, para

@@ -42,6 +42,8 @@
   min-width: 120px;
 }
 .chat-header__meta { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; flex-wrap: wrap; }
+/* Doc 19 §1.6/R04: identidad del agente personal del chat, cuando no es el builtin. */
+.chat-header__agent { font-weight: 600; }
 
 .chat-header__run-status {
   display: inline-flex;
@@ -251,6 +253,19 @@
 .interrupted-run-card__title { font-weight: 600; margin-bottom: var(--space-1); }
 .interrupted-run-card__actions { display: flex; gap: var(--space-2); margin-top: var(--space-2); }
 
+/* Tarea "carga de modelo/oom_load": tarjeta de "el modelo no entró en la memoria de tu equipo". */
+.oom-load-card {
+  background: var(--danger-subtle);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  margin: var(--space-2) 0;
+  font-size: var(--text-base);
+}
+.oom-load-card__title { font-weight: 600; margin-bottom: var(--space-1); }
+.oom-load-card__detail { color: var(--text-muted); font-size: var(--text-sm); font-family: var(--font-mono, monospace); margin-bottom: var(--space-2); }
+.oom-load-card__actions { display: flex; gap: var(--space-2); }
+
 .mode-selector { display: flex; gap: 2px; background: var(--bg-1); border-radius: var(--radius-md); padding: 2px; width: fit-content; }
 .mode-selector__option {
   background: transparent;
@@ -263,6 +278,28 @@
 }
 .mode-selector__option:hover:not(:disabled) { color: var(--text-primary); }
 .mode-selector__option--active { background: var(--bg-4); color: var(--text-primary); font-weight: 500; }
+
+/* Tarea "carga de modelo/oom_load": "Cargando modelo… mm:ss" + Cancelar, entre los mensajes y el
+   compositor mientras Ollama todavía no mandó ningún token. */
+.model-loading-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-5);
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.model-loading-banner__spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--border-subtle);
+  border-top-color: var(--accent, var(--text-primary));
+  animation: saurio-spin 0.8s linear infinite;
+}
+@keyframes saurio-spin { to { transform: rotate(360deg); } }
+.model-loading-banner__cancel { margin-left: auto; }
 
 .chat-input {
   border-top: 1px solid var(--border-subtle);
@@ -309,3 +346,25 @@
 .chat-input__send:disabled { opacity: 0.5; cursor: not-allowed; }
 .chat-input__cancel { background: var(--danger-subtle); color: var(--danger); border: 1px solid var(--danger); }
 .chat-input__cancel:hover { background: var(--danger); color: var(--text-on-accent); }
+
+/* DelegationCard.tsx (doc 19 §2.6, E3a delegación) — mismos tokens que .tool-call-card. */
+.delegation-card {
+  background: var(--bg-3);
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+  font-size: var(--text-sm);
+}
+.delegation-card__header { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.delegation-card__icon { display: flex; color: var(--text-muted); }
+.delegation-card__task, .delegation-card__deliverable { margin: var(--space-1) 0 0; color: var(--text-secondary); }
+.delegation-card__result { margin-top: var(--space-2); padding-top: var(--space-2); border-top: 1px solid var(--border-subtle); }
+.delegation-card__result-status { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-muted); }
+.delegation-card__result--failed .delegation-card__result-status { color: var(--danger); }
+.delegation-card__result--completed .delegation-card__result-status { color: var(--success); }
+.delegation-card__summary { margin: var(--space-1) 0 0; }
+.delegation-card__uncertainties { margin: var(--space-1) 0 0; padding-left: 18px; color: var(--text-muted); font-size: var(--text-xs); }
+.delegation-card__open-chat { margin-top: var(--space-2); }
+.delegation-card__pending { display: block; margin-top: var(--space-1); }

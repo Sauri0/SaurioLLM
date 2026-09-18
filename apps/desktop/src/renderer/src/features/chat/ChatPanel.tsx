@@ -5,7 +5,7 @@
 // con el selector de modelo, "+ Nuevo chat" y una lista de chats — la segunda de las tres columnas
 // que había a la izquierda del chat. Esa configuración vive ahora en la única barra lateral
 // (`layout/Sidebar.tsx`); acá solo queda la conversación, a todo el ancho del centro.
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import type { Chat, Mode, ModelRef } from '@saurio/shared';
 import { invoke } from '../../ipc/client.js';
 import { useChatStore } from '../../stores/chatStore.js';
@@ -16,6 +16,7 @@ import { formatContextPair } from '../../ui/formatTokens.js';
 import { findActiveRunId } from './runStatus.js';
 import { ChatMessageList } from './ChatMessageList.js';
 import { ChatInput } from './ChatInput.js';
+import { ModelLoadingBanner } from './ModelLoadingBanner.js';
 import './chat.css';
 
 const DEFAULT_MODE: Mode = 'agent';
@@ -26,7 +27,10 @@ export interface ChatPanelProps {
    *  `layout/ChatCenter.tsx` desde `chatStore`, así ChatPanel no repite el `.find()`. */
   chat: Chat | undefined;
   defaultAgentId: string;
-  defaultModelRef: ModelRef;
+  /** PRIORIDAD CERO punto 6: `undefined` cuando `models:list` no reportó ningún modelo instalado —
+   *  ya no hay un `qwen3:8b` hardcodeado que asumir. Sin esto, no se puede crear un chat nuevo
+   *  (ver el estado vacío de abajo). */
+  defaultModelRef: ModelRef | undefined;
   /** El diff en sí vive en `features/diff` (fuera de esta tarea); acá solo se reenvía el pedido. */
   onOpenDiff: (checkpointId: string, relPath: string) => void;
 }
@@ -48,6 +52,8 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
 
   const runStates = useRunStore((s) => s.runStates);
   const runChatIds = useRunStore((s) => s.runChatIds);
+  const runStartedAt = useRunStore((s) => s.runStartedAt);
+  const streaming = useRunStore((s) => s.streaming);
   const messages = useRunStore((s) => (currentChatId ? s.messagesByChat[currentChatId] : undefined));
   const metricsByMessage = useRunStore((s) => s.metricsByMessage);
 
@@ -60,12 +66,28 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
   const activeRunId = findActiveRunId(currentChatId, runChatIds, runStates);
 
   async function handleCreateChat(): Promise<void> {
+    if (!draftModelRef) return; // el botón de abajo ya queda deshabilitado sin modelo instalado
     const created = await createChat(projectId, defaultAgentId, DEFAULT_MODE, draftModelRef);
     setCurrentChat(created.id);
   }
 
+  const [sendError, setSendError] = useState<string | undefined>(undefined);
+
+  // Punto 2 del encargo ("nunca permitir enviar a un modelo no instalado — validación antes de
+  // crear el run con error accionable"): un modelo LOCAL puede haberse desinstalado (Centro de
+  // modelos, u otro proceso) después de que este chat ya lo tuviera asignado — sin este chequeo,
+  // `run:start` igual dispara el run y el usuario recién se entera del problema cuando falla
+  // (`provider_down`/`model_not_found`, varios segundos después). Los modelos LAN/NUBE no tienen
+  // noción de "instalado" (siempre disponibles mientras el proveedor esté configurado), así que el
+  // chequeo solo aplica a `locality: 'local'`.
   async function handleSend(text: string): Promise<void> {
     if (!currentChatId) return;
+    const modelRef = chat?.modelRef;
+    if (modelRef?.locality === 'local' && !installedModels.some((m) => m.ref.name === modelRef.name)) {
+      setSendError(`El modelo "${modelRef.name}" ya no está instalado en este equipo. Elegí otro modelo arriba antes de enviar.`);
+      return;
+    }
+    setSendError(undefined);
     await invoke('run:start', { chatId: currentChatId, text, mode });
   }
 
@@ -74,7 +96,7 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
     await invoke('run:cancel', { runId: activeRunId });
   }
 
-  const activeModelName = chat?.modelRef?.name ?? draftModelRef.name;
+  const activeModelName = chat?.modelRef?.name ?? draftModelRef?.name;
   const activeModelInfo = installedModels.find((m) => m.ref.name === activeModelName);
   const lastMessageId = messages && messages.length > 0 ? messages[messages.length - 1]!.id : undefined;
   const lastMetrics = lastMessageId ? metricsByMessage[lastMessageId] : undefined;
@@ -82,6 +104,10 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
     ? lastMetrics.promptTokens + lastMetrics.evalTokens
     : undefined;
   const contextLabel = formatContextPair(contextUsed, activeModelInfo?.contextMax);
+  // Tarea "carga de modelo/oom_load": "cargando" = el run activo no tiene ningún `message.delta`
+  // todavía (ningún `streaming` cuyo `runId` sea este) — ver ModelLoadingBanner.
+  const hasFirstChunk = activeRunId !== undefined
+    && Object.values(streaming).some((m) => m.runId === activeRunId);
 
   return (
     <div className="chat-panel">
@@ -89,15 +115,29 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
         {currentChatId ? (
           <>
             <div className="chat-panel__messages">
-              <ChatMessageList chatId={currentChatId} onOpenDiff={onOpenDiff} currentModelLocality={chat?.modelRef?.locality} />
+              <ChatMessageList
+                chatId={currentChatId}
+                onOpenDiff={onOpenDiff}
+                currentModelLocality={chat?.modelRef?.locality}
+                currentModelName={activeModelName}
+              />
             </div>
+            <ModelLoadingBanner
+              runState={activeRunId ? runStates[activeRunId] : undefined}
+              startedAt={activeRunId ? runStartedAt[activeRunId] : undefined}
+              hasFirstChunk={hasFirstChunk}
+              onCancel={() => void handleCancel()}
+            />
+            {sendError && (
+              <div className="saurio-banner danger chat-panel__send-error" role="alert">{sendError}</div>
+            )}
             <ChatInput
               mode={mode}
               onModeChange={(m) => setMode(currentChatId, m)}
               isRunning={activeRunId !== undefined}
               onSend={(text) => void handleSend(text)}
               onCancel={() => void handleCancel()}
-              modelName={activeModelName}
+              modelName={activeModelName ?? '(sin modelo)'}
               contextLabel={contextLabel}
             />
           </>
@@ -105,8 +145,16 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
           <div className="saurio-empty-state saurio-empty-state--fill">
             <span className="saurio-empty-state__icon"><ChatIcon width={18} height={18} /></span>
             <span className="saurio-empty-state__title">Elegí un chat o creá uno nuevo</span>
-            <span className="saurio-empty-state__hint">Cada chat mantiene su propio modo, modelo e historial.</span>
-            <button type="button" className="saurio-btn-primary" onClick={() => void handleCreateChat()}>+ Nuevo chat</button>
+            <span className="saurio-empty-state__hint">
+              {draftModelRef
+                ? 'Cada chat mantiene su propio modo, modelo e historial.'
+                // PRIORIDAD CERO punto 6: explícito en vez de dejar crear un chat contra un modelo
+                // que no existe en este equipo.
+                : 'No hay ningún modelo instalado todavía. Instalá uno en la pestaña "Modelos" para poder crear un chat.'}
+            </span>
+            <button type="button" className="saurio-btn-primary" onClick={() => void handleCreateChat()} disabled={!draftModelRef}>
+              + Nuevo chat
+            </button>
           </div>
         )}
       </section>

@@ -15,7 +15,9 @@ import type {
   TaskRepository, SettingsRepository, ProfileRepository,
 } from '@saurio/runtime/persistence/types';
 import type { ModelManager, HardwareProbe } from '@saurio/runtime/models/types';
-import type { DownloadManager, ModelCatalogEntry, RecommendationEngine, DownloadJob } from '@saurio/runtime/models/index';
+import type {
+  DownloadManager, ModelCatalogEntry, RecommendationEngine, DownloadJob, OllamaLibraryClient, HuggingFaceClient,
+} from '@saurio/runtime/models/index';
 import type { ModelGateway } from '@saurio/runtime/gateway/types';
 import type { Provider } from '@saurio/runtime/gateway/Provider';
 import type { CheckpointService } from '@saurio/runtime/checkpoint/types';
@@ -220,6 +222,15 @@ export class RuntimeHost {
     return this.runtime.recommendationEngine;
   }
 
+  /** Punto 1-3 del encargo (doc 16 §12.6): biblioteca completa de Ollama y búsqueda de Hugging Face. */
+  get ollamaLibraryClient(): OllamaLibraryClient {
+    return this.runtime.ollamaLibraryClient;
+  }
+
+  get huggingFaceClient(): HuggingFaceClient {
+    return this.runtime.huggingFaceClient;
+  }
+
   /** Reenvía `download:progress`/`download:done`/`download:failed` (doc 13 §5) al renderer; se
    *  suscribe una sola vez, recién cuando ya existe la `BrowserWindow` (main/index.ts), igual que
    *  `onRunEvent` para `runtime:event`. No-op si el runtime real no está armado. */
@@ -315,6 +326,16 @@ export class RuntimeHost {
   get profileRepository(): ProfileRepository {
     if (!this.deps.profileRepository) throw new RuntimeNotWiredError('ProfileRepository');
     return this.deps.profileRepository;
+  }
+
+  // ── Doc 19 §1.5 (E2a "Mis agentes") ──────────────────────────────────────
+
+  get agentRepository() {
+    return this.runtime.persistence.repositories.agents;
+  }
+
+  get agentMemoryRepository() {
+    return this.runtime.persistence.repositories.agentMemories;
   }
 
   /** Runs de un chat, para que `chat:history` pueda juntar las tool calls de todos ellos

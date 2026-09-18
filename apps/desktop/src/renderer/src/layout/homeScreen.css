@@ -1,0 +1,66 @@
+/* Pantalla de inicio sin chat abierto (punto 3 de la tarea) — layout/HomeScreen.tsx. */
+.saurio-home {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  padding: var(--space-8);
+  text-align: center;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.saurio-home__status {
+  display: flex;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.saurio-home__status-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.saurio-home__status-item--ok { color: var(--success, var(--text-primary)); }
+.saurio-home__status-item--down { color: var(--danger); }
+
+.saurio-home__title { font-size: var(--text-lg); font-weight: 600; color: var(--text-primary); margin: 0; }
+.saurio-home__hint { font-size: var(--text-sm); color: var(--text-muted); max-width: 420px; line-height: var(--leading-normal); margin: 0; }
+
+.saurio-home__actions {
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-top: var(--space-2);
+}
+.saurio-home__action {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1);
+  width: 200px;
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-2);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.saurio-home__action:hover:not(:disabled) { border-color: var(--accent); background: var(--bg-3); }
+.saurio-home__action:disabled { opacity: 0.5; cursor: not-allowed; }
+.saurio-home__action-title { font-weight: 600; font-size: var(--text-base); }
+.saurio-home__action-hint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.saurio-home__providers { margin-top: var(--space-2); }

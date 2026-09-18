@@ -57,7 +57,7 @@ const MODE_DENIED_CATEGORIES = new Set<PermissionCategory>([
 ]);
 
 const CATEGORY_PRIORITY: Record<PermissionCategory, number> = {
-  delete: 0, git_push: 0, git_commit: 1, network: 1, terminal: 2, mcp: 2, write: 3, read: 4,
+  delete: 0, git_push: 0, git_commit: 1, network: 1, terminal: 2, mcp: 2, delegate: 2, write: 3, read: 4,
 };
 
 function mostRestrictiveCategory(categories: PermissionCategory[]): PermissionCategory {
@@ -96,6 +96,11 @@ function defaultForCategory(
     case 'git_push':
     case 'network':
     case 'mcp':
+      return 'ask';
+    // Doc 19 §2 (E3a delegación): la tool `delegate` no se agrega a DEFAULT_ALLOWED_TOOLS y solo un
+    // agente que la tenga explícita en su allowedTools puede verla — igual se pide confirmación por
+    // defecto (mismo criterio cauteloso que terminal/network/mcp), sin agregar un preset nuevo.
+    case 'delegate':
       return 'ask';
   }
 }

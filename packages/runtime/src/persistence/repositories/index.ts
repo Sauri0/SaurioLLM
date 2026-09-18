@@ -13,6 +13,7 @@ import { createTaskRepository } from './task.js';
 import { createSettingsRepository } from './settings.js';
 import { createRunRepository } from './run.js';
 import { createAgentRepository } from './agent.js';
+import { createAgentMemoryRepository } from './agentMemory.js';
 import { createCheckpointStoreRepository, createBlobRefStore } from './checkpointStore.js';
 import { createPermissionRuleRepository, createPermissionDecisionRepository } from './permission.js';
 
@@ -28,6 +29,8 @@ export function createRepositories(driver: SqliteDriver) {
     // Agregados por la fase de integración (no están en persistence/types.ts; ver 16-estado-de-implementacion.md):
     runs: createRunRepository(driver),
     agents: createAgentRepository(driver),
+    // Doc 19 §1.5 (E2a "Mis agentes", migración 0004):
+    agentMemories: createAgentMemoryRepository(driver),
     checkpointStore: createCheckpointStoreRepository(driver),
     blobRefs: createBlobRefStore(driver),
     // Agregados en esta tarea (doc 16 §4, "allow_always no persiste"): implementación SQLite real de
@@ -47,6 +50,7 @@ export { createCheckpointRepository } from './checkpoint.js';
 export { createTaskRepository } from './task.js';
 export { createSettingsRepository } from './settings.js';
 export { createRunRepository, type SqliteRunRepository } from './run.js';
-export { createAgentRepository, type AgentRepository } from './agent.js';
+export { createAgentRepository, type AgentRepository, type AgentProfileFilter } from './agent.js';
+export { createAgentMemoryRepository, type AgentMemoryRepository, type AgentMemoryUpsertInput } from './agentMemory.js';
 export { createCheckpointStoreRepository, createBlobRefStore } from './checkpointStore.js';
 export { createPermissionRuleRepository, createPermissionDecisionRepository } from './permission.js';

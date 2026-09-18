@@ -11,11 +11,110 @@ import type { HardwareProfile, HardwareDatum } from './types.js';
 import type { HardwareProbe as HardwareProbeContract } from './types.js';
 import { type CommandRunner, realCommandRunner, POWERSHELL_EXE } from './CommandRunner.js';
 
+/** Puerto opcional hacia el texto del log de `ollama serve` (stdout capturado por la app al
+ *  lanzarlo, o `%LOCALAPPDATA%\Ollama\server.log`) — lo expone el host (apps/desktop) una vez que el
+ *  agente de proceso de Ollama lo tenga andando; hasta entonces `sample()` sigue el camino previo
+ *  (nvidia-smi -> registro de Windows) sin romper nada. Es la única fuente que cubre GPUs sin
+ *  `nvidia-smi` (Intel/AMD/Apple, doc 13 §7 "v0.2: AMD/Apple vía log de Ollama") — Ollama mismo ya
+ *  sondeó el hardware real con su propio backend (Vulkan/Metal/ROCm) y lo vuelca en la línea
+ *  `msg="inference compute"` (`[VERIFICADO EN DOC OFICIAL: discover/types.go, LogDetails(), repo
+ *  ollama/ollama]`). */
+export interface OllamaInferenceComputeSource {
+  read(): Promise<string | undefined>;
+}
+
 export interface HardwareProbeOptions {
   runner?: CommandRunner;
   now?: () => number;
   platformOverride?: NodeJS.Platform;
+  inferenceComputeSource?: OllamaInferenceComputeSource;
+  /** RAM total inyectable para tests (por defecto `os.totalmem()`); usada también por el fallback de
+   *  memoria unificada de última instancia. */
+  totalMemOverride?: () => number;
+  /** `false` por defecto a propósito: sin ninguna señal real (ni `nvidia-smi`, ni log de Ollama, ni
+   *  registro de Windows) lo más honesto sigue siendo `gpu: undefined` — inventar una GPU de la nada
+   *  en, por ejemplo, un servidor headless sin GPU sería peor que no reportar nada. El host
+   *  (apps/desktop) lo prende explícitamente solo en plataformas donde tiene sentido asumir memoria
+   *  unificada (win32/darwin) — ver comentario de `unifiedMemoryFallback`. */
+  assumeUnifiedMemoryFallback?: boolean;
 }
+
+export interface OllamaInferenceDevice {
+  id: string;
+  name: string;
+  /** `'iGPU' | 'discrete' | 'cpu' | ''` tal cual lo escribe Ollama (`discover/types.go`); se guarda
+   *  crudo porque el valor exacto puede cambiar entre versiones y este parser es tolerante a propósito. */
+  type: string;
+  totalBytes: number;
+  availableBytes: number;
+  raw: Record<string, string>;
+}
+
+/** Parsea "X.X GiB"/"MiB"/"KiB"/"B" — el formato exacto de `format.HumanBytes2` de Ollama
+ *  [VERIFICADO EN DOC OFICIAL: format/bytes.go, repo ollama/ollama]. */
+function parseHumanBytes2(text: string): number | undefined {
+  const m = /^([\d.]+)\s*(GiB|MiB|KiB|B)$/i.exec(text.trim());
+  if (!m) return undefined;
+  const value = Number.parseFloat(m[1] ?? '');
+  if (!Number.isFinite(value)) return undefined;
+  const unit = (m[2] ?? '').toLowerCase();
+  const mult = unit === 'gib' ? 1024 ** 3 : unit === 'mib' ? 1024 ** 2 : unit === 'kib' ? 1024 : 1;
+  return Math.round(value * mult);
+}
+
+/** Extrae pares `clave=valor` de una línea de log de `log/slog` (Go), con o sin comillas
+ *  (`name="Intel(R) Arc(TM) 140V GPU"` vs `type=iGPU`) — tolerante a espacios dentro de valores
+ *  citados y a campos ausentes. */
+function parseSlogFields(line: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const re = /([A-Za-z_][\w.]*)=("(?:[^"\\]|\\.)*"|\S*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(line))) {
+    const key = m[1] ?? '';
+    let value = m[2] ?? '';
+    if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1).replace(/\\"/g, '"');
+    fields[key] = value;
+  }
+  return fields;
+}
+
+/** Parsea todas las líneas `msg="inference compute"` del log de `ollama serve` (doc 13 §7 v0.2: única
+ *  fuente medida para GPUs sin `nvidia-smi`). Devuelve un dispositivo por línea, en el orden en que
+ *  aparecen (Ollama las loggea una vez por dispositivo cada vez que arranca/recarga, así que un log
+ *  largo puede repetir el mismo id — el llamador se queda con la ÚLTIMA aparición de cada id). */
+export function parseOllamaInferenceComputeLog(text: string): OllamaInferenceDevice[] {
+  const byId = new Map<string, OllamaInferenceDevice>();
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.includes('inference compute')) continue;
+    const fields = parseSlogFields(line);
+    if (fields['msg'] !== 'inference compute') continue;
+    const total = parseHumanBytes2(fields['total'] ?? '');
+    if (total === undefined) continue;
+    const available = parseHumanBytes2(fields['available'] ?? '') ?? total;
+    const id = fields['id'] ?? String(byId.size);
+    byId.set(id, { id, name: fields['name'] ?? 'gpu', type: fields['type'] ?? '', totalBytes: total, availableBytes: available, raw: fields });
+  }
+  return [...byId.values()];
+}
+
+/** Heurística de vendor a partir del nombre del dispositivo — Ollama no manda un campo `vendor`
+ *  explícito en la línea de log, solo `name`/`driver`/`library` (doc 13 §7: "Ollama ya sondeó el
+ *  hardware real"; acá solo se clasifica el texto que ya trajo). */
+function guessVendorFromName(name: string): 'nvidia' | 'amd' | 'intel' | 'apple' | 'other' {
+  const n = name.toLowerCase();
+  if (/nvidia|geforce|rtx|gtx|quadro|tesla/.test(n)) return 'nvidia';
+  if (/intel|arc\b|iris/.test(n)) return 'intel';
+  if (/amd|radeon|ryzen ai/.test(n)) return 'amd';
+  if (/apple|\bm[1-4]\b/.test(n)) return 'apple';
+  return 'other';
+}
+
+/** Proporción de la RAM total que un iGPU/memoria unificada puede reclamar en la práctica cuando no
+ *  hay ninguna fuente medida (ni `nvidia-smi`, ni log de Ollama, ni registro de Windows) — último
+ *  recurso, siempre `quality: 'estimated'`. `[HIPÓTESIS A PROBAR]`: el dato real medido en el equipo
+ *  #2 (Intel Core Ultra 9 288V, 32 GB RAM, Ollama reporta 18.0 GiB para el iGPU) da ~56%, dentro del
+ *  rango 50-60% que reportó el relevamiento de esa máquina — se usa 0.55 como punto medio. */
+const UNIFIED_MEMORY_CEILING_RATIO = 0.55;
 
 interface NvidiaSmiRow {
   name: string;
@@ -61,9 +160,11 @@ export class HardwareProbe implements HardwareProbeContract {
   private readonly runner: CommandRunner;
   private readonly now: () => number;
   private readonly platform: NodeJS.Platform;
+  private readonly options: HardwareProbeOptions;
   private nvidiaSmiAvailable: boolean | undefined;
 
   constructor(options: HardwareProbeOptions = {}) {
+    this.options = options;
     this.runner = options.runner ?? realCommandRunner;
     this.now = options.now ?? Date.now;
     this.platform = options.platformOverride ?? platform;
@@ -85,7 +186,7 @@ export class HardwareProbe implements HardwareProbeContract {
     const ramFree = freemem();
 
     const gpuRow = await this.probeNvidiaSmi();
-    const gpu = gpuRow
+    let gpu: HardwareProfile['gpu'] = gpuRow
       ? {
           vendor: 'nvidia' as const,
           vramTotalBytes: datum(gpuRow.memoryTotalMiB * MIB, 'measured' as const, 'nvidia-smi', sampledAt, 'bytes'),
@@ -94,7 +195,17 @@ export class HardwareProbe implements HardwareProbeContract {
           temperatureC: datum(gpuRow.temperatureC, 'measured' as const, 'nvidia-smi', sampledAt, 'C'),
           powerW: datum(gpuRow.powerW, 'measured' as const, 'nvidia-smi', sampledAt, 'W'),
         }
-      : await this.fallbackGpu(sampledAt);
+      : undefined;
+
+    // Doc 13 §7 v0.2 / hardware real del equipo #2 (Intel Core Ultra 9 288V + Arc 140V iGPU, sin
+    // nvidia-smi): el log de `ollama serve` ya sondeó el hardware con su propio backend (Vulkan en
+    // Windows/Intel, Metal en Apple, ROCm en AMD) — se usa como segunda fuente antes de caer al
+    // registro de Windows (menos preciso: no distingue uso actual, solo el total instalado).
+    if (!gpu) gpu = await this.probeOllamaInferenceCompute(sampledAt);
+    if (!gpu) gpu = await this.fallbackGpu(sampledAt);
+    if (!gpu && this.options.assumeUnifiedMemoryFallback && (this.platform === 'win32' || this.platform === 'darwin')) {
+      gpu = this.unifiedMemoryFallback(sampledAt);
+    }
 
     const fingerprint = this.fingerprint({
       gpuUuid: gpuRow?.uuid,
@@ -131,6 +242,50 @@ export class HardwareProbe implements HardwareProbeContract {
       this.nvidiaSmiAvailable = false;
       return undefined;
     }
+  }
+
+  /** Segunda fuente (doc 13 §7 v0.2): línea `msg="inference compute"` del log de `ollama serve`, la
+   *  única que cubre iGPU Intel/AMD y Apple Silicon sin depender de `nvidia-smi`. Se queda con el
+   *  dispositivo de mayor `totalBytes` que no sea la fila de CPU (`id === 'cpu'`) — Ollama loggea una
+   *  fila por dispositivo elegible, ordenadas por preferencia de scheduling. Sin `inferenceComputeSource`
+   *  inyectado (todavía no cableado en `apps/desktop`, ver comentario del puerto) devuelve `undefined`
+   *  de inmediato, sin romper nada. */
+  private async probeOllamaInferenceCompute(sampledAt: number): Promise<HardwareProfile['gpu']> {
+    const source = this.options.inferenceComputeSource;
+    if (!source) return undefined;
+    let text: string | undefined;
+    try {
+      text = await source.read();
+    } catch {
+      return undefined;
+    }
+    if (!text) return undefined;
+    const devices = parseOllamaInferenceComputeLog(text).filter((d) => d.id !== 'cpu' && d.type !== '');
+    if (devices.length === 0) return undefined;
+    const best = devices.reduce((a, b) => (b.totalBytes > a.totalBytes ? b : a));
+    const integrated = /igpu/i.test(best.type);
+    return {
+      vendor: guessVendorFromName(best.name),
+      integrated,
+      vramTotalBytes: datum(best.totalBytes, 'measured', 'ollama:inference-compute', sampledAt, 'bytes'),
+      vramUsedBytes: datum(Math.max(best.totalBytes - best.availableBytes, 0), 'measured', 'ollama:inference-compute', sampledAt, 'bytes'),
+    };
+  }
+
+  /** Último recurso, y solo si el host lo pidió explícitamente (`assumeUnifiedMemoryFallback`, doc 13
+   *  §7, hardware real equipo #2): sin `nvidia-smi`, sin log de Ollama todavía cableado y sin dato de
+   *  registro de Windows, se asume que una fracción de la RAM total podría ser memoria unificada
+   *  utilizable por una iGPU, SIEMPRE marcado `'estimated'`. Apagado por defecto (ver comentario de la
+   *  opción): sin ninguna señal real, `gpu: undefined` sigue siendo más honesto que inventar una cifra
+   *  en una máquina que a lo mejor ni tiene GPU. */
+  private unifiedMemoryFallback(sampledAt: number): HardwareProfile['gpu'] {
+    const totalMem = (this.options.totalMemOverride ?? totalmem)();
+    const estimatedCeiling = Math.round(totalMem * UNIFIED_MEMORY_CEILING_RATIO);
+    return {
+      vendor: 'other',
+      integrated: true,
+      vramTotalBytes: datum(estimatedCeiling, 'estimated', 'heuristic:unified-memory-55pct', sampledAt, 'bytes'),
+    };
   }
 
   /** Sin nvidia-smi (GPU no NVIDIA o ausente): en Windows se intenta el registro

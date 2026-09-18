@@ -10,9 +10,10 @@
 // de verdad — usa lo que `demo/demoState.ts` ya sembró en `useModelsStore`, para poder capturar este
 // panel sin depender de que Ollama esté corriendo en la máquina que toma la captura.
 import { useCallback, useEffect, useState } from 'react';
-import type { LoadedModel, MemoryEstimate, ModelInfo, ModelsFolderInfo, ProviderHealth } from '@saurio/shared';
+import type { LoadedModel, MemoryEstimate, ModelInfo, ModelRef, ModelsFolderInfo, ProviderHealth } from '@saurio/shared';
 import { invoke } from '../../ipc/client.js';
 import { useModelsStore } from '../../stores/modelsStore.js';
+import { useChatStore } from '../../stores/chatStore.js';
 import { isDemoMode } from '../../demo/demoState.js';
 import { fitClassLabel, formatBytes, qualitySuffix } from './format.js';
 import { CpuIcon } from '../../ui/icons.js';
@@ -70,6 +71,19 @@ function InstalledTab(): React.JSX.Element {
   const [folderInfo, setFolderInfo] = useState<ModelsFolderInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [startingOllama, setStartingOllama] = useState(false);
+  const [startOllamaError, setStartOllamaError] = useState<string | null>(null);
+
+  // Punto 1 del feedback post-v0.1: "cuál está en uso en el chat actual", con botón "Usar en este
+  // chat" (selectores por campo, no un objeto literal — bug ya documentado en doc 16 §10.3 con
+  // useSyncExternalStore/React 19: un objeto nuevo en cada render nunca es `Object.is` igual).
+  const currentChatId = useChatStore((s) => s.currentChatId);
+  const chatsByProject = useChatStore((s) => s.chatsByProject);
+  const setChatModel = useChatStore((s) => s.setChatModel);
+  const currentChatModelName = currentChatId
+    ? Object.values(chatsByProject).flat().find((c) => c.id === currentChatId)?.modelRef?.name
+    : undefined;
+  const [usingModel, setUsingModel] = useState<string | null>(null);
 
   const refresh = useCallback(async (force: boolean) => {
     if (demo) return; // ver nota de arriba: el modo demo usa `useModelsStore`, sembrado sin IPC.
@@ -122,6 +136,48 @@ function InstalledTab(): React.JSX.Element {
   const shownFolderInfo = demo ? demoFolderInfo() : folderInfo;
   const anyProviderDown = shownHealth.some((h) => !h.ok);
 
+  /** Punto 2 del feedback post-v0.1: banner con botón "Iniciar Ollama" (canal `ollama:ensureRunning`,
+   *  agregado por el otro agente en paralelo en esta misma sesión — `main/ipc/ollama.ts` +
+   *  `OllamaProcessManager`). Si el canal todavía no respondiera (encargo: "usá invoke tolerante y
+   *  mostrá la instrucción manual"), el `catch` deja el mensaje manual en vez de romper la UI. */
+  async function handleStartOllama(): Promise<void> {
+    setStartingOllama(true);
+    setStartOllamaError(null);
+    try {
+      const result = await invoke('ollama:ensureRunning', undefined);
+      if (result.running) {
+        await refresh(true);
+      } else {
+        setStartOllamaError(
+          result.error === 'ollama_not_installed'
+            ? 'Ollama no está instalado en este equipo — instalalo desde ollama.com/download y volvé a intentar.'
+            : 'Ollama no respondió a tiempo. Probá de nuevo en unos segundos, o abrí la app de Ollama manualmente.',
+        );
+      }
+    } catch (err) {
+      // Tolerante: si el canal todavía no existe en esta build, no rompe la UI — deja la instrucción
+      // manual (encargo, punto 2 del feedback).
+      setStartOllamaError(
+        `No se pudo pedirle a la app que inicie Ollama (${err instanceof Error ? err.message : String(err)}). ` +
+        'Abrí la app de Ollama manualmente, o ejecutá "ollama serve" en una terminal.',
+      );
+    } finally {
+      setStartingOllama(false);
+    }
+  }
+
+  async function handleUseInChat(ref: ModelRef): Promise<void> {
+    if (!currentChatId) return;
+    setUsingModel(ref.name);
+    try {
+      await setChatModel(currentChatId, ref);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setUsingModel(null);
+    }
+  }
+
   return (
     <div>
       <div className="saurio-panel__header">
@@ -132,7 +188,17 @@ function InstalledTab(): React.JSX.Element {
         <button onClick={() => void refresh(true)} disabled={loading || demo}>{loading ? 'Actualizando…' : 'Actualizar'}</button>
       </div>
 
-      {anyProviderDown && <div className="saurio-banner danger">Ollama no está corriendo (provider:health falló).</div>}
+      {anyProviderDown && !demo && (
+        <div className="saurio-banner danger">
+          <div>Ollama no está corriendo — por eso no se ve ningún modelo.</div>
+          <div className="saurio-row__line">
+            <button type="button" className="saurio-btn-primary" onClick={() => void handleStartOllama()} disabled={startingOllama}>
+              {startingOllama ? 'Iniciando…' : 'Iniciar Ollama'}
+            </button>
+          </div>
+          {startOllamaError && <div className="saurio-row__line saurio-row__line--muted">{startOllamaError}</div>}
+        </div>
+      )}
       {error && <div className="saurio-banner danger">{error}</div>}
 
       {/* Punto 2 del encargo / doc 13 §6, §12: carpeta OLLAMA_MODELS detectada + espacio libre.
@@ -168,19 +234,24 @@ function InstalledTab(): React.JSX.Element {
         </div>
       )}
 
-      {shownModels.length === 0 && !loading ? (
+      {/* Punto 2 del feedback post-v0.1: "cuando Ollama no responde, no mostrar listas vacías" — con
+          el banner de arriba ya explicado, no hace falta además una lista vacía confusa acá. */}
+      {anyProviderDown && !demo ? null : shownModels.length === 0 && !loading ? (
         <div className="saurio-empty-state">
           <span className="saurio-empty-state__icon"><CpuIcon width={20} height={20} /></span>
-          <span className="saurio-empty-state__title">Sin modelos instalados</span>
+          <span className="saurio-empty-state__title">Todavía no tenés ningún modelo instalado</span>
           <span className="saurio-empty-state__hint">
-            Instalá un modelo con Ollama (<code>ollama pull qwen3:8b</code>) y volvé a &quot;Actualizar&quot;,
-            o revisá que Ollama esté corriendo.
+            1. Anda a la pestaña &quot;Explorar&quot; y elegí un modelo (los que dicen &quot;Perfecto&quot; o
+            &quot;Muy bueno&quot; andan mejor en esta PC).<br />
+            2. Apretá &quot;Descargar&quot; y esperá a que termine — después vas a poder usarlo desde acá o
+            desde un chat.
           </span>
         </div>
       ) : (
         <div className="saurio-row-list">
           {shownModels.map((model) => {
             const isLoaded = shownLoaded.some((l) => l.name === model.ref.name);
+            const isCurrentChatModel = currentChatModelName === model.ref.name;
             const fit = shownFitByName[model.ref.name];
             const numCtxUsed = numCtxByName[model.ref.name] ?? NUM_CTX_DEFAULT;
             return (
@@ -188,6 +259,7 @@ function InstalledTab(): React.JSX.Element {
                 <div className="saurio-row__header">
                   <strong className="saurio-mono saurio-row__title">{model.ref.name}</strong>
                   <span className="saurio-row__badges">
+                    {isCurrentChatModel && <span className="saurio-badge measured">en uso en este chat</span>}
                     <span className={`saurio-badge ${isLoaded ? 'measured' : ''}`}>{isLoaded ? 'cargado' : 'no cargado'}</span>
                     <span className="saurio-badge local">{model.ref.locality}</span>
                   </span>
@@ -203,6 +275,18 @@ function InstalledTab(): React.JSX.Element {
                     <span className={`saurio-badge ${fit.quality}`}>{qualitySuffix(fit.quality)}</span>
                     {' '}({formatBytes(fit.vramNeededBytes)} de {formatBytes(fit.vramAvailableBytes)} VRAM)
                   </div>
+                )}
+                {/* Punto 1 del feedback post-v0.1: botón "Usar en este chat", con guía cuando no hay
+                    ningún chat abierto (nunca queda sin explicación por qué está deshabilitado). */}
+                {isCurrentChatModel ? (
+                  <span className="saurio-row__line saurio-row__line--muted">Ya es el modelo de este chat.</span>
+                ) : currentChatId ? (
+                  <button type="button" className="saurio-btn-primary" disabled={usingModel === model.ref.name}
+                    onClick={() => void handleUseInChat(model.ref)}>
+                    {usingModel === model.ref.name ? 'Aplicando…' : 'Usar en este chat'}
+                  </button>
+                ) : (
+                  <span className="saurio-row__line saurio-row__line--muted">Abrí o creá un chat para poder usarlo.</span>
                 )}
               </div>
             );

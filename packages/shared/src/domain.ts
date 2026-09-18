@@ -6,7 +6,8 @@
 import { z } from 'zod';
 import {
   Mode, Locality, ChatRole, ToolTransport, PermissionCategory,
-  Risk, ToolCallStatus, MatchLevel, Quality,
+  Risk, ToolCallStatus, MatchLevel, Quality, AgentRole,
+  AgentOwnerKind, ModelMode, MemorySourceKind, MemoryConfidence, PermissionPreset,
 } from './enums.js';
 
 export const ProjectSchema = z.object({
@@ -161,6 +162,10 @@ export const ChatSchema = z.object({
   createdAt: z.number(),
   updatedAt: z.number(),
   archived: z.boolean(),
+  /** Doc 19 §2.1 (E3a delegación, migración 0005): presente cuando este chat es el CHAT HIJO que
+   *  `RunController.runDelegateTool` crea para una delegación — apunta al run PADRE que la disparó.
+   *  `undefined` para cualquier chat normal (comportamiento previo, todos los chats existentes). */
+  originRunId: z.string().optional(),
 });
 export type Chat = z.infer<typeof ChatSchema>;
 
@@ -456,6 +461,21 @@ export const ModelCatalogEntrySchema = z.object({
 });
 export type ModelCatalogEntry = z.infer<typeof ModelCatalogEntrySchema>;
 
+/** Escala de seis niveles para "¿me conviene este modelo en esta PC?" (sesión 2026-09-18, cobertura
+ *  máxima del catálogo) — espejo zod de `@saurio/runtime` `ModelTier`
+ *  (`packages/runtime/src/models/TierClassifier.ts`, que es la única fuente de la lógica; acá solo se
+ *  declara la forma para que cruce IPC). Campo ADITIVO en `CatalogItemSchema`/`RecommendationSchema`:
+ *  nada que ya consumía esos tipos se rompe si `tier` viene `undefined` (p. ej. mientras no se pudo
+ *  muestrear hardware). */
+export const ModelTierSchema = z.object({
+  level: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5), z.literal(6)]),
+  label: z.string(),
+  color: z.enum(['green', 'teal', 'yellow', 'orange', 'red', 'gray']),
+  explanation: z.string(),
+  quality: z.enum(['measured', 'estimated']),
+});
+export type ModelTier = z.infer<typeof ModelTierSchema>;
+
 /** Entrada del catálogo curado con estado derivado contra `models`/`downloads` (doc 13 §11: estados
  *  `not_installed | downloading | installed_untested | installed_tested | loaded`, no una columna
  *  SQL nueva). El Centro de modelos (pestaña "Explorar") consume esto en vez del catálogo crudo. */
@@ -463,6 +483,9 @@ export const CatalogItemSchema = z.object({
   entry: ModelCatalogEntrySchema,
   status: z.enum(['not_installed', 'downloading', 'installed_untested', 'installed_tested', 'loaded']),
   downloadId: z.string().optional(),
+  /** `undefined` solo si no se pudo muestrear el hardware al armar la respuesta (nunca por diseño:
+   *  el handler de `models:catalog` siempre lo intenta, doc 13 §2 "para priorizar calidad"). */
+  tier: ModelTierSchema.optional(),
 });
 export type CatalogItem = z.infer<typeof CatalogItemSchema>;
 
@@ -475,6 +498,62 @@ export const RecommendationSchema = z.object({
   tested: z.object({ tokPerSec: z.number(), testedAt: z.number(), hardwareFingerprint: z.string() }).optional(),
 });
 export type Recommendation = z.infer<typeof RecommendationSchema>;
+
+// ── Centro de modelos: biblioteca completa de Ollama + Hugging Face (doc 16 §12.6, v0.2) ────────
+
+/** Resultado de `models:hfSearch` — espejo zod de `HuggingFaceSearchResult`
+ *  (`@saurio/runtime` `packages/runtime/src/models/HuggingFaceClient.ts`, que es la única fuente de la
+ *  lógica de búsqueda; acá solo se declara la forma para que cruce IPC). */
+export const HuggingFaceSearchResultSchema = z.object({
+  id: z.string(),
+  likes: z.number(),
+  downloads: z.number(),
+  tags: z.array(z.string()),
+  pipelineTag: z.string().optional(),
+  libraryName: z.string().optional(),
+  updatedAt: z.string().optional(),
+});
+export type HuggingFaceSearchResult = z.infer<typeof HuggingFaceSearchResultSchema>;
+
+/** Resultado de `models:hfFiles` — un archivo `.gguf` de un repo de Hugging Face con su cuantización
+ *  parseada del nombre (`HuggingFaceClient.listGgufFiles`). `sizeBytes` es `undefined` si el llamador
+ *  no pidió `?blobs=true` (nunca se inventa un tamaño). */
+export const HuggingFaceGgufFileSchema = z.object({
+  filename: z.string(),
+  sizeBytes: z.number().optional(),
+  quant: z.string().optional(),
+});
+export type HuggingFaceGgufFile = z.infer<typeof HuggingFaceGgufFileSchema>;
+
+/** De dónde salió el catálogo devuelto por `models:libraryCatalog` (`OllamaLibraryClient.getCatalog`,
+ *  doc 16 §12.6 punto 2): 'network' = se sincronizó ahora contra ollama.com/library; 'cache' = caché en
+ *  userData todavía vigente (TTL 24h) o, sin red, una vencida; 'bundled' = snapshot empaquetado con la
+ *  app (`resources/model-catalog.snapshot.json`), último recurso sin red y sin caché. La UI muestra
+ *  cuál es (nunca finge que el catálogo está siempre fresco). */
+export const LibraryCatalogSourceSchema = z.enum(['cache', 'network', 'bundled']);
+export type LibraryCatalogSource = z.infer<typeof LibraryCatalogSourceSchema>;
+
+export const LibraryCatalogResultSchema = z.object({
+  items: z.array(CatalogItemSchema),
+  source: LibraryCatalogSourceSchema,
+  cachedAt: z.number().optional(),
+  familyCount: z.number(),
+  variantCount: z.number(),
+});
+export type LibraryCatalogResult = z.infer<typeof LibraryCatalogResultSchema>;
+
+/** Resultado de `models:resolveByName` ("Descargar por nombre" libre, punto 4 del encargo): valida
+ *  contra el registry de Ollama o contra `hf.co/<usuario>/<repo>:<quant>`, sin descargar nada todavía —
+ *  la UI usa esto para mostrar tamaño/espacio/nivel ANTES de que el usuario confirme la descarga. */
+export const ResolveModelByNameResultSchema = z.object({
+  fullName: z.string(),
+  source: z.enum(['ollama', 'huggingface']),
+  sizeBytes: z.number(),
+  freeBytes: z.number().optional(),
+  spaceOk: z.boolean(),
+  tier: ModelTierSchema.optional(),
+});
+export type ResolveModelByNameResult = z.infer<typeof ResolveModelByNameResultSchema>;
 
 export const DownloadJobSchema = z.object({
   id: z.string(),
@@ -638,3 +717,102 @@ export const ProfileSchema = z.object({
   isBuiltin: z.boolean(), isDefault: z.boolean(), config: z.unknown(),
 });
 export type Profile = z.infer<typeof ProfileSchema>;
+
+// ── Doc 19 §1.2 — E2a "Mis agentes" ──────────────────────────────────────────
+// `AgentProfileSchema` NO es un espejo 1:1 de `AgentConfig` (packages/runtime/src/agent/types.ts,
+// interfaz TS pura, nunca cruzó IPC hasta esta tarea): expone solo los campos que la vitrina de "Mis
+// agentes" y `agents:*` necesitan (identidad + los tres selectores del editor, doc 19 §1.6) — deja
+// afuera `contextPolicy`/`permissions.rules`/`maxIterations`/`temperature`/`toolTransport`/
+// `defaultMode`/`workingDir`, que siguen siendo responsabilidad exclusiva del `AgentConfig` que
+// resuelve `AgentConfigResolver` para el run (`packages/runtime/src/persistence/repositories/agent.ts`
+// sigue devolviendo `AgentConfig` completo para eso). Deviation de la letra literal de doc 19 §1.2
+// ("extiende el AgentConfigSchema existente") porque ese schema zod no existe — ver arriba.
+export const AgentProfileSchema = z.object({
+  id: z.string(),
+  ownerKind: AgentOwnerKind,
+  name: z.string(),
+  role: AgentRole,
+  description: z.string().optional(),
+  avatarEmoji: z.string().optional(),
+  avatarColor: z.string().optional(),
+  modelMode: ModelMode,
+  /** Solo tiene sentido con `modelMode: 'fixed'`; con `'auto'` lo resuelve `agent/modelPolicy.ts`
+   *  en cada run (doc 19 §1.5), así que puede faltar acá. */
+  model: ModelRefSchema.optional(),
+  systemPrompt: z.string(),
+  allowedTools: z.array(z.string()),
+  permissionPreset: PermissionPreset,
+  createdAt: z.number(),
+  archivedAt: z.number().optional(),
+});
+export type AgentProfile = z.infer<typeof AgentProfileSchema>;
+
+/** Doc 19 §1.1/§1.7: una fila de memoria propia de un agente, con procedencia explícita.
+ *  `projectId: undefined` = memoria global del agente (visible en cualquier proyecto);
+ *  `AgentMemoryRepository.list` es el único punto que aplica el filtro de privacidad de T09. */
+export const AgentMemorySchema = z.object({
+  id: z.string(),
+  agentId: z.string(),
+  projectId: z.string().optional(),
+  content: z.string(),
+  sourceKind: MemorySourceKind,
+  confidence: MemoryConfidence,
+  originRef: z.string().optional(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  expiresAt: z.number().optional(),
+  invalidatedAt: z.number().optional(),
+});
+export type AgentMemory = z.infer<typeof AgentMemorySchema>;
+
+/** Doc 19 §1.2: "sin plantilla obligatoria... todos los campos salvo `name` tienen default sensato"
+ *  (R01 — usar la app sin crear agentes sigue siendo el camino por defecto). `memoryScope`/`projectId`
+ *  solo orientan dónde cae la PRIMERA fila de memoria que el agente llegue a escribir; no son columnas
+ *  de `agents` (la privacidad real vive en `agent_memories.project_id`, por fila, doc 19 §1.7). */
+export const AgentCreateInputSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  role: AgentRole.default('custom'),
+  avatarEmoji: z.string().optional(),
+  avatarColor: z.string().optional(),
+  modelMode: ModelMode.default('fixed'),
+  model: ModelRefSchema.optional(),
+  systemPrompt: z.string().optional(),
+  allowedTools: z.array(z.string()).optional(),
+  permissionPreset: PermissionPreset.default('balanced'),
+  memoryScope: z.enum(['global', 'project']).default('global'),
+  projectId: z.string().optional(),
+});
+export type AgentCreateInput = z.infer<typeof AgentCreateInputSchema>;
+
+// ── Doc 19 §2.2 — E3a "Delegación desde el chat" ─────────────────────────────
+// Esquema deliberadamente chico (mitigación central contra la falta de fiabilidad de un modelo de
+// 8B, doc 19 §5): 4 campos de entrada, sin anidamiento salvo un `budget` opcional de dos números.
+
+/** Input de la tool `delegate` (packages/runtime/src/tools/builtin/delegate.ts). `targetAgentId`
+ *  ausente: `RunController.runDelegateTool` crea un worker efímero (`owner_kind: 'worker'`, doc 19
+ *  §0/§2.5) con el `role` pedido en vez de fallar. */
+export const DelegationRequestSchema = z.object({
+  targetAgentId: z.string().optional(),
+  role: AgentRole.optional(),
+  task: z.string().min(1),
+  expectedDeliverable: z.string().min(1),
+  budget: z.object({
+    maxIterations: z.number().optional(),
+    timeoutMs: z.number().optional(),
+  }).optional(),
+});
+export type DelegationRequest = z.infer<typeof DelegationRequestSchema>;
+
+/** Salida de la tool `delegate` — traduce literal el "protocolo de entrega" de la investigación
+ *  (doc 19 §2.2). Doc 19 §2.5 paso 6: si el último mensaje del hijo no valida contra este schema, se
+ *  envuelve como `{status:'completed', summary:<texto crudo>, uncertainties:['formato no
+ *  estructurado']}` en vez de fallar la delegación completa. */
+export const DelegationResultSchema = z.object({
+  status: z.enum(['completed', 'failed', 'needs_input']),
+  summary: z.string(),
+  artifacts: z.array(z.object({ path: z.string(), description: z.string() })).optional(),
+  uncertainties: z.array(z.string()).optional(),
+  nextAction: z.string().optional(),
+});
+export type DelegationResult = z.infer<typeof DelegationResultSchema>;

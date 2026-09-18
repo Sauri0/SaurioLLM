@@ -15,6 +15,7 @@ import { createDeleteFileTool } from './delete_file.js';
 import { createRunCommandTool } from './run_command.js';
 import { createTaskUpdateTool } from './task_update.js';
 import { createFinishTool } from './finish.js';
+import { createDelegateTool } from './delegate.js';
 
 export type { BuiltinToolsDeps };
 export { defaultBuiltinToolsDeps };
@@ -28,8 +29,11 @@ function erase<A>(def: ToolDefinition<A>): ToolDefinition {
   return def as unknown as ToolDefinition;
 }
 
-/** Instancia las 10 builtins con dependencias compartidas (ReadTracker, PathLock, límites de
- *  ContextPolicy). Doc 04 §4, BuiltinToolName. */
+/** Instancia las 10 builtins del MVP + `delegate` (doc 19 §2.5, E3a) con dependencias compartidas
+ *  (ReadTracker, PathLock, límites de ContextPolicy). Doc 04 §4, BuiltinToolName. `delegate` se
+ *  registra siempre (para que `tools.list({names: agent.allowedTools})` pueda resolverla), pero NO
+ *  forma parte de `DEFAULT_ALLOWED_TOOLS` (agent/defaults.ts) — solo la ve un agente que la pida
+ *  explícita en su `allowedTools`. */
 export function createBuiltinTools(overrides: Partial<BuiltinToolsDeps> = {}): ToolDefinition[] {
   const deps = defaultBuiltinToolsDeps(overrides);
   return [
@@ -43,5 +47,6 @@ export function createBuiltinTools(overrides: Partial<BuiltinToolsDeps> = {}): T
     erase(createRunCommandTool(deps)),
     erase(createTaskUpdateTool(deps)),
     erase(createFinishTool(deps)),
+    erase(createDelegateTool(deps)),
   ];
 }

@@ -89,3 +89,8 @@ export function SettingsIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element 
 export function SendIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
   return <Svg {...props}><path d="m3 3 18 9-18 9 4-9-4-9Z" /><path d="M7 12h13" /></Svg>;
 }
+
+/** Doc 19 §1.6 (pestaña "Agentes" del panel derecho, E2a "Mis agentes"). */
+export function UserIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
+  return <Svg {...props}><circle cx="12" cy="8" r="4" /><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7" /></Svg>;
+}

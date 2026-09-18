@@ -8,6 +8,7 @@ import { ipcContract } from '@saurio/shared';
 import { allowFrame, observeResponses, registerHandler } from './ipc/registerHandler.js';
 import { registerAppHandlers } from './ipc/app.js';
 import { registerProjectHandlers } from './ipc/project.js';
+import { registerAgentsHandlers } from './ipc/agents.js';
 import { registerChatHandlers } from './ipc/chat.js';
 import { registerRunHandlers } from './ipc/run.js';
 import { registerPermissionHandlers } from './ipc/permission.js';
@@ -17,6 +18,8 @@ import { registerProvidersHandlers } from './ipc/providers.js';
 import { registerMetricsHandlers } from './ipc/metrics.js';
 import { registerSettingsHandlers } from './ipc/settings.js';
 import { registerBenchHandlers } from './ipc/bench.js';
+import { registerOllamaHandlers } from './ipc/ollama.js';
+import { OllamaProcessManager } from './services/ollama-process/index.js';
 import { registerTerminalHandlers, type TerminalPortOpener } from './ipc/terminal.js';
 import { registerFilesHandlers, closeAllFileWatchers, type FilesChangeEmitter } from './ipc/files.js';
 import { RuntimeHost, type HostAdapter } from './host/RuntimeHost.js';
@@ -29,6 +32,7 @@ import { SystemSampler } from './services/system-sampler/index.js';
 import { SqlMetricsMinuteRepository } from './services/metrics/SqlMetricsMinuteRepository.js';
 import { MetricsTicker } from './services/metrics/MetricsTicker.js';
 import { createSmokeRecorder, isSmokeRun } from './smoke.js';
+import { startAutoUpdater } from './services/updater/index.js';
 
 app.setName('SaurioLLM');
 
@@ -382,6 +386,18 @@ app.whenReady().then(async () => {
   registerAppHandlers();
 
   const hostAdapter = createHostAdapter();
+
+  // Tarea "carga de modelo/oom_load" punto 4: se crea ANTES de `createGlobalRuntime` (antes vivía
+  // más abajo, junto a `registerOllamaHandlers`) para poder pasarle `readInferenceComputeLine()` a
+  // `HardwareProbe` como `inferenceComputeSource` (doc 16 §12.2, puerto ya soportado ahí pero nunca
+  // cableado en la app real). `logsDir` captura el stdout/stderr real de `ollama serve` cuando ESTA
+  // clase lo arranca (`userData/logs/ollama-serve.log`); `SAURIO_OLLAMA_URL` (punto 5, solo pruebas)
+  // apunta el health-check a un puerto vacío para simular "apagado" sin tocar Ollama real.
+  const ollamaProcessManager = new OllamaProcessManager({
+    baseUrl: process.env['SAURIO_OLLAMA_URL'],
+    logsDir: hostAdapter.paths.logsDir,
+  });
+
   // Integración del MVP: se construyen las instancias reales (saurio.db + migraciones, gateway con
   // OllamaProvider, ModelManager, telemetría) y se le inyectan al host. Si la base no abre (disco
   // lleno, esquema más nuevo — doc 10 §5), la app arranca igual con los canales registrados y el
@@ -392,7 +408,10 @@ app.whenReady().then(async () => {
     // solo se importa acá (único lugar con Electron real, doc 02 §1 ADR-002 — createRuntime.ts recibe
     // la instancia ya armada para que createRuntime.test.ts siga sin depender de Electron).
     const secureKeyStore = new SecureKeyStore(path.join(hostAdapter.paths.userDataDir, 'provider-keys.enc.json'), safeStorage);
-    runtime = createGlobalRuntime(hostAdapter, { secureKeyStore });
+    runtime = createGlobalRuntime(hostAdapter, {
+      secureKeyStore,
+      inferenceComputeSource: { read: () => ollamaProcessManager.readInferenceComputeLine() },
+    });
   } catch (error) {
     console.error('[main] no se pudo inicializar el runtime (persistencia/gateway)', error);
   }
@@ -412,6 +431,7 @@ app.whenReady().then(async () => {
   }
 
   registerProjectHandlers(host);
+  registerAgentsHandlers(host);
   registerChatHandlers(host);
   registerRunHandlers(host);
   registerPermissionHandlers(host);
@@ -420,6 +440,33 @@ app.whenReady().then(async () => {
   registerProvidersHandlers(host);
   registerSettingsHandlers(host);
   registerBenchHandlers(host);
+
+  // PRIORIDAD CERO punto 1/7 (bloqueo real: "Ollama instalado pero apagado" — la app no lo detectaba
+  // ni lo arrancaba sola). `ollamaProcessManager` ya se construyó más arriba (para poder pasarle
+  // `inferenceComputeSource` a `createGlobalRuntime`); acá se registra el canal y se dispara el
+  // arranque automático. El canal queda registrado ANTES de saber si el arranque automático tuvo
+  // éxito (la UI puede reintentar manualmente con el mismo canal). El arranque automático en sí es
+  // "fire and forget": no bloquea la creación de la ventana ni el resto del arranque — puede tardar
+  // hasta 15s (OllamaProcessManager.ensureRunning) y el usuario no debería esperar eso a pantalla
+  // negra; `layout/StatusBar.tsx` muestra "Iniciando motor local…" mientras tanto (poll propio).
+  //
+  // Tarea "carga de modelo/oom_load" punto 5: con `SAURIO_OLLAMA_URL` seteada (simulación de
+  // "apagado" apuntando a un puerto vacío, solo para pruebas) el arranque automático se salta a
+  // propósito — si no, `checkHealth()` fallaría contra el puerto falso y `ensureRunning()` intentaría
+  // encontrar y arrancar un `ollama serve` REAL (bind al puerto real de Ollama, ignorando la URL de
+  // prueba), justo lo que esta variable existe para evitar.
+  registerOllamaHandlers(ollamaProcessManager);
+  if (process.env['SAURIO_OLLAMA_URL']) {
+    console.log('[main] SAURIO_OLLAMA_URL seteada: se salta el arranque automático de ollama serve (simulación de "apagado")');
+  } else {
+    void ollamaProcessManager.ensureRunning().then(
+      (result) => console.log('[main] ollama:ensureRunning (automático al arrancar)', result),
+      (error) => console.error('[main] ollama:ensureRunning (automático al arrancar) falló', error),
+    );
+  }
+  // Punto 4: "al cerrar la app, detené SOLO el Ollama que la app inició" — no hace nada si esta
+  // clase nunca llegó a arrancar un proceso propio (Ollama ya corría, o lo arrancó otra cosa).
+  app.on('before-quit', () => ollamaProcessManager.stop());
 
   const terminalService = new TerminalService();
   app.on('before-quit', () => terminalService.closeAll());
@@ -467,6 +514,8 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
+
+  startAutoUpdater({ host });
 });
 
 app.on('window-all-closed', () => {

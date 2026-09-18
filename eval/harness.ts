@@ -356,6 +356,10 @@ async function buildEnhancedRunController(
     toolCalls: repositories.toolCalls,
     checkpointRepo: repositories.checkpoints,
     agents: repositories.agents,
+    // Doc 19 §2.5 (E3a delegación): `AgentRepository` ya implementa `AgentProfilePort.createProfile`
+    // — se agrega acá (aditivo, sin efecto en los pasos (a)-(n) que no delegan) para que los pasos
+    // nuevos de delegación puedan crear un worker efímero real.
+    agentProfiles: repositories.agents,
     workspaceFs,
     clock: systemClock,
     ids: defaultIdGenerator,
@@ -1147,6 +1151,103 @@ async function main(): Promise<void> {
       );
     } catch (err) {
       report('(n) compactación real: run.state -> compacting y evento context.compacted, mensajes marcados compacted_by', false, String((err as Error).stack ?? err));
+    }
+
+    // ── (p) doc 19 T04: chat directo con un agente PERSONAL (E2a "Mis agentes") ────────────────
+    try {
+      const personalProfile = await runtime.persistence.repositories.agents.createProfile({
+        name: 'Agente eval personal', role: 'custom', modelMode: 'fixed', model: modelRef,
+        systemPrompt: 'Sos "Agente eval personal", un agente de prueba. Cuando te saluden, respondé identificándote por tu nombre en una frase corta y después llamá a finish.',
+        permissionPreset: 'balanced', memoryScope: 'global',
+      });
+      const personalAgentConfig = await runtime.persistence.repositories.agents.get(personalProfile.id);
+      if (!personalAgentConfig) throw new Error('createProfile no dejó un AgentConfig resoluble (doc 19 §1.5)');
+      const personalController = await buildEnhancedRunController(runtime, hostAdapter, project, personalAgentConfig);
+      const personalChat = await runtime.persistence.repositories.chats.create({
+        id: 'chat_personal_agent', projectId: project.id, agentId: personalProfile.id, mode: 'agent',
+        modelRef, createdAt: Date.now(), updatedAt: Date.now(), archived: false,
+      });
+      const runPersonal = await personalController.start(personalChat.id, 'Hola, ¿quién sos?', 'agent');
+      const waitPersonal = await waitForRunTerminalTolerant(runtime.events, runPersonal.runId, 120_000);
+      const personalMessages = await runtime.persistence.repositories.messages.listByChat(personalChat.id);
+      const assistantMsg = personalMessages.find((m) => m.role === 'assistant' && m.content.trim().length > 0);
+      const readChat = await runtime.persistence.repositories.chats.get(personalChat.id);
+      const ok = waitPersonal.finalState === 'completed' && assistantMsg !== undefined && readChat?.agentId === personalProfile.id;
+      report(
+        '(p) doc 19 T04: chat directo con un agente personal — identidad visible, chat.agentId refleja el agente',
+        ok,
+        `agente creado: ${personalProfile.id} (ownerKind=${personalProfile.ownerKind})\n` +
+          `estado final=${waitPersonal.finalState}\nchat.agentId=${readChat?.agentId}\n` +
+          `respuesta del agente: ${assistantMsg ? JSON.stringify(assistantMsg.content.slice(0, 300)) : '(ninguna)'}`,
+      );
+    } catch (err) {
+      report('(p) doc 19 T04: chat directo con un agente personal — identidad visible, chat.agentId refleja el agente', false, String((err as Error).stack ?? err));
+    }
+
+    // ── (q) doc 19 T06/T07: delegación a un worker temporal, entregable vuelve al padre (E3a) ──
+    try {
+      const delegatorAgentId = 'agent_eval_delegator';
+      const delegatorAgent: Partial<AgentConfig> & { id: string } = {
+        id: delegatorAgentId, model: modelRef,
+        systemPrompt: 'Sos un agente que delega tareas chicas. Cuando te pidan algo simple, usá la tool `delegate` SIN indicar targetAgentId (así se crea un worker temporal) con una `task`/`expectedDeliverable` claros. Esperá el resultado de la tool y después llamá a finish resumiendo lo que devolvió el worker.',
+        allowedTools: ['list_files', 'read_file', 'finish', 'delegate'],
+      };
+      const delegatorController = await buildEnhancedRunController(runtime, hostAdapter, project, delegatorAgent);
+      const delegatorChat = await runtime.persistence.repositories.chats.create({
+        id: 'chat_delegator', projectId: project.id, agentId: delegatorAgentId, mode: 'agent',
+        modelRef, createdAt: Date.now(), updatedAt: Date.now(), archived: false,
+      });
+      const runDelegator = await delegatorController.start(
+        delegatorChat.id,
+        'Delegale a un worker temporal la tarea de listar 3 ideas de nombres para una mascota (entregable: una lista corta). Esperá el resultado y después resumímelo con finish.',
+        'agent',
+      );
+      // Doc 19 §2.5: `delegate` es category 'delegate' -> default 'ask' (permissions/engine.ts,
+      // mismo criterio cauteloso que terminal/network/mcp) — el agente `balanced` de este harness
+      // (preset por defecto de `createDefaultAgentConfig`) SÍ pasa por el permiso, a diferencia de
+      // los pasos (b)/(c)/(n) que usan tools de categoría read/write ya permitidas por defecto. Sin
+      // este paso, el run queda en awaiting_permission para siempre y el hallazgo real de esta
+      // sesión (visto en la primera corrida del harness) es justamente eso: el paso reportaba
+      // "timeout" no porque la delegación esté rota, sino porque nadie contestaba el pedido.
+      const waitAwaitDelegate = await waitForRunState(runtime.events, runDelegator.runId, 'awaiting_permission', 60_000)
+        .catch((err) => { log('(q): no se llegó a awaiting_permission (puede que el modelo no haya llamado a delegate):', String(err)); return undefined; });
+      const pendingDelegate = waitAwaitDelegate?.finalState === 'awaiting_permission'
+        ? await findAwaitingPermissionCall(runtime, runDelegator.runId)
+        : undefined;
+      if (pendingDelegate) {
+        await delegatorController.answerPermission(pendingDelegate.id, { toolCallId: pendingDelegate.id, answer: 'allow_once' });
+      }
+      const waitDelegator = await waitForRunTerminalTolerant(runtime.events, runDelegator.runId, 180_000);
+      const allEventsDelegator = runtime.events.since(runDelegator.runId, 0);
+      const delegatedEvent = allEventsDelegator.find((e) => e.type === 'run.delegated') as Extract<RunEvent, { type: 'run.delegated' }> | undefined;
+      const delegateToolCalls = (await runtime.persistence.repositories.toolCalls.listByRun(runDelegator.runId))
+        .filter((c) => c.toolName === 'delegate');
+      let childOk = false;
+      let childEvidence = '(no se emitió run.delegated)';
+      if (delegatedEvent) {
+        const childRun = await runtime.persistence.repositories.runs.get(delegatedEvent.childRunId);
+        const childChat = await runtime.persistence.repositories.chats.get(delegatedEvent.childChatId);
+        const workerProfile = await runtime.persistence.repositories.agents.getProfile(delegatedEvent.targetAgentId);
+        childOk = childRun?.state === 'completed' && childRun?.parentRunId === runDelegator.runId
+          && childRun?.delegationDepth === 1 && childChat?.originRunId === runDelegator.runId
+          && workerProfile?.ownerKind === 'worker';
+        childEvidence = `childRunId=${delegatedEvent.childRunId} state=${childRun?.state} parentRunId=${childRun?.parentRunId} ` +
+          `delegationDepth=${childRun?.delegationDepth} childChat.originRunId=${childChat?.originRunId} ` +
+          `worker.ownerKind=${workerProfile?.ownerKind}`;
+      }
+      const ok = waitDelegator.finalState === 'completed' && delegateToolCalls.length > 0
+        && delegateToolCalls[0]?.category === 'delegate' && delegateToolCalls[0]?.resultIsError === false && childOk;
+      report(
+        '(q) doc 19 T06/T07: delegación a un worker temporal — entregable estructurado vuelve al padre',
+        ok,
+        `permiso de delegate contestado: ${pendingDelegate !== undefined}\n` +
+          `run padre estado final=${waitDelegator.finalState}\n` +
+          `tool calls delegate: ${delegateToolCalls.length} (status=${delegateToolCalls.map((c) => c.status).join(',')}, resultIsError=${delegateToolCalls.map((c) => c.resultIsError).join(',')})\n` +
+          `run.delegated: ${childEvidence}\n` +
+          `resultPreview del delegate: ${delegateToolCalls[0]?.resultPreview ?? '(ninguno)'}`,
+      );
+    } catch (err) {
+      report('(q) doc 19 T06/T07: delegación a un worker temporal — entregable estructurado vuelve al padre', false, String((err as Error).stack ?? err));
     }
   } else {
     for (const step of [

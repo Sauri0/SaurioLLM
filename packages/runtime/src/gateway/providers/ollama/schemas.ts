@@ -139,6 +139,10 @@ export const OllamaChatOptionsSchema = z.object({
   top_k: z.number().optional(),
   seed: z.number().optional(),
   stop: z.array(z.string()).optional(),
+  // Cambio aditivo (tarea "carga de modelo/oom_load"): capas offloadeadas a GPU — RunController lo
+  // baja tras un oom_load real (options.numGpu en ChatRequest, ver gateway/types.ts). `undefined`
+  // deja el default de Ollama (todo lo que entre), comportamiento previo sin cambios.
+  num_gpu: z.number().optional(),
 });
 export type OllamaChatOptions = z.infer<typeof OllamaChatOptionsSchema>;
 

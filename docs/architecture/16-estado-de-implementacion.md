@@ -332,3 +332,444 @@ Alcance: todo el repo (único agente activo en esta sesión). Nueve puntos puntu
    - Verificado en disco: `apps/desktop/release/win-unpacked/resources/grammars/*.wasm` y `resources/repomap-queries/*.scm` existen planos (confirma el punto 5 de arriba contra un empaquetado real, no solo contra el test unitario de `resolveRepoMapResourceDirs`).
    - `ContextResult::kFatalFailure: Failed to create shared context for virtualization` sigue apareciendo en stderr (mismo hallazgo ya documentado en §7/§8: la mitigación de GPU activa por defecto lo absorbe, no impide que la app arranque ni dibuje).
 - `docs/capturas` no tiene una captura del selector de modelo agrupado por proveedor en un chat real (ver 10.8).
+
+---
+
+## 12. Centro de modelos: escala de seis niveles, HardwareProbe para iGPU/memoria unificada, usabilidad post-v0.1 (sesión 2026-09-18, cobertura máxima del catálogo)
+
+Alcance del encargo: `packages/runtime/src/models/**`, `resources/model-catalog*.json`, `apps/desktop/src/main/ipc` (solo handlers de `models`), `apps/desktop/src/renderer/src/features/models/**`, cambios aditivos en `packages/shared/src/{ipc,domain}.ts`. Objetivo pedido: que el explorador cubra el máximo de modelos del mercado, los analice contra el hardware real y los clasifique en una escala de seis niveles. **Esta sesión no llegó a implementar la sincronización en vivo del catálogo completo de Ollama ni la búsqueda de Hugging Face** (ver "Pendiente" al final) — dos rondas de feedback real de usuario llegaron a mitad de tarea y se priorizaron sobre continuar el catálogo, siguiendo el mismo criterio que ya usa este documento ("se priorizaron los gaps... sobre features nuevas más grandes, para no dejar nada a medio hacer").
+
+### 12.1 `TierClassifier` (escala de seis niveles)
+
+`packages/runtime/src/models/TierClassifier.ts` (nuevo): `classifyModelTier()` — función pura que recibe `vramNeededBytes/vramAvailableBytes/weightsBytes/ramFreeBytes/freeDiskBytes` (ya medidos/estimados por `HardwareProbe`/`MemoryEstimator`) y devuelve `{ level: 1-6, label, color, explanation, quality }`. Los seis niveles y sus umbrales `[HIPÓTESIS A PROBAR: los cortes numéricos, no la lógica de separación]`:
+
+1. Perfecto (verde) — entra en GPU con margen (`needed ≤ available × 0.85`, `0.70` en iGPU).
+2. Muy bueno (teal) — entra justo (`needed ≤ available × 1.05`, `0.90` en iGPU).
+3. Usable (amarillo) — los pesos entran en GPU, el KV cache/overhead se reparte con RAM sin excederse mucho (techo `1.3×`, `1.05×` en iGPU — ver hallazgo de visión abajo).
+4. Al límite (naranja) — offload parcial significativo (≥30% de los pesos en GPU).
+5. Solo CPU / muy lento (rojo) — entra en RAM pero casi sin ayuda de GPU.
+6. No recomendado instalar (gris) — no entra ni con toda la RAM, o no hay espacio en disco.
+
+Un resultado `tested` (Banco de pruebas/`model_compat` real para este `hardware_fingerprint`) fuerza el nivel y sube `quality` a `'measured'`, igual que ya hacía `RecommendationEngine` con el badge "probado". `tierForCatalogWeights()` arma el input para un modelo **no instalado** (catálogo/Explorar) con el mismo proxy 15%/512 MiB que ya usaba `RecommendationEngine.estimatedTotalBytes` (duplicado a propósito para no crear una dependencia cruzada entre los dos módulos). 32 tests nuevos (`TierClassifier.test.ts`), incluidos los tres escenarios que pedía el encargo (8 GB de VRAM, 24 GB, solo CPU) más el perfil real de iGPU (ver 12.2).
+
+### 12.2 `HardwareProbe`: iGPU/memoria unificada (Intel/AMD/Apple sin `nvidia-smi`)
+
+Hardware real relevado en un segundo equipo del feedback (Intel Core Ultra 9 288V, 32 GB RAM unificada, iGPU Intel Arc 140V por Vulkan — sin `nvidia-smi`, la app quedaba ciega de VRAM):
+
+- **`parseOllamaInferenceComputeLog()`** (nuevo): parsea la línea `msg="inference compute"` que el propio `ollama serve` loguea por dispositivo (`[VERIFICADO EN DOC OFICIAL: discover/types.go, LogDetails(), repo ollama/ollama]`, formato `slog` con `total`/`available` en `HumanBytes2` — `"18.0 GiB"`/`"17.2 GiB"`, exactamente los valores reales reportados). `HardwareProbe.sample()` la usa como segunda fuente (`measured`) cuando no hay `nvidia-smi`, antes del registro de Windows — inyectada vía el puerto opcional `OllamaInferenceComputeSource` (todavía sin cablear en `apps/desktop`: el encargo dice que el otro agente va a exponer el log real desde `OllamaProcessManager`/`server.log`; hasta que eso pase, `sample()` sigue el camino previo sin romper nada).
+- **Fallback de memoria unificada** (nuevo, `assumeUnifiedMemoryFallback`, **apagado por defecto**): sin ninguna fuente real, asume ~55% de la RAM total como techo de VRAM utilizable (`[HIPÓTESIS A PROBAR]`, calibrado contra el ~56% real medido en el equipo #2). Deliberadamente opt-in y restringido a win32/darwin: sin ninguna señal, `gpu: undefined` sigue siendo más honesto que inventar una GPU en una máquina que a lo mejor no tiene ninguna (evita la regresión que hubiera roto el test "sin GPU detectable en plataforma no-Windows: gpu queda undefined").
+- `HardwareProfile.gpu` gana `vendor: 'intel'` y `integrated?: boolean` (additive, `packages/runtime/src/models/types.ts` — no es `packages/shared`, sin restricción de aditividad pero se mantuvo igual).
+
+### 12.3 `MemoryEstimator`: proyector de visión no contado + margen mayor en iGPU
+
+Hallazgo real del mismo equipo: `gemma4:26b` (Q4, 15.77 GiB de pesos + ~1.1 GiB de proyector de visión) NO entró en ~17.2 GiB disponibles de la iGPU, pese a que la suma de bytes sugería que sí — el scheduler de Ollama no reserva memoria de trabajo extra para el encoder de visión al decidir el offload. `MemoryEstimator.fits()` gana `VISION_OVERHEAD_BYTES` (1.25 GiB extra cuando `description.capabilities.vision`) e `INTEGRATED_GPU_SAFETY_MARGIN_RATIO` (10% del total en vez de 512 MiB fijos cuando `hardware.gpu?.integrated`) — ambos `[HIPÓTESIS A PROBAR]`, con test de regresión que reproduce el caso real (18.0 GiB total / 17.2 GiB disponible → no `fits_gpu`).
+
+### 12.4 Usabilidad del Centro de modelos (feedback real de un usuario que instaló la v0.1)
+
+Feedback textual: *"no entiendo cómo instalar, seleccionar y saber si tengo modelos"*. Resuelto en `features/models/{ModelsPanel,ExploreTab}.tsx`:
+
+- **Instalados**: badge "en uso en este chat" (compara contra `chats.modelRef` del chat abierto) + botón "Usar en este chat" (`chatStore.setChatModel`); si no hay chat abierto, texto explícito ("Abrí o creá un chat para poder usarlo") en vez de un botón deshabilitado sin explicación. Estado vacío con guía de 2 pasos. Banner "Ollama no está corriendo" con botón "Iniciar Ollama" (canal `ollama:ensureRunning`, agregado en paralelo por otro agente en esta misma sesión — `main/ipc/ollama.ts`/`OllamaProcessManager`; `invoke` envuelto en `try/catch` con instrucción manual de fallback si el canal fallara). La lista de modelos ya no se muestra vacía cuando Ollama está caído: el banner reemplaza al estado vacío.
+- **Explorar**: leyenda fija de los seis niveles en español simple (sin "VRAM"/"fitClass"), badge de nivel + explicación de una línea por modelo (`models:catalog` ahora calcula `tier` con `tierForCatalogWeights` muestreando `HardwareProbe` real en cada request), espacio libre en disco visible junto al filtro, botón "Usar este modelo" tanto recién descargado como sobre lo ya instalado.
+- `CatalogItemSchema.tier: ModelTierSchema.optional()` (additive, `packages/shared/src/domain.ts`).
+
+**Verificado con capturas reales** (Ollama corriendo, 4 modelos reales instalados: `qwen2.5-coder:7b`, `qwen3:8b`, `gemma4:31b`, `gemma4:26b`) — `docs/capturas/smoke-explorar-tiers-ollama-on.png` y `smoke-instalados-usar-en-chat.png` (no versionadas, `.gitignore: smoke-*.png`, igual que el resto de las capturas de smoke de este documento). **No se verificó visualmente el caso "Ollama apagado"**: hacerlo hubiera requerido detener el proceso real de Ollama de esta máquina (compartido con otro agente activo en la misma sesión) o tocar `createRuntime.ts`/`OllamaProvider` para inyectar una URL falsa (fuera de zona) — la rama de código se revisó manualmente y reutiliza exactamente el mismo `anyProviderDown`/`ollama:ensureRunning` que `StatusBar.tsx` ya ejercita en producción, pero queda como `[HIPÓTESIS A PROBAR]` sin captura propia hasta una sesión con un entorno de Ollama desechable.
+
+### 12.5 Gates
+
+`pnpm typecheck` (raíz) verde. `pnpm --filter @saurio/runtime run test`: 550 tests en verde + 2 skipped (antes 518+2; +32 de `TierClassifier`/`HardwareProbe`/`MemoryEstimator`). `pnpm --filter @saurio/desktop run test`: 132 en verde (incluye tests de otros agentes activos en paralelo en esta sesión). `pnpm exec eslint` sobre los archivos de esta zona: limpio.
+
+### 12.6 Pendiente (alcance original del encargo, no completado esta sesión)
+
+El encargo pedía "cobertura máxima del catálogo" — biblioteca completa de Ollama sincronizada en vivo (scraper tolerante de `ollama.com/library` + `/tags`, caché con TTL, botón "Actualizar catálogo", snapshot generado por `scripts/build-model-catalog.mjs` y commiteado), búsqueda de Hugging Face GGUF (`hf.co/<usuario>/<repo>:<quant>`, formato verificado vigente contra `huggingface.co/docs/hub/en/ollama`), "descargar por nombre" libre, ficha con selector de `num_ctx` (4k/8k/16k/32k), y una UI de Explorar con filtros por fuente/tamaño/nivel y paginado o virtualización para cientos de modelos. **Nada de esto se implementó todavía** — se investigaron y verificaron en vivo las fuentes (`ollama.com/library` devuelve ~240 familias reales, formato de manifest confirmado con capa `application/vnd.ollama.image.projector`, API de HF probada con resultados reales, fixtures reales guardados en `packages/runtime/src/models/fixtures/`) pero se priorizó, en el tiempo disponible de esta sesión, cerrar primero la escala de seis niveles (imprescindible para clasificar cualquier catálogo futuro) y la usabilidad básica reportada por un usuario real. Queda para la próxima sesión de esta zona.
+
+---
+
+## 13. Centro de modelos: cobertura máxima del catálogo, cierre (sesión 2026-09-18, noche)
+
+Alcance del encargo: `packages/runtime/src/models/**`, `resources/model-catalog*.json`,
+`scripts/build-model-catalog.mjs`, `apps/desktop/src/main/ipc/models.ts`,
+`apps/desktop/src/renderer/src/features/models/**`, cambios aditivos en `packages/shared/src/{ipc,domain}.ts`.
+Cierra exactamente el pendiente de §12.6.
+
+### 13.1 Parser tolerante + snapshot commiteado (puntos 1/2 del encargo)
+
+`packages/runtime/src/models/ollamaLibraryParser.ts` (nuevo): regex tolerante sobre el HTML público de
+`ollama.com/library` (listado de familias) y `ollama.com/library/<familia>` (variantes con
+tamaño/contexto real) — sin librería de DOM nueva (ADR-2). Verificado contra los fixtures reales Y
+contra el sitio en vivo, donde encontró y toleró DOS cambios reales de layout que el fixture guardado
+(de una sesión anterior) no tenía: el breakpoint de Tailwind del bloque de fila pasó de `md:hidden` a
+`sm:hidden`, y el separador visual pasó de "•" (bullet) a "·" (middle dot). Un tercer hallazgo, más
+serio: el bloque de la ÚLTIMA variante de una página se extendía sin límite hasta un widget "subí una
+imagen" del chat de la propia ficha, y el detector de visión (`/Image/i`) lo matcheaba — `llama3.1:405b`
+y `deepseek-r1:671b` (sin visión real) salían marcados `vision: true`. Dos relecturas en vivo de la
+MISMA URL devolvieron HTML de longitud distinta entre sí, así que un techo de caracteres fijo no
+alcanzaba siempre; el fix real corta en el marcador `id="readme"` (la sección de variantes siempre
+termina justo antes, confirmado en 4 relecturas en vivo consecutivas), con un techo de caracteres como
+red de seguridad secundaria. 14 tests (incluidos los dos hallazgos de tolerancia como regresión).
+
+`scripts/build-model-catalog.mjs` (+ `.impl.ts`, nuevo): recorre la biblioteca completa con el MISMO
+parser (bootstrap fino con `tsx/esm/api` para poder importar el `.ts` de runtime desde un script `.mjs`
+de la raíz) y escribe `resources/model-catalog.snapshot.json`. Corrido de verdad esta sesión: **240
+familias, 858 variantes, 0 errores de red**, commiteado. `ollamaLibrarySnapshot.ts` (nuevo) define el
+esquema zod del snapshot y `mergeSnapshotWithCuratedCatalog()`, que lo fusiona por `name:tag` con el
+catálogo curado existente (`resources/model-catalog.json`, sigue siendo la capa de "uso sugerido/notas"
+verificada a mano — gana sobre el snapshot en `notes`/`quantization`/`suggestedUse`; el snapshot gana en
+tamaño/contexto por ser más fresco). 8 tests.
+
+### 13.2 `OllamaLibraryClient` + `HuggingFaceClient` (puntos 2/3 del encargo)
+
+`OllamaLibraryClient` (nuevo): mismo parser, `getCatalog({ forceRefresh })` con caché inyectable (TTL
+24 h — `DEFAULT_LIBRARY_CACHE_TTL_MS`), cae a la caché vencida sin red y al snapshot empaquetado sin
+ninguna caché todavía; `resolveExactSize()` para tamaño exacto por tag vía `RegistryClient` (perezoso,
+al abrir la ficha — la suma de capas ya incluye la capa `projector`/mmproj de los modelos de visión sin
+lógica especial). `FileLibraryCache` (`apps/desktop/src/main/services/models/LibraryCache.ts`, nuevo):
+implementación real sobre un JSON en `userData`, nunca lanza con datos corruptos. 11 + 4 tests.
+
+`HuggingFaceClient` (nuevo): `searchModels()` (`huggingface.co/api/models?search=...&filter=gguf`),
+`listGgufFiles()` (`?blobs=true`, tamaño real confirmado en vivo esta sesión) con cuantización parseada
+del nombre de archivo, `buildOllamaRef()` (`hf.co/<usuario>/<repo>:<quant>`, formato vigente verificado
+contra la doc oficial de HF para Ollama). 8 tests contra los fixtures reales ya investigados.
+
+### 13.3 Descarga fuera del registry de Ollama (puntos 3/4 del encargo)
+
+`DownloadManager.pullKnownSize()` (nuevo, aditivo — `pull()` no cambió): para referencias `hf.co/...`
+que no tienen manifest Docker v2 que diffear contra `blobs/`, verifica espacio contra el tamaño total
+YA CONOCIDO (por `HuggingFaceClient`/`resolveByName`) en vez de restar capas presentes — más
+conservador que de más, nunca de menos — y reutiliza el mismo `runPull`/progreso/persistencia que
+`pull()` vía un `beginJob()` privado factoreado de ambos métodos. 4 tests.
+
+### 13.4 IPC + wireo (`apps/desktop`)
+
+Canales nuevos (aditivos, `packages/shared/src/ipc.ts`): `models:libraryCatalog` (biblioteca completa
+fusionada + estado/nivel, con `forceRefresh` para "Actualizar catálogo"), `models:hfSearch`,
+`models:hfFiles`, `models:resolveByName` ("descargar por nombre": valida contra el registry de Ollama
+o `hf.co/...`, nunca bloquea el botón "Descargar" si no se pudo confirmar el espacio en disco),
+`models:pullExternal` (delega en `pullKnownSize`), `models:tierForSize` (recalcula nivel para un
+tamaño ya conocido con el `numCtx` elegido, sin volver a pedir el catálogo completo — usado por el
+selector 4k/8k/16k/32k de la ficha). `TierClassifier.tierForCatalogWeights()` ganó un `numCtx` opcional
+(default 8192, mismo resultado que antes sin él — verificado con test dedicado): escala linealmente el
+proxy de KV cache existente, documentado como `[HIPÓTESIS A PROBAR]` igual que el proxy original.
+
+`createRuntime.ts`/`RuntimeHost.ts` (compartidos, cambio aditivo mínimo documentado en el propio
+código, mismo criterio que sesiones anteriores para wireo cruzado de zona): construyen
+`OllamaLibraryClient` con `FileLibraryCache` real + fallback al snapshot empaquetado, y
+`HuggingFaceClient`. `electron-builder.yml` ganó una entrada `extraResources` para el snapshot (mismo
+patrón que `model-catalog.json`), sin la cual no llegaría al build empaquetado.
+
+25 tests nuevos en `apps/desktop` (11 en `ipc/models.test.ts`, mismo patrón de `RuntimeHost` falso que
+`providers.test.ts`, más 4 de `FileLibraryCache` y 10 de `models:tierForSize`/handlers restantes).
+
+### 13.5 UI de Explorar (punto 5 del encargo)
+
+`exploreLogic.ts` (nuevo, puro, 20 tests): búsqueda de texto, filtros por uso/nivel/tamaño, tres modos
+de orden (`recommended` = nivel ascendente + tamaño ascendente, `name`, `size`), paginado (30 por
+página — alcanza para las ~850 variantes sin agregar una librería de virtualización nueva, ADR-2) y
+agrupado por familia para la ficha lateral.
+
+`ExploreTab.tsx` (reescrito): fuente de datos pasa de `models:catalog` (16 curados) a
+`models:libraryCatalog` (biblioteca completa fusionada), con nota de dónde salió el catálogo mostrado
+(sincronizado ahora / en caché / snapshot empaquetado) y botón "Actualizar catálogo"; ficha lateral con
+las variantes de una familia + selector de contexto 4k/8k/16k/32k que recalcula el nivel en vivo
+(`models:tierForSize`); pestaña separada "Hugging Face" (búsqueda -> archivos .gguf por cuantización
+-> descarga); "Descargar por nombre" libre siempre visible arriba (valida con `models:resolveByName`
+antes de mostrar el botón "Descargar"). Sin estilos inline nuevos (`models.css`, tokens existentes).
+
+### 13.6 Verificación real
+
+`pnpm typecheck`/`pnpm test`/`pnpm lint`/`pnpm build` en verde al cierre (raíz, con el resto del
+working tree compartido con otros agentes activos en esta misma sesión también en verde en ese
+momento). `pnpm --filter @saurio/runtime run test`: 650 + 2 skipped (antes 550+2). `pnpm --filter
+@saurio/desktop run test`: 177 (antes 132). Snapshot generado de verdad con `pnpm build:model-catalog`
+contra `ollama.com` en vivo (240 familias, 858 variantes, 0 errores). Descarga real por nombre de
+`all-minilm` (46 MB, progreso real medido hasta ~67 MB/s en esta máquina) y borrado, confirmados contra
+`/api/tags` real antes y después — mismo camino que ejercitaría `models:resolveByName` +
+`models:pull` + `models:delete` desde la UI.
+
+### 13.7 Pendiente / limitaciones conocidas
+
+1. **Capturas de la UI nueva**: no se tomó una captura de Explorar v2 (biblioteca completa, ficha
+   lateral, pestaña Hugging Face) — el smoke visual (`SAURIO_SMOKE_SHOT`) requiere una corrida
+   dedicada de la app empaquetada/dev que no se hizo esta sesión por tiempo; la UI se verificó por
+   tipos + tests + lectura manual del JSX, no visualmente.
+2. **Descarga real de un archivo de Hugging Face** (`hf.co/...` vía `pullKnownSize`): no se verificó
+   una descarga real de varios GB de un repo de HF en esta sesión (sí se verificó `searchModels`/
+   `listGgufFiles` contra la API real de HF durante el desarrollo, y `pullKnownSize` tiene 4 tests
+   unitarios con fakes) — el encargo pedía verificar específicamente `all-minilm` (Ollama), que sí se
+   hizo de punta a punta.
+3. **`tierForCatalogWeights` con `numCtx`** sigue siendo un proxy (15% de los pesos escalado
+   linealmente con el contexto elegido) — no hay `model_info` real para un modelo no instalado, mismo
+   límite que ya tenía el proxy original antes de este cambio, ahora declarado explícitamente
+   `[HIPÓTESIS A PROBAR]` en el comentario del código.
+4. **Paginado, no virtualización**: se eligió paginado de 30 por página en vez de virtualización de
+   scroll (ambas opciones las permitía el encargo) — más simple de implementar y testear correctamente
+   sin agregar una dependencia nueva; suficiente para las ~850 variantes actuales.
+5. La UI de Hugging Face no tiene filtro por nivel/tamaño (el catálogo de Ollama sí) — los resultados
+   de búsqueda de HF no siempre traen tamaño sin pedir cada repo individualmente (`?blobs=true` es por
+   repo, no hay un batch), así que filtrar por tamaño ahí requeriría N llamadas extra por búsqueda; se
+   dejó fuera de esta sesión por alcance.
+
+## 14. Doc 19 — E2a "Mis agentes" y E3a "Delegación desde el chat" (sesión 2026-09-18)
+
+Zona de esta pasada: `packages/runtime/src/{persistence,agent,tools/builtin/delegate*}`,
+`packages/shared/**` (aditivo), `apps/desktop/src/main/ipc/agents.ts` + wiring mínimo en
+`host/{RuntimeHost,createRuntime}.ts`, `apps/desktop/src/renderer/src/features/agents/**` (nueva) +
+stores nuevos, e integración mínima releída antes de cada edit en `RightPanel.tsx`/`ChatHeader.tsx`/
+`ChatCenter.tsx`/`AppLayout.tsx`/`ChatMessageList.tsx`/`project.ts`. **E3b (equipos) y E4a
+(automatización/proactividad) no se tocaron** — quedan tal como los deja doc 19 §3/§4, sin empezar.
+
+### 14.1 E2a "Mis agentes" — cerrado
+
+- Migración `0004_agent_profiles.ts`: `agents` suma `owner_kind`/`avatar_emoji`/`avatar_color`/
+  `description`/`model_mode`/`created_at`/`archived_at` (aditivo, sin CHECK — se valida en zod);
+  `agent_memories` nueva, con procedencia (`source_kind`/`confidence`) e índice por
+  `(agent_id, project_id)`.
+- `AgentRepository` (packages/runtime/src/persistence/repositories/agent.ts) suma
+  `getProfile/listProfiles/createProfile/updateProfile/archive/duplicate` sin tocar `rowToConfig`/
+  `save` (el agente builtin sigue exactamente igual). `listProfiles` sin filtro devuelve solo
+  `owner_kind: 'personal'`, nunca `'worker'`/`'coordinator'`.
+- `AgentMemoryRepository` nuevo: `list()` es el único punto que aplica el filtro de privacidad de T09
+  (`project_id = ? OR project_id IS NULL`).
+- `agent/defaults.ts` suma `createPersonalAgentDefaults` (excluye `delegate` de las tools heredadas
+  por defecto); `agent/modelPolicy.ts` (`resolveModelRef`, heurística mínima fixed/auto,
+  `[HIPÓTESIS A PROBAR]`) y `agent/personalProject.ts` (proyecto sintético, doc 19 §0) son puertos
+  nuevos — `modelPolicy.ts` **no está conectado a `RunController`** todavía (queda como función pura
+  testeada, sin wiring de `resolveModelRef` en el loop real — ver pendientes abajo).
+- `apps/desktop/src/main/ipc/agents.ts` expone los 7 canales de doc 19 §1.4. `createRuntime.ts` llama
+  `ensurePersonalProject()` en el boot; `project:list` excluye el proyecto personal del selector.
+- Renderer: `stores/agentsStore.ts`, `features/agents/{AgentsPanel,AgentEditorModal,toolCatalog}.tsx`,
+  pestaña "Agentes" nueva en `RightPanel.tsx`. `ChatHeader.tsx`/`ChatCenter.tsx` muestran nombre+avatar
+  del agente cuando `chat.agentId` no es el builtin.
+- Tests: `agent.test.ts` (T03 + CRUD), `agentMemory.test.ts` (T09), `modelPolicy.test.ts`,
+  `personalProject.test.ts`.
+
+### 14.2 E3a "Delegación desde el chat" — cerrado
+
+- Migración `0005_delegation.ts`: `runs.delegation_depth` (default 0) + `chats.origin_run_id`
+  (aditivos). `tool_calls.category`/`runs.parent_run_id` ya admitían esto desde la migración 0001
+  (placeholders sin productor, doc 17) — no se tocaron.
+- `packages/shared`: `DelegationRequestSchema`/`DelegationResultSchema` (domain.ts),
+  `PermissionCategory` suma `'delegate'`, `RunEventSchema` suma `'run.delegated'` (con `childChatId`
+  agregado — campo aditivo no listado literal en doc 19 §2.3, necesario para que la UI resuelva "ver
+  conversación completa" sin escanear el stream del hijo).
+- `tools/builtin/delegate.ts`: `ToolDefinition` registrada siempre, nunca en
+  `DEFAULT_ALLOWED_TOOLS` — su `handler` genérico lanza si se ejecuta (la orquestación real vive en
+  `RunController.runDelegateTool`, interceptada en `runHandler` antes del despacho genérico, mismo
+  patrón que `finish`).
+- `RunController.runDelegateTool`: valida el pedido, aplica profundidad máxima 1 y máximo 3
+  delegaciones por run, resuelve destino (agente existente verificado contra el resolver real, o un
+  worker efímero vía el puerto opcional `agentProfiles`), crea chat/run hijo (`this.start()` deriva
+  `delegation_depth` solo a partir de `chats.origin_run_id`), espera a que el hijo termine (polling
+  sobre `this.live`, con cancelación si se agota `budget.timeoutMs`) y traduce el `finish(summary)`
+  del hijo a `DelegationResultSchema` (degrada a texto envuelto si no valida). `gateway.chat()` usa
+  `priority: 'subagent'` para cualquier run con `delegationDepth > 0`.
+- `permissions/engine.ts`: `defaultForCategory`/`CATEGORY_PRIORITY` suman el caso `'delegate'` (ask
+  por defecto) — fix mecánico exigido por la nueva categoría del enum compartido, sin tocar ninguna
+  decisión existente de las demás categorías.
+- Renderer: `runStore.ts` suma `childRunsByParent`/`childChatIdByRun` desde `run.delegated`;
+  `features/chat/DelegationCard.tsx` reemplaza a `ToolCallCard` para tool calls `delegate` en
+  `ChatMessageList.tsx`.
+- Tests: 6 casos nuevos en `RunController.test.ts` (delegación feliz de punta a punta con verificación
+  de `parent_run_id`/`delegation_depth`/`origin_run_id`, worker efímero, sin `agentProfiles`
+  inyectado, profundidad máxima, límite de 3 por run, `targetAgentId` inexistente) + `delegate.test.ts`
+  + actualización de `tools/builtin/index.test.ts` (11 tools).
+
+### 14.3 Pendiente / limitaciones conocidas de esta pasada
+
+1. **`modelPolicy.resolveModelRef` no está conectado a `RunController.start()`**: la función existe,
+   está probada, pero el loop real sigue resolviendo el modelo del run exactamente como antes
+   (`chat.modelRef ?? resolvedAgent.model`) — un agente con `model_mode: 'auto'` hoy se comporta igual
+   que uno `'fixed'` en la app real. Conectar esto de punta a punta (pasar `deps.resolveModelRef` +
+   wirearlo en `createRuntime.ts` con `modelManager.listLoaded()`/`fits()`) queda pendiente; se cortó
+   acá para priorizar el resto de E2a/E3a dentro del tiempo de la sesión.
+2. **Verificación contra Ollama real: hecha, con un hallazgo real en el camino.** `eval/harness.ts`
+   suma los pasos (p) "chat directo con un agente personal" (T04) y (q) "delegación a un worker
+   temporal" (T06/T07), corridos de punta a punta contra qwen3:8b real (127.0.0.1:11434). Primera
+   corrida: (q) dio `timeout` porque `delegate` es `category: 'delegate'` -> default `'ask'`
+   (permissions/engine.ts) y el paso no contestaba ese permiso — no era un bug del runtime, sino que
+   al paso de harness le faltaba el mismo `waitForRunState('awaiting_permission')` +
+   `answerPermission('allow_once')` que ya usan (g.1)-(g.4). Con el fix: **20/20 pasos OK (278.7s)**,
+   corrido dos veces de punta a punta. Evidencia real de (q): el worker se creó con
+   `owner_kind='worker'`, el run/chat hijo con `parent_run_id`/`delegation_depth=1`/`origin_run_id`
+   correctos, y el `DelegationResultSchema` volvió al padre (`{"status":"completed","summary":"Lista
+   de 3 ideas de nombres para una mascota.","artifacts":[...],"nextAction":"..."}`, generado por
+   qwen3:8b real, no inventado). Verificación visual adicional (`SAURIO_SMOKE_SHOT`, `SAURIO_USER_DATA`
+   aislado, sin Ollama de por medio): la pestaña "Agentes" y el modal "Nuevo agente" se dibujan
+   completos contra la app real (capturas no versionadas, revisadas en la sesión).
+3. **DelegationCard correlaciona por orden, no por `toolCallId`**: `run.delegated` no lleva
+   `toolCallId` (doc 19 §2.3 literal); un run con más de una delegación en el mismo turno o turnos
+   distintos se correlaciona con su `childChatId` por orden de aparición entre las tool calls
+   `delegate` y los eventos `run.delegated` del mismo run — funciona para el caso común (una
+   delegación por run) pero es una aproximación documentada, no una garantía por id exacto.
+4. **`budget.maxIterations` de `DelegationRequestSchema` no se aplica**: solo `budget.timeoutMs` se
+   usa (cancela el hijo si se agota); `maxIterations` queda sin efecto — el hijo usa el
+   `maxIterations` de su propio `AgentConfig`, sin ajustarlo según el pedido del padre.
+5. **Sidebar.tsx no tiene la sección "Mis agentes" que pide doc 19 §1.6** — la vitrina completa vive
+   en la pestaña "Agentes" del panel derecho (que sí permite "click para chatear"); no se agregó una
+   segunda entrada duplicada en la barra lateral para no tocar ese archivo más de lo necesario
+   mientras otro agente lo edita activamente en esta misma sesión (layout/Sidebar.tsx).
+6. **T10 sin test automático dedicado** ("`Scheduler.status()` nunca reporta más de 1 slot ocupado
+   durante una delegación"): necesita un test de integración contra el `Scheduler`/`ModelGateway`
+   reales (no el gateway fake de `RunController.test.ts`) — no se agregó esta sesión.
+
+---
+
+## 15. Carga de modelo (oom_load), ModelSelect con estados explícitos, pantalla de inicio, OllamaProcessManager con logs (sesión 2026-09-18, en paralelo con §13/§14)
+
+Alcance del encargo: bloqueos reportados por un usuario real que instaló la v0.1 en una notebook
+Intel Core Ultra 9 288V / iGPU Arc 140V (Vulkan, sin `nvidia-smi`) con solo `gemma4:26b/31b`
+instalados y reportó "bloqueos". Zona: `apps/desktop/src/main/**` (salvo `services/updater` e
+`ipc/models.ts`), `apps/desktop/src/renderer/src/{layout,features/chat,stores}`, el único archivo
+`features/models/ModelSelect.tsx`, `packages/runtime/src/{gateway,agent}` (cambios aditivos
+mínimos). `packages/runtime/src/models/**`/`features/models/**` (catálogo), `services/updater` y
+`main/ipc/agents.ts`/`packages/runtime/src/{persistence,agent/profiles}` eran zona de otros dos
+agentes activos en paralelo en este mismo working tree (§13 y §14 de este documento, escritos
+durante esta misma sesión) — cada archivo compartido se releyó del disco inmediatamente antes de
+editarlo, como pide el encargo; en al menos dos ocasiones un edit ya aplicado apareció revertido en
+una relectura posterior (probablemente una operación de git de otro proceso sobre el mismo working
+tree) y tuvo que rehacerse — de ahí que esta pasada haya commiteado en unidades más chicas de lo
+habitual, una por archivo/grupo tocado, para minimizar la ventana de pérdida.
+
+### 15.1 `oom_load`: detección ampliada + reintento automático con menos capas en GPU
+
+- **`classifyErrorMessage`/`classifyHttpError`** (`packages/runtime/src/gateway/providers/ollama/errors.ts`)
+  ampliados con los textos reales de oom en Vulkan/iGPU que el `classifyErrorMessage` anterior (solo
+  CUDA: `"out of memory"` con espacios, `"cudamalloc failed"`) no reconocía: `"out-of-memory"`
+  (guionado), `"failed to allocate"`, `"model is too large"`, `"ErrorOutOfDeviceMemory"` (enum de
+  Vulkan). Fixture real probado (`errors.test.ts`): `"llama-server reported out-of-memory during
+  startup: GGML_ASSERT(buffer) failed alloc_tensor_range: failed to allocate Vulkan0 buffer of size
+  1072462848"`.
+- **`ChatRequest.options.numGpu`** (aditivo, `gateway/types.ts`) mapeado a `num_gpu` en
+  `OllamaProvider`/`OllamaChatOptionsSchema` — `undefined` deja el default de Ollama, comportamiento
+  previo intacto.
+- **`RunController.handleOomLoad`** (`packages/runtime/src/agent/RunController.ts`): en vez de fallar
+  directo ante `oom_load`, reintenta con ~75% y ~50% de `block_count` (real, vía el puerto opcional
+  nuevo `ModelLayerCountProbe` — `agent/ports.ts`, el host lo implementa envolviendo
+  `ModelManager.describeModel` en `createRuntime.ts`, mismo criterio que `ModelContextProbe`) y por
+  último `numGpu: 0` (CPU pura); sin el puerto (o si nunca devuelve un valor), un único intento
+  directo a `numGpu: 0` — nunca inventa un porcentaje de capas sin saber cuántas hay. Cada paso se
+  registra como `Adjustment`/evento `run.adjustment` (visible en `runStore.adjustmentsByRun`) y queda
+  en `LiveRun.numGpuOverride`, válido solo para ESE run — "reversible" en el sentido del encargo: un
+  run/chat nuevo vuelve a `numGpu` automático. 5 tests nuevos en `RunController.test.ts` (escalera
+  completa 75/50/0 con `block_count` conocido, fallback a CPU sin el puerto, agotamiento de la
+  escalera, persistencia del ajuste entre turnos del mismo run, "reversible" entre runs).
+- **`OomLoadCard`** (`features/chat/OomLoadCard.tsx`, nuevo): cuando un run termina `failed` con
+  `oom_load` (la escalera automática ya se agotó), muestra el mensaje real del error y dos acciones —
+  "Elegir otro modelo" (`useUiNavStore.requestTab('Modelos')`) y "Reintentar con menos capas en GPU"
+  (`run:continue`, que vuelve a correr la misma escalera desde el principio: útil si mientras tanto
+  se liberó memoria). Inyectable en modo demo (`demoState.ts`, `?demoState={"oomError":true}`) —
+  capturada en `docs/capturas/06-oom-load.png` con el texto real del fixture.
+- **"Cargando modelo… mm:ss" + Cancelar** (`ModelLoadingBanner.tsx`, nuevo): `RunState` no distingue
+  "cargando" de "generando" (ambos son `'generating'`, doc 05) — se infiere: activo pero sin ningún
+  `message.delta` todavía (`runStore.streaming` sin entradas de ese `runId`) durante más de unos
+  segundos. `runStore` gana `runStartedAt` (ts del primer `run.state` de cada run) para el
+  cronómetro.
+- **Pendiente, documentado explícitamente y fuera de zona**: registrar el fallo de carga en
+  `model_load_samples`/tabla de compatibilidad ("probado: no entra en este equipo", como pedía el
+  encargo) requeriría tocar `packages/runtime/src/models/ModelManager.ts` (`ModelLoadSample` exige
+  campos de una carga EXITOSA — `size`/`sizeVram`/`loadMs` reales — no hay forma honesta de rellenarlos
+  para un intento fallido sin inventar datos) — zona de la sesión de catálogo (§13), activa en
+  paralelo en este mismo working tree. Se deja como puerto futuro análogo a `ModelLayerCountProbe`.
+
+### 15.2 `ModelSelect`: estados explícitos + mejor modelo por defecto
+
+- **`ModelSelect.tsx`** (único archivo tocado en `features/models/`, según el encargo) gana
+  `engineState?: 'ready' | 'starting' | 'down'`: `'starting'` → "Iniciando motor local…"; `'down'` →
+  "Ollama no está corriendo" + botón "Iniciar" (`ollama:ensureRunning`); sin modelos instalados (y sin
+  esos dos estados) → "No hay modelos instalados" + botón "Abrir Modelos". Opt-in: sin `engineState`,
+  comportamiento exactamente igual al de antes de esta tarea.
+- **`ollamaHealthStore.ts`** (nuevo, `stores/`): un único poll de `provider:health` (8 s) compartido
+  entre `Sidebar.tsx` y `ChatHeader.tsx` — antes cada uno hubiera necesitado el suyo (`StatusBar.tsx`
+  sigue con su propio poll local, no se tocó para no arriesgar una regresión fuera de esta tarea
+  puntual; duplicación menor conocida).
+  Auto-refresco cuando el provider vuelve: ya lo daba `modelsStore.subscribe()` (`models:changed`) para
+  la lista de instalados; se agregó lo mismo para `models:catalog` en `Sidebar.tsx` (se re-pide cuando
+  `ollamaHealthStore.ok` cambia, porque el catálogo depende de poder muestrear hardware real).
+- **`defaultModel.ts`** (`pickDefaultModelRef`): orden real ahora — último modelo usado en ESTE
+  proyecto y que siga instalado (`pickLastUsedModelRef`, sale de `chatStore` sin canal/columna nueva:
+  el chat con `modelRef` más reciente por `updatedAt`) → mejor clasificado por la escala de seis
+  niveles para este hardware (`pickBestInstalledModelRef`, cruza `models:catalog` — API PÚBLICA del
+  Centro de modelos, sin importar internals de `packages/runtime/src/models/**`/`features/models/**`
+  — contra los modelos instalados) → primer instalado (comportamiento previo, sigue siendo el
+  fallback final).
+- **Nunca enviar a un modelo no instalado**: `ChatPanel.handleSend` valida que `chat.modelRef` (si es
+  `locality: 'local'`) siga en `modelsStore.installed` ANTES de `run:start`; si no, banner de error
+  accionable en vez de dejar que el run falle varios segundos después contra el provider.
+
+### 15.3 Pantalla de inicio sin chat abierto
+
+`HomeScreen.tsx` (nuevo, `layout/`) reemplaza los dos estados vacíos que había por separado ("Abrí
+una carpeta" sin proyecto, en `ChatCenter.tsx`; "Elegí un chat" con proyecto pero sin chat, en
+`ChatPanel.tsx`) por uno solo: estado del motor local (`ollamaHealthStore`) y de los modelos
+instalados, tres acciones grandes (Abrir/cambiar carpeta, Elegir o instalar un modelo, Nuevo chat) y
+un enlace a "Configurar proveedores" (`Ajustes`). `ChatCenter` pasó de recibir `projectId: string |
+null` a `project`/`onProjectChange`/`onSelectChat` (igual que ya recibía `Sidebar.tsx`) para poder
+disparar esas acciones sin duplicar estado. La barra lateral suma dos accesos directos fijos
+("Modelos"/"Ajustes", `useUiNavStore.requestTab`) al pie, pedidos explícitamente por el encargo.
+Capturada con Ollama simulado apagado en `docs/capturas/07-motor-apagado.png`.
+
+### 15.4 `OllamaProcessManager`: logs, `stop()`, `inference compute`
+
+- **Captura de stdout/stderr**: con `logsDir` (`hostAdapter.paths.logsDir`), el `ollama serve` que
+  ESTA clase arranca escribe en `userData/logs/ollama-serve.log` (append) en vez de `stdio: 'ignore'`.
+- **`stop()`**: detiene SOLO el proceso que la clase arrancó (nunca una instancia ajena — antes el
+  criterio de "no matar nada" era "no guardar ningún PID"; ahora se guarda el PID únicamente cuando
+  es el propio, y se mata explícitamente en `app.on('before-quit', ...)`).
+- **`readInferenceComputeLine()`**: expone la línea real `msg="inference compute"` que `ollama serve`
+  loguea por dispositivo — primero del log propio, si no en modo attach lee en SOLO LECTURA
+  `%LOCALAPPDATA%\Ollama\server.log`. Cablea el puerto `OllamaInferenceComputeSource` que
+  `HardwareProbe` ya soportaba desde §12.2 pero que la app real nunca terminó de pasarle
+  (`createGlobalRuntime` gana `deps.inferenceComputeSource` opcional).
+- **`SAURIO_OLLAMA_URL`** (nueva variable, solo para pruebas): `createRuntime.ts` la usa como
+  `OLLAMA_BASE_URL` si está seteada — apunta toda la app (gateway, `ModelManager`, `provider:health`)
+  a un puerto vacío para simular "Ollama apagado" de verdad sin tocar una instancia real. Con esta
+  variable seteada, el arranque automático de `ollama:ensureRunning` se salta a propósito (si no,
+  vería el puerto falso caído e intentaría arrancar un `ollama serve` REAL, exactamente lo que la
+  variable existe para evitar). 12 tests nuevos en `ollama-process/index.test.ts` (captura de logs,
+  `stop()` con y sin proceso propio, lectura del log propio y del modo attach, `undefined` sin
+  ninguna fuente).
+
+### 15.5 Verificación real
+
+`pnpm typecheck`/`pnpm test`/`pnpm lint`/`pnpm build` en verde al cierre (raíz, con el resto del
+working tree compartido —  §13/§14 de otras dos sesiones en paralelo — también en verde en ese
+momento): typecheck sin errores, **840 tests en verde + 2 skipped** (repomap 13, runtime 650+2
+skipped, desktop 177 — más que el conteo de sesiones anteriores por el trabajo en paralelo de §13/§14
+además de esta tarea), lint limpio, build genera `out/main`/`out/preload`/`out/renderer`.
+
+- **`SAURIO_SMOKE=1` con Ollama real encendido** (`SAURIO_USER_DATA=<temp>`): `app:ping`/`models:list`
+  responden contra Ollama 0.34.1 real (`127.0.0.1:11434`), 4 modelos reales (`qwen2.5-coder:7b`,
+  `qwen3:8b`, `gemma4:31b`, `gemma4:26b`), `ollama:ensureRunning` automático detecta que ya estaba
+  corriendo (`{ running: true, startedByApp: false }`), la app cierra sola.
+- **`SAURIO_OLLAMA_URL=http://127.0.0.1:11999` con `SAURIO_SMOKE_UI`/`SAURIO_SMOKE_SHOT`** (sin
+  `SAURIO_SMOKE`, `SAURIO_USER_DATA=<temp>` distinto): la app arranca contra el puerto vacío,
+  `models:list`/`models:catalog`/`provider:health` fallan con `connection_refused` de forma prolija
+  (sin crashear el proceso), `rootHtmlLength=10567` (> 0) y captura real
+  (`docs/capturas/07-motor-apagado.png`) mostrando la pantalla de inicio en rojo + el asistente de
+  primer arranque detectando lo mismo + la barra de estado con "Iniciar Ollama". No se mató ni se
+  arrancó ningún proceso `ollama serve` real durante esta prueba (el arranque automático se saltó a
+  propósito, ver §15.4).
+- **Modo demo con `oomError:true`** (`SAURIO_SMOKE_UI`/`SAURIO_SMOKE_SHOT`/`SAURIO_SMOKE_STATE`):
+  `docs/capturas/06-oom-load.png`, `OomLoadCard` con el mensaje real del fixture y las dos acciones.
+- **No verificado con capturas** (fuera de alcance del tiempo disponible en esta sesión, documentado
+  como límite conocido): el estado `engineState: 'starting'` de `ModelSelect` (ventana muy corta,
+  típicamente <15s) y el banner "Cargando modelo… mm:ss" con un modelo grande cargando de verdad
+  (`ModelLoadingBanner`) — ambos se verificaron por lectura de código + los gates automatizados, no
+  con una captura de pantalla propia.
+
+### 15.6 Pendiente / limitaciones conocidas
+
+1. `oom_load` fallido no queda registrado en `model_load_samples`/tabla de compatibilidad — ver
+   §15.1, requiere un cambio en `packages/runtime/src/models/**` (zona de otra sesión).
+2. El botón "Reintentar con menos capas en GPU" de `OomLoadCard` no fuerza `numGpu: 0` directo — hace
+   `run:continue`, que vuelve a correr la escalera automática completa desde `'auto'`. Es la opción
+   más honesta dado que la memoria real pudo haber cambiado, pero significa que, si el motivo del oom
+   no cambió, el segundo intento tarda lo mismo en volver a fallar (tres reintentos con backoff antes
+   de la tarjeta) en vez de ir directo a CPU.
+3. `ModelSelect`'s `engineState: 'down'` solo se calcula cuando `installedModels.length === 0` — si
+   Ollama está caído pero hay modelos de otro proveedor (LAN/nube) configurados, el selector muestra
+   esos con normalidad en vez de señalar que Ollama puntualmente no responde (comportamiento
+   considerado correcto: el usuario igual puede elegir un modelo que sí funciona).
+4. `StatusBar.tsx` sigue con su propio poll de `provider:health` en vez de usar `ollamaHealthStore`
+   (duplicación menor, ver §15.2) — no se tocó para no arriesgar una regresión fuera de esta tarea.
+5. `docs/capturas` no tiene una captura de `engineState: 'starting'` ni del banner de carga con un
+   modelo real cargando (ver §15.5).

@@ -36,7 +36,7 @@ Hay dos scripts `.cmd` en la raíz del repo (`N:\SaurioLLM`). Se abren con doble
   3. Al terminar, el ejecutable queda en `apps\desktop\release\win-unpacked\SaurioLLM.exe`: se puede
      abrir con doble clic como cualquier `.exe` de Windows.
 
-  Para generar además el instalador NSIS (`SaurioLLM Setup <versión>.exe`, con asistente de
+  Para generar además el instalador NSIS (`SaurioLLM-Setup-<versión>.exe`, con asistente de
   instalación/desinstalación), corré `pnpm --filter @saurio/desktop run build:installer` (sin
   `-- --dir`) — deja el instalador en `apps/desktop/release/`, junto a la misma carpeta
   `win-unpacked/`.
@@ -225,6 +225,40 @@ Hay dos scripts `.cmd` en la raíz del repo (`N:\SaurioLLM`). Se abren con doble
   avanzar, es justamente esto: cancelá el run y pedí el cambio con más contexto (indicando la línea o
   función exacta).
 
+### Carga de modelo, selector de modelo y pantalla de inicio (esta sesión)
+
+Cierra los bloqueos reportados por un usuario real que instaló la v0.1 en una notebook con iGPU
+Intel Arc (Vulkan, sin `nvidia-smi`) y solo `gemma4:26b/31b` instalados:
+
+- **El modelo no entra en la memoria del equipo (`oom_load`)**: mientras Ollama carga el modelo (puede
+  tardar más de un minuto) el chat muestra "Cargando modelo… mm:ss" con un botón Cancelar, en vez de
+  quedar en un "Generando…" sin explicación. Si el provider devuelve un error real de falta de
+  memoria, la app reintenta sola con menos capas offloadeadas a GPU (~75% → ~50% → 0% = solo CPU, más
+  lento) antes de rendirse; cada intento queda visible como un ajuste automático. Si ni con CPU entra,
+  aparece una tarjeta con el mensaje real del error y dos acciones: "Elegir otro modelo" (abre el
+  Centro de modelos) y "Reintentar con menos capas en GPU" (arranca de nuevo la misma escalera —
+  útil si mientras tanto se liberó memoria).
+- **Selector de modelo con estados explícitos**: en vez de un `<select>` vacío o engañoso, ahora dice
+  explícitamente "Iniciando motor local…", "Ollama no está corriendo" (con botón "Iniciar") o "No hay
+  modelos instalados" (con botón "Abrir Modelos"). El modelo por defecto de un chat nuevo prioriza el
+  último usado en este proyecto (si sigue instalado), después el mejor clasificado por la escala de
+  seis niveles para tu hardware, y por último el primer modelo instalado. Nunca se permite enviar un
+  mensaje a un modelo local que ya no está instalado: se avisa antes de intentarlo.
+- **Pantalla de inicio** cuando no hay ningún chat abierto: estado del motor local y de los modelos
+  instalados, y tres accesos grandes — Abrir/cambiar carpeta, Elegir o instalar un modelo, Nuevo chat —
+  más un enlace a "Configurar proveedores" (API de nube). La barra lateral suma accesos directos fijos
+  a "Modelos" y "Ajustes".
+- **Log de `ollama serve`**: cuando la app arranca Ollama por su cuenta, su stdout/stderr queda en
+  `%APPDATA%\SaurioLLM\logs\ollama-serve.log`; al cerrar la app, se detiene SOLO ese proceso (nunca uno
+  que ya estuviera corriendo o que hayas arrancado vos). En equipos sin `nvidia-smi` (iGPU Intel/AMD),
+  la línea real `msg="inference compute"` que Ollama loguea por dispositivo ahora alimenta el
+  detector de hardware (o, en modo attach, se lee de `%LOCALAPPDATA%\Ollama\server.log` en solo
+  lectura).
+- **Pendiente**: el intento fallido de cargar un modelo (`oom_load`) todavía no queda registrado en la
+  tabla de modelos probados del Centro de modelos ("probado: no entra en este equipo") — el mecanismo
+  para eso vive en `packages/runtime/src/models/**`, zona de otra sesión de trabajo en paralelo; ver
+  `docs/architecture/16-estado-de-implementacion.md` para el detalle.
+
 ## 5. Qué NO deshace el revert
 
 Revertir un checkpoint deshace **el contenido del archivo o archivos que ese checkpoint tocó**, byte a
@@ -346,6 +380,48 @@ máquina con la carpeta `N:\OllamaModels` detectada; "Explorar" muestra el catá
 filtros por uso, `qwen3:8b` marcado "cargado" (coincide con el estado real del servidor en el
 momento de la captura) y modelos no instalados con el botón "Descargar" habilitado.
 
+### Centro de modelos — escala de seis niveles y usabilidad (sesión 2026-09-18, cobertura máxima del catálogo)
+
+![Pestaña Explorar con la leyenda de los seis niveles y el badge "1 · Perfecto" en qwen3:8b](capturas/smoke-explorar-tiers-ollama-on.png)
+![Pestaña Instalados con los 4 modelos reales y la guía "Abrí o creá un chat para poder usarlo"](capturas/smoke-instalados-usar-en-chat.png)
+
+Feedback real de un usuario que instaló la v0.1 ("no entiendo cómo instalar, seleccionar y saber si
+tengo modelos") llevó a: badge "en uso en este chat" + botón "Usar en este chat" en Instalados;
+banner "Ollama no está corriendo" con botón "Iniciar Ollama" (en vez de listas vacías sin
+explicación); en Explorar, una leyenda fija en español simple de los seis niveles de la escala
+("1 · Perfecto" ... "6 · No recomendado") con el badge y la explicación de una línea calculados
+contra el hardware real de esta máquina en cada request, espacio libre en disco visible, y botón
+"Usar este modelo" después de descargar. Ver `docs/architecture/16-estado-de-implementacion.md` §12
+para el detalle técnico (`TierClassifier`, soporte de `HardwareProbe` para iGPU/memoria unificada).
+
+### Centro de modelos — cobertura máxima del catálogo (sesión 2026-09-18, cierre)
+
+Lo que quedaba pendiente arriba ya está: la pestaña Explorar ahora muestra la biblioteca COMPLETA de
+`ollama.com/library` (240 familias reales, 858 variantes reales, sincronizadas en vivo la primera vez
+que se abre — ver `docs/architecture/16-estado-de-implementacion.md` §12.6/§13 para el detalle
+técnico), no solo las 16 entradas curadas a mano (esas siguen existiendo, pero ahora son la capa de
+"uso sugerido/notas" que se fusiona por nombre con el resto de la biblioteca).
+
+- **Búsqueda, filtros y orden**: texto libre, por uso, por nivel de la escala (1-6) y por tamaño
+  (chico/mediano/grande); orden "recomendado para tu PC" (nivel ascendente, después tamaño), por
+  nombre o por tamaño. Lista paginada de a 30 modelos por página.
+- **"Actualizar catálogo"**: sincroniza de nuevo contra `ollama.com/library` (caché de 24 h en
+  `userData`; sin conexión, usa la caché aunque esté vencida, y si nunca hubo caché, el snapshot
+  incluido con la app — `resources/model-catalog.snapshot.json`, generado con
+  `pnpm build:model-catalog`). La pestaña siempre dice de dónde salió el catálogo mostrado
+  ("sincronizado ahora" / "en caché" / "incluido con la app, sin conexión").
+- **Ficha lateral**: click en cualquier modelo abre sus variantes (tags) de esa familia, con un
+  selector de contexto 4k/8k/16k/32k que recalcula el nivel de la escala en vivo para ese contexto.
+- **Hugging Face**: pestaña separada para buscar modelos GGUF por texto, ver sus archivos por
+  cuantización con tamaño real, y descargarlos (`hf.co/<usuario>/<repo>:<quant>`, el mismo formato que
+  entiende Ollama de forma nativa).
+- **"Descargar por nombre"**: campo libre siempre visible arriba de Explorar — valida el nombre
+  (contra el registry de Ollama o contra `hf.co/...`) y muestra tamaño/espacio/nivel antes de
+  descargar.
+
+Verificado real esta sesión: descarga por nombre de `all-minilm` (46 MB, progreso real hasta ~67 MB/s)
+y borrado, confirmados contra `/api/tags` real antes y después.
+
 ### Panel de rendimiento con muestreo continuo
 
 ![Panel de rendimiento con CPU/RAM/GPU/VRAM medidos y un modelo real cargado](capturas/smoke-perf-panel.png)
@@ -369,6 +445,31 @@ tamaño porque el objetivo por defecto es velocidad), cada uno con su badge LOCA
 Formulario para agregar un proveedor (tipo, nombre, base URL, clave de API) y la lista de
 proveedores configurados — acá, el Ollama local sembrado por defecto, con "Probar conexión" y el
 campo para pegar/reemplazar la clave.
+
+### Tarjeta "el modelo no entró en la memoria" (oom_load)
+
+![Tarjeta de oom_load con "Elegir otro modelo" y "Reintentar con menos capas en GPU"](capturas/06-oom-load.png)
+
+Cuando Ollama devuelve un error real de falta de memoria (aquí, el texto real reportado por un
+usuario con iGPU Intel Arc/Vulkan: `GGML_ASSERT(buffer) failed alloc_tensor_range: failed to
+allocate Vulkan0 buffer...`), `RunController` ya reintentó automáticamente bajando `numGpu`
+(~75% → ~50% → 0 = solo CPU) antes de rendirse; la tarjeta ofrece abrir el Centro de modelos o
+reintentar desde cero (útil si mientras tanto se liberó memoria). Capturada en modo demo
+(`?demoState={"oomError":true}`, `apps/desktop/src/renderer/src/demo/demoState.ts`) para no
+depender de una GPU real sin memoria.
+
+### Motor local apagado: pantalla de inicio, selector de modelo y barra de estado
+
+![Pantalla de inicio con el motor local no conectado](capturas/07-motor-apagado.png)
+
+Capturada apuntando la app a un puerto vacío (`SAURIO_OLLAMA_URL=http://127.0.0.1:11999`, variable
+solo para pruebas — simula "Ollama apagado" de verdad sin tocar ninguna instancia real de Ollama de
+esta máquina, ver `apps/desktop/src/main/host/createRuntime.ts`). La pantalla de inicio muestra
+"Motor local no conectado (Ollama)" en rojo y "Sin modelos
+instalados", la barra de estado inferior muestra "Ollama no conectado" con el botón "Iniciar
+Ollama", y el asistente de primer arranque detecta lo mismo y ofrece instalar Ollama o configurar
+una clave de API. Los accesos directos "Modelos"/"Ajustes" quedan visibles al pie de la barra
+lateral en todo momento.
 
 ## 9. Usar modelos por API
 
@@ -425,3 +526,82 @@ proveedor los informa) y una etiqueta de calidad del dato (medido/estimado/no di
 **costo en moneda siempre aparece como "no disponible"**: ningún proveedor del MVP (Ollama, ni
 ningún "OpenAI-compatible", ni Anthropic) informa el costo de una respuesta — se muestra así en vez
 de inventar un cálculo.
+
+## 10. Actualizaciones automáticas
+
+Resumen para quien ya tiene la app instalada (la explicación completa, pensada para quien todavía no
+instaló, está en [`docs/INSTALAR.md`](INSTALAR.md) §5 — no se duplica acá).
+
+- SaurioLLM busca una versión nueva sola al abrir y cada 6 horas mientras queda abierta, la descarga
+  en segundo plano sin interrumpir el uso, y al terminar muestra un diálogo nativo ("Reiniciar ahora"
+  / "Más tarde"). Con "Más tarde", se instala sola al cerrar la app.
+- Si hay un run activo (modelo respondiendo, herramienta ejecutando) cuando termina de descargar, el
+  aviso se pospone hasta que termine — nunca corta un run a mitad de camino.
+- Errores de red al buscar/descargar quedan solo en `%APPDATA%\SaurioLLM\logs\updater.log`, sin
+  ningún aviso — no afectan el resto de la app.
+- Implementación: `apps/desktop/src/main/services/updater/` (`AutoUpdaterService` orquesta el flujo
+  sobre `electron-updater`; `ActiveRunTracker` es la pieza que sabe si hay un run activo, escuchando
+  los mismos `RunEvent` `run.state` que ya consume `RunEventBatcher`). `electron-builder.yml`
+  (`publish: github`) es lo que hace que cada build genere `latest.yml` + `.blockmap` y empaquete
+  `app-update.yml` dentro de la app — sin esos tres archivos en el Release de GitHub (ver
+  `scripts/release-local.mjs`), no hay forma de que electron-updater encuentre la actualización.
+- **Ajuste para desactivarlo:** clave `updates.auto` en `settings.local.json` (default `true`) o la
+  variable de entorno `SAURIO_NO_UPDATE=1` para una sola sesión — ver detalle en
+  [`docs/INSTALAR.md`](INSTALAR.md) §5.
+- **Probarlo sin instalar nada** (dos versiones + feed HTTP estático local, en vez del Release real de
+  GitHub): compilar dos veces con `apps/desktop/package.json` en versiones distintas
+  (`build:installer` cada vez, guardando la salida de `apps/desktop/release/` de cada una en una
+  carpeta aparte), servir la carpeta de la versión "nueva" con cualquier servidor HTTP estático en
+  `127.0.0.1`, y abrir el `.exe` de `release/win-unpacked/` de la versión "vieja" con las variables de
+  entorno `SAURIO_UPDATE_DEV_FEED=http://127.0.0.1:<puerto>` (fuerza el chequeo aunque no esté
+  empaquetada/instalada) y `SAURIO_USER_DATA=<carpeta aislada>` (para no tocar datos reales). El log
+  de `updater.log` en esa carpeta aislada va a mostrar `actualización disponible` y
+  `actualización descargada` en cuanto el chequeo/descarga terminen contra ese feed local — así se
+  verificó esta implementación de punta a punta, sin instalar el resultado en ninguna máquina.
+
+## 11. Mis agentes y delegación
+
+Doc de arquitectura completo: `docs/architecture/19-agentes-personales-y-equipos.md` (entregas E2a
+"Mis agentes" y E3a "Delegación desde el chat"; equipos y automatización/proactividad — E3b y E4a —
+todavía no están implementados).
+
+### 11.1 Mis agentes (opcional, nunca obligatorio)
+
+- Pestaña **"Agentes"** del panel derecho: lista tus agentes personales (avatar/nombre/rol), con
+  "+ Nuevo agente". El único campo obligatorio es el nombre — modelo, herramientas, permisos y
+  memoria tienen un default sensato, así que crear un agente nunca es un paso necesario para usar la
+  app (el chat con el agente builtin sigue siendo el camino por defecto).
+- Al crear/editar un agente elegís: emoji + color, rol, **modelo fijo** (uno instalado puntual) o
+  **automático** (heurística mínima: usa el modelo ya cargado si entra en memoria, si no cae al
+  modelo configurado — todavía en evaluación, no hay selección "inteligente" por tarea), qué
+  herramientas puede usar (checklist), preset de permisos (estricto/balanceado/confiado) y si su
+  memoria es global o solo de este proyecto.
+- **Chat directo con un agente personal**: hacé clic en el agente (desde la pestaña "Agentes") para
+  abrir o crear un chat con él. Si no tenés ningún proyecto abierto, el chat vive en un proyecto
+  personal interno (nunca aparece en el selector de proyectos). La cabecera del chat muestra el
+  nombre/avatar del agente junto al selector de modelo cuando no es el agente builtin.
+- **Memoria por agente**: cada fila de memoria queda etiquetada con su procedencia (dicho por vos /
+  inferido / derivado de un archivo) y su confianza (confirmado / hipótesis) — nunca se le muestra al
+  modelo como un hecho plano. Una memoria guardada en un proyecto nunca se filtra a otro proyecto
+  distinto (solo las memorias marcadas explícitamente como "global" se ven en cualquier proyecto).
+  Límite conocido: esto protege lo que el *sistema* de memoria recupera, no impide que el modelo
+  "recuerde" algo que vos mismo pegaste en la conversación de otro proyecto — eso es un límite del
+  LLM, no de este mecanismo.
+
+### 11.2 Delegar una tarea a otro agente
+
+- Un agente puede tener la herramienta **"Delegar a otro agente"** habilitada explícitamente (no
+  viene activada por defecto en ningún agente, ni siquiera el builtin) — solo entonces puede delegar
+  una subtarea.
+- Al delegar, aparece una **tarjeta de delegación** en el chat: a quién (agente existente, o "worker
+  temporal" si no se indicó ninguno — un agente efímero que NO aparece en "Mis agentes"), la tarea y
+  el entregable esperado; cuando el sub-agente termina, la tarjeta muestra el resultado (completado /
+  falló / necesita más info) con un botón "ver conversación completa" que abre el chat del sub-agente.
+- Límites duros, sin depender de que el modelo se autolimite: un sub-agente **no puede delegar de
+  nuevo** (profundidad máxima 1) y un mismo chat/turno no puede acumular más de **3 delegaciones**.
+  Si el modelo insiste, la tool devuelve un error explícito en vez de romper la conversación.
+  Si el sub-agente no responde en un tiempo razonable, la delegación se cancela y se informa como
+  fallida — no queda corriendo indefinidamente.
+- Con el hardware medido en el equipo de referencia de este proyecto (1 solo slot de inferencia), tu
+  agente y el sub-agente **nunca corren al mismo tiempo** — se turnan automáticamente; delegar no
+  duplica el uso de VRAM ni acelera nada, solo organiza el trabajo en una conversación aparte.

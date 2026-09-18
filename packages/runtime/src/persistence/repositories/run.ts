@@ -33,6 +33,7 @@ interface RunRow extends SqliteRow {
   last_event_seq: number | null;
   owner_session_id: string | null;
   heartbeat_at: number | null;
+  delegation_depth: number | null;
 }
 
 function rowToRecord(row: RunRow): RunRecord {
@@ -54,6 +55,7 @@ function rowToRecord(row: RunRow): RunRecord {
     ...(row.owner_session_id ? { ownerSessionId: row.owner_session_id } : {}),
     ...(row.heartbeat_at !== null ? { heartbeatAt: row.heartbeat_at } : {}),
     createdAt: row.started_at ?? 0,
+    delegationDepth: row.delegation_depth ?? 0,
   };
 }
 
@@ -73,8 +75,8 @@ export function createRunRepository(driver: SqliteDriver): SqliteRunRepository {
       driver.prepare(
         `INSERT INTO runs (id, chat_id, parent_run_id, agent_id, mode, model_ref_json, effective_config_json,
                            state, state_reason, iteration, started_at, finished_at, error_json, metrics_json,
-                           last_event_seq, owner_session_id, heartbeat_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)`,
+                           last_event_seq, owner_session_id, heartbeat_at, delegation_depth)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?)`,
       ).run(
         run.id, run.chatId, run.parentRunId ?? null, run.agentId, run.mode,
         JSON.stringify(run.effectiveConfig?.model ?? PLACEHOLDER_MODEL_REF),
@@ -82,6 +84,7 @@ export function createRunRepository(driver: SqliteDriver): SqliteRunRepository {
         run.state, run.stateReason ?? null, run.iteration, run.createdAt,
         run.error ? JSON.stringify(run.error) : null,
         run.lastEventSeq, run.ownerSessionId ?? null, run.heartbeatAt ?? null,
+        run.delegationDepth ?? 0,
       );
       return run;
     },
@@ -120,6 +123,7 @@ export function createRunRepository(driver: SqliteDriver): SqliteRunRepository {
       if (patch.ownerSessionId !== undefined) set('owner_session_id', patch.ownerSessionId ?? null);
       if (patch.heartbeatAt !== undefined) set('heartbeat_at', patch.heartbeatAt ?? null);
       if (patch.createdAt !== undefined) set('started_at', patch.createdAt);
+      if (patch.delegationDepth !== undefined) set('delegation_depth', patch.delegationDepth);
 
       if (sets.length > 0) {
         params.push(id);

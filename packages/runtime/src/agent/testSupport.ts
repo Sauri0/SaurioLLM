@@ -4,7 +4,7 @@
 import type {
   Chat, ChatMessage, ToolCall, ToolResult, PermissionDecision, Task, Checkpoint,
 } from '@saurio/shared';
-import type { ChatChunk, ModelGateway } from '../gateway/types.js';
+import type { ChatChunk, ChatRequest, ModelGateway } from '../gateway/types.js';
 import type { ToolDefinition, ToolProtocol, ToolRegistry } from '../tools/types.js';
 import type { PermissionEngine } from '../permissions/types.js';
 import type { CheckpointService, RevertPlan, RevertResult } from '../checkpoint/types.js';
@@ -152,12 +152,20 @@ export function makeFakeTaskManager(events: EventStore, clock: Clock): TaskManag
 
 /** Cola de "turnos" del modelo: cada `start()` de un test empuja los `ChatChunk[]` que el próximo
  *  `chat()` debe emitir. Si la cola se vacía, devuelve un turno que llama a `finish`. */
-export function makeScriptedGateway(scripts: ChatChunk[][]): ModelGateway & { calls: number } {
+export function makeScriptedGateway(scripts: ChatChunk[][]): ModelGateway & { calls: number; requests: ChatRequest[] } {
   let i = 0;
-  const gw: ModelGateway & { calls: number } = {
+  const gw: ModelGateway & { calls: number; requests: ChatRequest[] } = {
     calls: 0,
-    chat(_ref, _req, _ctx): AsyncIterable<ChatChunk> {
+    // Tarea "carga de modelo/oom_load": guarda cada `ChatRequest` tal como llegó (por referencia, no
+    // clonado) para que los tests puedan verificar `options.numGpu` en cada reintento sucesivo del
+    // mismo turno (RunController muta el MISMO objeto `request` entre reintentos, ver retryOrFail).
+    requests: [],
+    chat(_ref, req, _ctx): AsyncIterable<ChatChunk> {
       gw.calls += 1;
+      // Snapshot superficial de `options`: RunController reutiliza y MUTA el mismo objeto `request`
+      // entre reintentos del mismo turno (ver retryOrFail/handleOomLoad) — sin clonar acá, todas las
+      // entradas de `requests` terminarían apuntando al mismo objeto y mostrando el último valor.
+      gw.requests.push({ ...req, options: { ...req.options } });
       const script = scripts[i] ?? defaultFinishScript();
       i += 1;
       return (async function* () { for (const chunk of script) yield chunk; })();

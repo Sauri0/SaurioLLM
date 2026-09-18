@@ -10,14 +10,16 @@ del [`README.md`](../README.md).
 - Espacio libre en disco: el instalador pesa alrededor de 125 MB y la app instalada ronda los 450-500
   MB. Sumale el espacio de los modelos que instales en Ollama (varios GB cada uno).
 - Para usar modelos locales gratis: [Ollama](https://ollama.com/download) instalado y corriendo en
-  esta misma máquina. Alternativa sin instalar nada más: usar un proveedor por API (ver paso 5).
+  esta misma máquina. Alternativa sin instalar nada más: usar un proveedor por API (ver paso 6).
 
 ## 2. Descargar el instalador
 
 1. Andá a la sección **[Releases](../../releases)** de este repositorio en GitHub.
-2. Bajo la versión más reciente, descargá el archivo `SaurioLLM Setup <versión>.exe`.
-3. No hace falta descargar nada más: el instalador ya trae todo lo necesario (no requiere .NET, Visual
-   C++ Redistributable ni ningún otro runtime aparte).
+2. Bajo la versión más reciente, descargá el archivo `SaurioLLM-Setup-<versión>.exe`.
+3. No hace falta descargar nada más que ese `.exe` para instalar (los otros dos archivos del Release,
+   `latest.yml` y `SaurioLLM-Setup-<versión>.exe.blockmap`, son solo para que las versiones futuras se
+   actualicen solas — ver paso 5 — no hacen falta para instalar por primera vez). El instalador ya trae
+   todo lo necesario (no requiere .NET, Visual C++ Redistributable ni ningún otro runtime aparte).
 
 ## 3. Instalar
 
@@ -48,7 +50,33 @@ Después de eso, abrís la carpeta de un proyecto de código y ya podés chatear
 resto del recorrido (modos plan/agent, permisos, checkpoints, terminal, Centro de modelos, etc.) mirá
 el [`docs/MANUAL.md`](MANUAL.md), pensado para acompañar el uso día a día.
 
-## 5. Modelos: local (Ollama) o por API
+## 5. Actualizaciones automáticas
+
+SaurioLLM se actualiza sola, sin que tengas que volver a esta página de Releases cada vez:
+
+- Al abrir la app (y después cada 6 horas, si la dejás abierta) busca sola una versión nueva en los
+  Releases de este repositorio.
+- Si hay una, la descarga en segundo plano — podés seguir usando la app mientras tanto, no se
+  interrumpe nada.
+- Cuando termina de descargar, te avisa con un diálogo: **"Hay una versión nueva (x.y.z) lista."**, con
+  dos opciones:
+  - **Reiniciar ahora**: cierra SaurioLLM y la vuelve a abrir ya actualizada.
+  - **Más tarde**: seguís usando la versión actual; la actualización se instala sola la próxima vez que
+    cierres la app (no hace falta que vuelvas a este diálogo).
+- Si en ese momento tenés un run activo (el modelo respondiendo, o ejecutando una herramienta),
+  SaurioLLM pospone el aviso hasta que termine — no te va a cortar nada a mitad de camino.
+- Si no hay conexión o el chequeo falla por lo que sea, no ves ningún aviso molesto: queda anotado en
+  `%APPDATA%\SaurioLLM\logs\updater.log` y la app sigue funcionando normal con la versión que tenías.
+- **Para desactivarlo:** en Ajustes (o a mano, editando `%APPDATA%\SaurioLLM\settings.local.json`)
+  poné la clave `updates.auto` en `false`. También podés desactivarlo por sesión con la variable de
+  entorno `SAURIO_NO_UPDATE=1` antes de abrir la app.
+- **Nota de firma** (mismo tema que el paso 3, aplicado ahora a la actualización): SaurioLLM verifica
+  que el archivo que descargó sea EXACTAMENTE el que se publicó (compara un hash `sha512`), pero eso no
+  es una firma de editor — Windows sigue sin reconocer una identidad verificada detrás del binario. Es
+  la misma limitación de siempre (sin certificado de firma de código pago), no algo nuevo que introduzca
+  la actualización automática.
+
+## 6. Modelos: local (Ollama) o por API
 
 - **Local con Ollama (gratis, corre en tu máquina):** instalá [Ollama](https://ollama.com/download),
   dejalo corriendo, y desde el asistente de primer arranque o el Centro de modelos de SaurioLLM
@@ -58,12 +86,12 @@ el [`docs/MANUAL.md`](MANUAL.md), pensado para acompañar el uso día a día.
   proveedor compatible con la API de OpenAI o de Anthropic en Ajustes. SaurioLLM no guarda ni envía esa
   clave a nadie más que al proveedor que elijas.
 
-## 6. Desinstalar
+## 7. Desinstalar
 
 Como cualquier otro programa de Windows: **Configuración → Aplicaciones → Aplicaciones instaladas →
 SaurioLLM → Desinstalar**, o ejecutá el desinstalador desde la carpeta de instalación.
 
-## 7. Problemas conocidos / cómo reportar
+## 8. Problemas conocidos / cómo reportar
 
 - Si la ventana queda en blanco o la app no arranca, fijate primero si tu placa de video tiene
   problemas con la virtualización de GPU de Electron (algunos equipos lo necesitan deshabilitado) —

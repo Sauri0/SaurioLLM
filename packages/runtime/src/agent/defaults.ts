@@ -4,8 +4,8 @@
 // Ollama 0.34.1): qwen3:8b y qwen2.5-coder:7b entran 100% en GPU con num_ctx 8192; con 16384 hay
 // offload y la generación cae de ~60 tok/s a ~18 tok/s. De ahí numCtx 8192 y los presupuestos
 // escalados a 8k (repo map ~1000 tokens, historial ~3500, reserva 1500) y `thinking: 'off'`.
-import { createHash } from 'node:crypto';
-import type { ModelRef, ToolTransport } from '@saurio/shared';
+import { createHash, randomUUID } from 'node:crypto';
+import type { AgentCreateInput, ModelRef, ToolTransport } from '@saurio/shared';
 import type { AgentConfig, ContextPolicy } from './types.js';
 import type { PermissionPolicy } from '../permissions/types.js';
 
@@ -141,6 +141,39 @@ export function createDefaultAgentConfig(
     permissions: DEFAULT_PERMISSION_POLICY,
     workingDir,
     contextPolicy,
+    memory: { readProjectMemory: true, writeProjectMemory: false },
+    maxIterations: 25,
+    temperature: 0.2,
+    thinking: 'off',
+    toolTransport: 'auto',
+    defaultMode: 'agent',
+  };
+}
+
+/** Doc 19 §1.5 (E2a "Mis agentes"): `AgentConfig` completo para un agente personal (o un worker
+ *  efímero de delegación, E3a — mismo constructor, distinto `owner_kind` en la fila de `agents`, ver
+ *  `AgentRepository.createProfile`). Hereda `DEFAULT_ALLOWED_TOOLS` cuando `input.allowedTools` viene
+ *  vacío/ausente (R01: "sin plantilla obligatoria... todos los campos salvo name tienen default
+ *  sensato") y SIEMPRE excluye `delegate` de esa herencia por defecto (doc 19 §2.5: "no se agrega a
+ *  DEFAULT_ALLOWED_TOOLS... solo un agente que la tenga explícitamente en su allowedTools puede
+ *  delegar") — si el usuario la pide de forma explícita en `input.allowedTools`, se respeta. */
+export function createPersonalAgentDefaults(input: AgentCreateInput, id?: string): AgentConfig {
+  const systemPrompt = input.systemPrompt && input.systemPrompt.trim().length > 0
+    ? input.systemPrompt
+    : DEFAULT_SYSTEM_PROMPT;
+  const requestedTools = input.allowedTools && input.allowedTools.length > 0 ? input.allowedTools : undefined;
+  const allowedTools = requestedTools ?? DEFAULT_ALLOWED_TOOLS.filter((t) => t !== 'delegate');
+  return {
+    id: id ?? `agent_personal_${randomUUID()}`,
+    name: input.name,
+    role: input.role ?? 'custom',
+    model: input.model ?? DEFAULT_MODEL_REF,
+    systemPrompt,
+    systemPromptHash: hashSystemPrompt(systemPrompt),
+    allowedTools,
+    permissions: { ...DEFAULT_PERMISSION_POLICY, preset: input.permissionPreset ?? 'balanced' },
+    workingDir: '',
+    contextPolicy: DEFAULT_CONTEXT_POLICY,
     memory: { readProjectMemory: true, writeProjectMemory: false },
     maxIterations: 25,
     temperature: 0.2,

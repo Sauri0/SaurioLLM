@@ -13,8 +13,9 @@
 // cancelling` (doc 10 §2: es un estado activo más, ocupa slot real — doc 07 §7.2).
 import type {
   Mode, RunState, ChatMessage, ToolCall, ToolResult, PermissionAnswer, PermissionRequest,
-  RunError as RunErrorShared, ResponseMetrics, ToolTransport,
+  RunError as RunErrorShared, ResponseMetrics, ToolTransport, DelegationRequest, DelegationResult,
 } from '@saurio/shared';
+import { DelegationRequestSchema, DelegationResultSchema } from '@saurio/shared';
 import type { ModelGateway, ChatRequest, JsonSchemaTool } from '../gateway/types.js';
 import type {
   ToolRegistry, ToolProtocol, ToolDefinition, ToolContext, CheckpointHandle, ToolClassification,
@@ -32,8 +33,8 @@ import type {
   AgentConfig, EffectiveConfig, RunController as RunControllerContract, ToolCallRecord, Adjustment,
 } from './types.js';
 import type {
-  RunRepository, AgentConfigResolver, Clock, IdGenerator, OrphanDiagnostics, ModelContextProbe,
-  LastReadHashes,
+  RunRepository, RunRecord, AgentConfigResolver, Clock, IdGenerator, OrphanDiagnostics, ModelContextProbe,
+  LastReadHashes, ModelLayerCountProbe, AgentProfilePort,
 } from './ports.js';
 import { RunStateMachine } from './RunStateMachine.js';
 import { LoopDetector } from './LoopDetector.js';
@@ -44,7 +45,22 @@ import { recover as recoverRuns, synthesizeInterruptedResultMessage, type Recove
 
 const MUTATING_ERROR_RETRY_CODES = new Set(['connection_refused', 'stream_cut']);
 const BUSY_RETRY_CODE = 'server_busy';
+/** PRIORIDAD CERO punto 2: tope de reintentos SEGUIDOS de `connection_refused` antes de fallar el
+ *  run con `provider_down` en vez de reintentar para siempre (ver `retryOrFail`). 3 reintentos de
+ *  2s = ~6s de "Generando…" como máximo con el provider caído, un tiempo corto y predecible en vez
+ *  de indefinido. */
+const MAX_CONNECTION_RETRIES = 3;
 const MAX_FORMAT_RETRIES = 2;
+/** Doc 19 §2.5/§5 (E3a delegación): profundidad máxima 1 (un run hijo no puede delegar de nuevo) y
+ *  máximo 3 delegaciones por run — límites duros contra un modelo de 8B que delega de más, sin
+ *  depender de que el propio modelo se autolimite. */
+const MAX_DELEGATION_DEPTH = 1;
+const MAX_DELEGATIONS_PER_RUN = 3;
+/** Tarea "carga de modelo/oom_load": escalera de fracciones de `block_count` a offloadear a GPU en
+ *  cada reintento tras un `oom_load` (75% -> 50% -> 0 = CPU pura). Sin `block_count` real
+ *  (`modelLayerCountProbe` no inyectado o sin respuesta), la escalera colapsa a un único paso: `[0]`
+ *  — ver `handleOomLoad`. */
+const OOM_GPU_RATIOS = [0.75, 0.5, 0];
 /** Doc 09 §2.3: únicas tools con `mutating: true` sobre el filesystem en el MVP — las únicas cuyo
  *  `tool_calls.expected_pre_hash` importa (doc 10 §3, ítem 16 de doc 16 §4). */
 const MUTATING_FILE_TOOLS = new Set(['edit_file', 'write_file', 'delete_file']);
@@ -102,6 +118,15 @@ export interface RunControllerDeps {
    *  modelo (`/api/show`) al entrar en `preparing`, con `run_adjustments` + evento `run.adjustment`.
    *  Opcional: sin esto, `numCtx` se toma tal cual de `ContextPolicy` (comportamiento previo). */
   modelContextProbe?: ModelContextProbe;
+  /** Tarea "carga de modelo/oom_load": puerto opcional para conocer `block_count` real del modelo y
+   *  poder calcular ~75%/~50% de capas en GPU al reintentar tras un `oom_load` (ver `ports.ts` y
+   *  `handleOomLoad`). Opcional: sin esto, el reintento de `oom_load` salta directo a un único
+   *  intento con `numGpu: 0` (CPU pura) en vez de una escalera de tres pasos. */
+  modelLayerCountProbe?: ModelLayerCountProbe;
+  /** Doc 19 §2.5 (E3a delegación): permite crear un worker efímero (`owner_kind: 'worker'`) cuando
+   *  `delegate` no trae `targetAgentId` (ver `AgentProfilePort`, ports.ts). Opcional: sin esto,
+   *  delegar sin destino explícito falla con un `ToolResult` de error en vez de romper el run. */
+  agentProfiles?: AgentProfilePort;
   /** Cambio aditivo mínimo (encargo de apps/desktop, punto 5: "numCtx por defecto por modelo desde
    *  Ajustes debe llegar al runtime"; packages/runtime no es zona de ese encargo — documentado acá y
    *  en docs/architecture/16-estado-de-implementacion.md). Se consulta en `prepareAndQueue` ANTES del
@@ -138,6 +163,32 @@ interface LiveRun {
   /** Turnos transcurridos desde la última compactación (doc 07 §7.1 punto 2, doc 16 §4 ítem 5);
    *  se resetea a 0 cada vez que `ContextBuilder.build` compacta. */
   turnsSinceCompaction: number;
+  /** PRIORIDAD CERO (bloqueo real reportado por el usuario tras instalar v0.1, punto 2): cuenta
+   *  reintentos SEGUIDOS de `connection_refused` ("Ollama no responde"). Antes de este campo,
+   *  `retryOrFail` reintentaba ESTE código para siempre cada 2s sin límite — con Ollama apagado, el
+   *  run quedaba "Generando…" de forma indefinida, nunca llegaba a `fail()` (el veredicto de
+   *  `LoopDetector.recordError` solo controla el mensaje de "nudge", nunca la decisión de
+   *  reintentar/fallar). Se resetea a 0 apenas se recibe cualquier chunk real del provider (la
+   *  conexión funcionó), para no penalizar un corte transitorio aislado en medio de una sesión larga. */
+  connectionErrorStreak: number;
+  /** Tarea "carga de modelo/oom_load": último `numGpu` aplicado tras un reintento de `oom_load`
+   *  (`undefined` = automático de Ollama, comportamiento previo). Persiste para TODOS los turnos de
+   *  ESTE run (`buildChatRequest` lo repite en cada `ChatRequest.options.numGpu`) — una vez que el
+   *  modelo entró con menos capas, no tiene sentido volver a intentar el default en el turno
+   *  siguiente. "Reversible" (doc de la tarea): un run/chat nuevo (`continueRun`/`start`) arranca con
+   *  `numGpuOverride: undefined` de nuevo, sin que este ajuste quede pegado para siempre. */
+  numGpuOverride?: number;
+  /** Paso actual de la escalera de reintento de `oom_load` (0 = todavía no se intentó bajar
+   *  `numGpu`). Ver `handleOomLoad`. */
+  oomGpuRetryStep: number;
+  /** `block_count` del modelo, consultado una sola vez por run vía `modelLayerCountProbe` (si está
+   *  disponible) la primera vez que aparece un `oom_load`; `undefined` si el puerto no está
+   *  inyectado o no pudo resolverlo (la escalera cae entonces a un único paso con `numGpu: 0`). */
+  oomBlockCount?: number;
+  /** Doc 19 §2.1/§2.5 (E3a delegación): copia en memoria de `runs.delegation_depth` (0 = run normal;
+   *  1 = run hijo de una delegación). Se fija una sola vez al construir el `LiveRun` en `start()`/
+   *  `continueRun()`, a partir de si `chats.origin_run_id` está seteado para este chat. */
+  delegationDepth: number;
 }
 
 type TurnOutcome = 'continue' | 'completed' | 'failed' | 'cancelled';
@@ -166,9 +217,21 @@ export class RunController implements RunControllerContract {
     const agent = await this.withPersistedRules(withModel);
     const runId = this.deps.ids.next();
 
+    // Doc 19 §2.1/§2.5 (E3a delegación): un chat CREADO POR `delegate` trae `chats.origin_run_id`
+    // apuntando al run PADRE — la profundidad de ESTE run nuevo es la del padre + 1. Un chat normal
+    // (comportamiento previo, sin cambios) no tiene `originRunId` y queda en profundidad 0.
+    let parentRunId: string | undefined;
+    let delegationDepth = 0;
+    if (chat.originRunId) {
+      parentRunId = chat.originRunId;
+      const parentRun = await this.deps.runs.get(chat.originRunId);
+      delegationDepth = (parentRun?.delegationDepth ?? 0) + 1;
+    }
+
     await this.deps.runs.create({
       id: runId, chatId, agentId: agent.id, mode, state: 'created', iteration: 0,
       lastEventSeq: 0, createdAt: this.deps.clock.now(), ownerSessionId: 'local', heartbeatAt: this.deps.clock.now(),
+      parentRunId, delegationDepth,
     });
     // Hallazgo #5: sin esto el mensaje del usuario no aparece en el chat hasta el primer
     // message.delta del assistant (runStore.reduceRunEvent solo agrega a messagesByChat en
@@ -193,6 +256,7 @@ export class RunController implements RunControllerContract {
       iteration: 0, state: 'created', abort: new AbortController(),
       loopDetector: new LoopDetector(), history: await this.deps.messages.listByChat(chatId),
       cancelRequested: false, formatRetries: 0, touchedPaths: new Set(), turnsSinceCompaction: 0,
+      connectionErrorStreak: 0, oomGpuRetryStep: 0, delegationDepth,
     };
     this.live.set(runId, live);
     await this.prepareAndQueue(live);
@@ -243,6 +307,9 @@ export class RunController implements RunControllerContract {
       id: newRunId, chatId: prev.chatId, agentId: agent.id, mode: prev.mode, state: 'created',
       iteration: 0, lastEventSeq: 0, createdAt: this.deps.clock.now(),
       ownerSessionId: 'local', heartbeatAt: this.deps.clock.now(), parentRunId: prev.parentRunId,
+      // Doc 19 §2.1: run:continue crea un run nuevo del MISMO chat — hereda la profundidad del
+      // anterior (un chat hijo de delegación sigue siendo hijo tras un continue).
+      delegationDepth: prev.delegationDepth ?? 0,
     });
 
     const live: LiveRun = {
@@ -251,6 +318,7 @@ export class RunController implements RunControllerContract {
       abort: new AbortController(), loopDetector: new LoopDetector(),
       history: await this.deps.messages.listByChat(prev.chatId),
       cancelRequested: false, formatRetries: 0, touchedPaths: new Set(), turnsSinceCompaction: 0,
+      connectionErrorStreak: 0, oomGpuRetryStep: 0, delegationDepth: prev.delegationDepth ?? 0,
     };
     this.live.set(newRunId, live);
     await this.prepareAndQueue(live);
@@ -369,7 +437,8 @@ export class RunController implements RunControllerContract {
       // `tool_calls.expected_pre_hash`, persistido); se deja vacío como límite conocido documentado
       // — un `git reset`/`checkout` sobre un path tocado antes del reinicio no se reconoce como
       // "tocado por este run" tras rehidratar.
-      touchedPaths: new Set(), turnsSinceCompaction: 0,
+      touchedPaths: new Set(), turnsSinceCompaction: 0, connectionErrorStreak: 0, oomGpuRetryStep: 0,
+      delegationDepth: run.delegationDepth ?? 0,
     };
     this.live.set(runId, live);
 
@@ -647,9 +716,25 @@ export class RunController implements RunControllerContract {
     try {
       for await (const chunk of this.deps.gateway.chat(
         live.effectiveConfig.model, request,
-        { runId: live.runId, signal: live.abort.signal, authorizedLocality: [live.effectiveConfig.model.locality], priority: 'interactive' },
+        {
+          runId: live.runId, signal: live.abort.signal, authorizedLocality: [live.effectiveConfig.model.locality],
+          // Doc 19 §2.5 (E3a delegación): un run hijo de delegación pide prioridad 'subagent' —
+          // activa el orden de PRIORITY_ORDER que el Scheduler ya implementa (código muerto hasta
+          // esta tarea), sin tocar Scheduler.ts/ModelGateway.ts. Con 1 slot medido, padre e hijo ya
+          // están serializados por construcción; esto importa recién cuando haya más slots o varias
+          // delegaciones encoladas (doc 19 §2.5 nota final).
+          priority: live.delegationDepth > 0 ? 'subagent' : 'interactive',
+        },
       )) {
         if (live.cancelRequested) { deltaBatcher.flush(); return 'cancelled'; }
+
+        // PRIORIDAD CERO punto 2: llegó un chunk que NO es 'error' -> la conexión funciona de
+        // verdad (Ollama respondió contenido real); se resetea la racha de `connection_refused` para
+        // no arrastrar un conteo viejo de un corte aislado hacia una sesión larga y exitosa después.
+        // A propósito NO se resetea para `chunk.type === 'error'` (si no, un `connection_refused`
+        // repetido nunca acumularía racha: cada chunk de error la resetearía a 0 antes de que
+        // `retryOrFail` la incremente a 1, y el tope de `MAX_CONNECTION_RETRIES` nunca se alcanzaría).
+        if (chunk.type !== 'error') live.connectionErrorStreak = 0;
 
         if (chunk.type === 'content') {
           content += chunk.text;
@@ -667,7 +752,7 @@ export class RunController implements RunControllerContract {
         } else if (chunk.type === 'error') {
           deltaBatcher.flush();
           await this.persistTruncatedMessage(live, assistantMessageId, content, thinking);
-          return this.retryOrFail(live, chunk.code ?? 'unknown', chunk.message);
+          return this.retryOrFail(live, chunk.code ?? 'unknown', chunk.message, request);
         } else if (chunk.type === 'done') {
           // El contenido/thinking pendiente del batcher tiene que llegar a `run_events` ANTES que
           // `message.done` (mismo orden que antes de este cambio: todo el streaming, después el
@@ -692,12 +777,12 @@ export class RunController implements RunControllerContract {
       // el stream terminó sin un chunk 'done' -> Ollama cortó la conexión (doc 10 caso 3).
       deltaBatcher.flush();
       await this.persistTruncatedMessage(live, assistantMessageId, content, thinking);
-      return this.retryOrFail(live, 'stream_cut', 'El stream terminó sin un chunk done.');
+      return this.retryOrFail(live, 'stream_cut', 'El stream terminó sin un chunk done.', request);
     } catch (err) {
       deltaBatcher.flush();
       if (live.cancelRequested || live.abort.signal.aborted) return 'cancelled';
       await this.persistTruncatedMessage(live, assistantMessageId, content, thinking);
-      return this.retryOrFail(live, 'stream_cut', err instanceof Error ? err.message : String(err));
+      return this.retryOrFail(live, 'stream_cut', err instanceof Error ? err.message : String(err), request);
     }
   }
 
@@ -724,13 +809,81 @@ export class RunController implements RunControllerContract {
     }
   }
 
-  private async retryOrFail(live: LiveRun, code: string, message: string): Promise<'retry' | 'failed'> {
+  private async retryOrFail(live: LiveRun, code: string, message: string, request: ChatRequest): Promise<'retry' | 'failed'> {
     const verdict = live.loopDetector.recordError(code);
     if (verdict === 'nudge') this.pushNudge(live, `Reintento tras error ${code}: probá un enfoque distinto si vuelve a pasar.`);
+    // Tarea "carga de modelo/oom_load": antes de cualquier otra cosa, si el modelo no entró en la
+    // memoria del equipo se reintenta con menos capas en GPU (ver `handleOomLoad`) en vez de fallar
+    // directo — esto es justamente lo que distingue `oom_load` de un error "normal" sin reintento.
+    if (code === 'oom_load') return this.handleOomLoad(live, request, message);
+    // PRIORIDAD CERO punto 2: `connection_refused` ("Ollama no responde") tenía reintento sin límite
+    // acá abajo (`MUTATING_ERROR_RETRY_CODES.has(code)` es true para este código y nunca se volvía a
+    // evaluar nada más) — con el provider caído, el run quedaba "Generando…" para siempre. Ahora se
+    // cuentan los reintentos SEGUIDOS de este código puntual y, al llegar al máximo, se falla con
+    // `provider_down` en vez de seguir reintentando (fail-fast real, no solo declarado en el nombre
+    // de la constante). `stream_cut` (corte de stream ya en curso, típicamente transitorio) conserva
+    // el reintento sin este límite adicional — doc 10 caso 3 lo trata distinto de "provider caído".
+    if (code === 'connection_refused') {
+      live.connectionErrorStreak += 1;
+      if (live.connectionErrorStreak > MAX_CONNECTION_RETRIES) {
+        await this.fail(live, {
+          code: 'provider_down',
+          message: `${message} (Ollama no respondió tras ${MAX_CONNECTION_RETRIES} reintentos de ~2s cada uno)`,
+        });
+        return 'failed';
+      }
+      await this.delay(2000);
+      return 'retry';
+    }
     if (MUTATING_ERROR_RETRY_CODES.has(code)) { await this.delay(2000); return 'retry'; }
     if (code === BUSY_RETRY_CODE) { await this.delay(3000); return 'retry'; }
     await this.fail(live, { code: mapProviderErrorCode(code), message });
     return 'failed';
+  }
+
+  /** Tarea "carga de modelo/oom_load": el modelo no entró en la memoria del equipo. En vez de fallar
+   *  directo, se reintenta con menos capas offloadeadas a GPU (`ChatRequest.options.numGpu`) — la
+   *  primera vez se consulta `block_count` real (`modelLayerCountProbe`, opcional) para poder hablar
+   *  en términos de "~75%/~50% de las capas"; sin esa información, un único intento con `numGpu: 0`
+   *  (CPU pura, más lento pero siempre válido) es la única opción honesta. Cada paso se registra como
+   *  `Adjustment`/`run.adjustment` (visible en la UI, doc de la tarea: "run_adjustment visible y
+   *  reversible") y queda pegado a ESTE run (`live.numGpuOverride`, ver `buildChatRequest`) — un
+   *  run/chat nuevo vuelve a `numGpu` automático, así que el ajuste nunca queda "para siempre". */
+  private async handleOomLoad(live: LiveRun, request: ChatRequest, message: string): Promise<'retry' | 'failed'> {
+    if (live.oomBlockCount === undefined && live.oomGpuRetryStep === 0 && this.deps.modelLayerCountProbe) {
+      try {
+        live.oomBlockCount = await this.deps.modelLayerCountProbe.getBlockCount(live.effectiveConfig.model);
+      } catch (err) {
+        console.warn('[RunController] no se pudo consultar block_count del modelo; el reintento de oom_load va directo a CPU', err);
+      }
+    }
+    const ratios = live.oomBlockCount !== undefined ? OOM_GPU_RATIOS : [0];
+    if (live.oomGpuRetryStep >= ratios.length) {
+      await this.fail(live, {
+        code: 'oom_load',
+        message: `${message} (se reintentó bajando las capas en GPU hasta usar solo CPU y el modelo tampoco entró — probá con un modelo más chico)`,
+      });
+      return 'failed';
+    }
+    const ratio = ratios[live.oomGpuRetryStep]!;
+    const newNumGpu = live.oomBlockCount !== undefined ? Math.max(0, Math.round(live.oomBlockCount * ratio)) : 0;
+    const requested = live.numGpuOverride ?? 'auto';
+    live.numGpuOverride = newNumGpu;
+    request.options.numGpu = newNumGpu;
+    live.oomGpuRetryStep += 1;
+    const adjustment: Adjustment = {
+      param: 'numGpu',
+      requested,
+      applied: newNumGpu,
+      reason: newNumGpu === 0
+        ? 'El modelo no entró en la memoria de la GPU (oom_load); se reintenta solo con CPU — va a ser mucho más lento. Ajuste vale solo para este run.'
+        : `El modelo no entró en la memoria de la GPU (oom_load); se reintenta con ~${Math.round(ratio * 100)}% de las capas en GPU (${newNumGpu}/${live.oomBlockCount}). Ajuste vale solo para este run.`,
+      source: 'auto',
+    };
+    live.effectiveConfig.adjustments.push(adjustment);
+    this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'run.adjustment', adjustment });
+    await this.delay(500);
+    return 'retry';
   }
 
   private delay(ms: number): Promise<void> {
@@ -944,6 +1097,17 @@ export class RunController implements RunControllerContract {
       return 'ok';
     }
 
+    // Doc 19 §2.5: `delegate` se intercepta ANTES del despacho genérico (mismo patrón que `finish`,
+    // `runFinish` más arriba) — su orquestación real necesita crear un run/chat hijo y llamar
+    // `this.start()` recursivamente, algo que el `handler` genérico de la tool (tools/builtin/
+    // delegate.ts) no puede hacer con el `ToolContext` estándar.
+    if (call.name === 'delegate') {
+      const runningRecord: ToolCallRecord = { ...record, status: 'running', startedAt: this.deps.clock.now() };
+      await this.deps.toolCalls.upsert(runningRecord);
+      this.emitToolStatus(live, call.id, 'running');
+      return this.runDelegateTool(live, call, runningRecord, classification);
+    }
+
     let checkpointHandle: CheckpointHandle | undefined;
     if (def.mutating) {
       // Hallazgo E2E (2026-09-18): `checkpoints.begin()` solo reserva el id en memoria — la fila de
@@ -1029,6 +1193,158 @@ export class RunController implements RunControllerContract {
     }
 
     return 'ok';
+  }
+
+  // ── delegate (doc 19 §2.5, E3a) ─────────────────────────────────────────
+
+  /** Orquesta una delegación completa: valida el pedido, aplica los límites de profundidad/cantidad,
+   *  resuelve el destino (agente existente o worker efímero), crea el chat/run hijo, espera a que
+   *  termine y traduce su resultado a `DelegationResultSchema`. Nunca lanza: cualquier problema se
+   *  devuelve como un `ToolResult` (con `isError` cuando corresponde) para que el modelo padre pueda
+   *  reaccionar, igual que cualquier otra tool. */
+  private async runDelegateTool(
+    live: LiveRun, call: ToolCall, record: ToolCallRecord, _classification: ToolClassification,
+  ): Promise<'ok' | 'cancelled'> {
+    const protocol = this.protocolFor(live);
+    const finish = async (result: ToolResult, structured?: DelegationResult): Promise<'ok'> => {
+      const finalStatus: ToolCallRecord['status'] = result.isError ? 'failed' : 'done';
+      const finalRecord: ToolCallRecord = {
+        ...record, status: finalStatus, finishedAt: this.deps.clock.now(),
+        resultPreview: previewOf(result), resultIsError: result.isError,
+      };
+      await this.deps.toolCalls.upsert(finalRecord);
+      this.emitToolStatus(live, call.id, finalStatus, previewOf(result));
+      live.history.push(protocol.renderResult(call, { ...result, structured }));
+      return 'ok';
+    };
+    const failWith = (text: string): Promise<'ok'> => finish({ content: [{ type: 'text', text }], isError: true });
+
+    const parsedArgs = DelegationRequestSchema.safeParse(call.args);
+    if (!parsedArgs.success) {
+      return failWith(`delegate: argumentos inválidos (${parsedArgs.error.issues.map((i) => i.message).join('; ')}).`);
+    }
+    const args: DelegationRequest = parsedArgs.data;
+
+    // Paso 1 (doc 19 §2.5): profundidad máxima — un run que ya es hijo de otra delegación no delega
+    // de nuevo. Error de `ToolResult`, no excepción: el run padre sigue vivo y puede reaccionar.
+    if (live.delegationDepth >= MAX_DELEGATION_DEPTH) {
+      return failWith('delegate: profundidad máxima de delegación alcanzada (este run ya es hijo de otra delegación).');
+    }
+    // Paso 2: máximo N delegaciones por run — cuenta las tool calls `delegate` YA registradas para
+    // este run (sin contar la actual, todavía no cerrada).
+    const priorDelegations = (await this.deps.toolCalls.listByRun(live.runId))
+      .filter((c) => c.toolName === 'delegate' && c.id !== call.id);
+    if (priorDelegations.length >= MAX_DELEGATIONS_PER_RUN) {
+      return failWith(`delegate: límite de delegaciones por run alcanzado (máximo ${MAX_DELEGATIONS_PER_RUN}).`);
+    }
+
+    // Paso 3: resuelve destino — agente personal existente por targetAgentId, o un worker efímero
+    // (owner_kind: 'worker', doc 19 §0) si no se indica ninguno. El modelo NUNCA debe poder inventar
+    // un targetAgentId que no exista: se verifica contra el resolver real antes de seguir.
+    let targetAgentId = args.targetAgentId;
+    if (targetAgentId) {
+      const exists = await this.deps.agents.resolve(targetAgentId).catch(() => undefined);
+      if (!exists) return failWith(`delegate: no existe el agente "${targetAgentId}".`);
+    } else {
+      if (!this.deps.agentProfiles) {
+        return failWith('delegate: no se indicó targetAgentId y este runtime no puede crear un worker temporal (agentProfiles no está inyectado).');
+      }
+      const worker = await this.deps.agentProfiles.createProfile({
+        name: `Worker temporal (${args.role ?? 'custom'})`,
+        role: args.role ?? 'custom',
+        modelMode: 'fixed',
+        model: live.effectiveConfig.model,
+        permissionPreset: live.agent.permissions.preset,
+        memoryScope: 'global',
+      }, 'worker');
+      targetAgentId = worker.id;
+    }
+
+    // Paso 4: chat hijo en el mismo proyecto del padre, con origin_run_id -> este run.
+    const parentChat = await this.deps.chats.get(live.chatId);
+    const now = this.deps.clock.now();
+    const childChatId = this.deps.ids.next();
+    await this.deps.chats.create({
+      id: childChatId, projectId: parentChat?.projectId ?? '', agentId: targetAgentId,
+      mode: 'agent', createdAt: now, updatedAt: now, archived: false, originRunId: live.runId,
+    });
+
+    // Paso 5: arranca el run hijo. `this.start()` deriva `delegationDepth = padre+1` por sí solo a
+    // partir de `chats.origin_run_id` (ver `start()` más arriba) — no hace falta pasarlo acá.
+    const { runId: childRunId } = await this.start(childChatId, buildDelegationPrompt(args), 'agent');
+
+    this.deps.events.append({
+      runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'run.delegated',
+      parentRunId: live.runId, childRunId, childChatId, targetAgentId, task: args.task,
+    });
+
+    // Paso 6: espera a que el hijo termine (doc 19 §2.5: "el loop de tools ya es síncrono dentro de
+    // una iteración; no se introduce concurrencia nueva" — con 1 slot medido, padre e hijo ya están
+    // serializados por el Scheduler; este polling solo detecta CUÁNDO terminó, no agrega una segunda
+    // inferencia en paralelo). Presupuesto de tiempo opcional (`budget.timeoutMs`); si se agota, se
+    // cancela el hijo en vez de dejarlo corriendo indefinidamente.
+    const timeoutMs = args.budget?.timeoutMs ?? this.deps.defaultToolTimeoutMs ?? 120_000;
+    const finalRun = await this.waitForRunTerminal(childRunId, timeoutMs);
+    if (live.cancelRequested) return 'cancelled';
+
+    const delegationResult = await this.buildDelegationResult(childChatId, finalRun);
+    return finish(
+      { content: [{ type: 'text', text: JSON.stringify(delegationResult) }], isError: delegationResult.status === 'failed' },
+      delegationResult,
+    );
+  }
+
+  /** Sondea `this.live` hasta que el run hijo salga de memoria (terminó, en este proceso) o se agote
+   *  `timeoutMs`, en cuyo caso lo cancela. Usa `this.delay()` (inyectable) para no depender de
+   *  temporizadores reales en los tests. */
+  private async waitForRunTerminal(runId: string, timeoutMs: number): Promise<RunRecord | undefined> {
+    const deadline = this.deps.clock.now() + Math.max(0, timeoutMs);
+    while (this.live.has(runId)) {
+      if (this.deps.clock.now() >= deadline) {
+        await this.cancel(runId);
+        // Margen corto para que cancel() termine de resolver el hijo antes de leer su estado final
+        // (cancel() solo pide la cancelación; el propio loop del hijo es quien la resuelve).
+        for (let i = 0; i < 20 && this.live.has(runId); i += 1) await this.delay(50);
+        break;
+      }
+      await this.delay(50);
+    }
+    return this.deps.runs.get(runId);
+  }
+
+  /** Doc 19 §2.5 paso 6: intenta parsear el `finish(summary)` del hijo como `DelegationResultSchema`
+   *  (reusa el mismo criterio que el protocolo de tool-calling en texto: el JSON puede venir dentro
+   *  del `summary` de la tool call `finish`, no en el `content` plano del mensaje). Si el run hijo no
+   *  terminó en `completed`, o no hay ningún `finish` registrado, o el JSON no valida, degrada a un
+   *  resultado envuelto en vez de fallar la delegación completa (nunca revienta el run padre por un
+   *  formato imperfecto de un modelo de 8B). */
+  private async buildDelegationResult(childChatId: string, finalRun: RunRecord | undefined): Promise<DelegationResult> {
+    if (finalRun && finalRun.state !== 'completed') {
+      return {
+        status: 'failed',
+        summary: finalRun.error?.message ?? `el run del worker terminó en estado "${finalRun.state}" sin completar la tarea.`,
+        uncertainties: ['el run hijo no llegó a completed'],
+      };
+    }
+    const messages = await this.deps.messages.listByChat(childChatId);
+    const assistantMessages = messages.filter((m) => m.role === 'assistant');
+    const finishMsg = [...assistantMessages].reverse().find((m) => m.toolCalls?.some((tc) => tc.name === 'finish'));
+    const finishCall = finishMsg?.toolCalls?.find((tc) => tc.name === 'finish');
+    const finishArgs = finishCall?.args as Record<string, unknown> | undefined;
+    const rawText = typeof finishArgs?.['summary'] === 'string'
+      ? finishArgs['summary'] as string
+      : assistantMessages[assistantMessages.length - 1]?.content;
+
+    if (!rawText || rawText.trim().length === 0) {
+      return { status: 'needs_input', summary: 'el worker no dejó ninguna respuesta final.', uncertainties: ['sin mensaje de finish'] };
+    }
+    try {
+      const parsed = DelegationResultSchema.safeParse(JSON.parse(rawText));
+      if (parsed.success) return parsed.data;
+    } catch {
+      // no era JSON — cae a la degradación de texto crudo de abajo.
+    }
+    return { status: 'completed', summary: rawText, uncertainties: ['formato no estructurado'] };
   }
 
   /** Hallazgo #3 (parcial, dentro del alcance de agent/): sin esto, un handler colgado (p. ej.
@@ -1219,6 +1535,10 @@ export class RunController implements RunControllerContract {
         temperature: live.agent.temperature,
         numPredict: live.agent.contextPolicy.reserveForResponse,
         stop: rendered.stop,
+        // Tarea "carga de modelo/oom_load": si un turno anterior de ESTE run ya tuvo que bajar
+        // `numGpu` tras un oom_load, se repite en todos los turnos siguientes (el modelo no entra
+        // más en la próxima llamada si no entró en esta) — ver LiveRun.numGpuOverride.
+        numGpu: live.numGpuOverride,
       },
       think: live.effectiveConfig.think,
       keepAlive: '5m',
@@ -1231,6 +1551,21 @@ function buildPlaceholderConfig(agent: AgentConfig): EffectiveConfig {
     model: agent.model, numCtx: agent.contextPolicy.numCtx, think: false, tools: [],
     transport: 'native', promptHash: agent.systemPromptHash, adjustments: [],
   };
+}
+
+/** Doc 19 §2.5: el primer mensaje del chat hijo — le pide al worker que cierre con `finish` cuyo
+ *  `summary` sea el JSON de `DelegationResultSchema` (así `buildDelegationResult` puede parsearlo
+ *  directo, sin depender de que el modelo hable en el `content` plano del mensaje). */
+function buildDelegationPrompt(args: DelegationRequest): string {
+  return [
+    `Tarea delegada: ${args.task}`,
+    `Entregable esperado: ${args.expectedDeliverable}`,
+    'Cuando termines (o si no podés completarla), llamá a la tool `finish` pasando como `summary` ' +
+      'EXACTAMENTE un JSON (sin texto adicional antes o después) con esta forma: ' +
+      '{"status":"completed"|"failed"|"needs_input","summary":"texto breve del resultado",' +
+      '"artifacts":[{"path":"...","description":"..."}],"uncertainties":["..."],"nextAction":"..."} ' +
+      '(los campos "artifacts"/"uncertainties"/"nextAction" son opcionales).',
+  ].join('\n\n');
 }
 
 function mapProviderErrorCode(code: string): RunErrorShared['code'] {

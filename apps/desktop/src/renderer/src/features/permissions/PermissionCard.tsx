@@ -8,6 +8,8 @@ import './permissions.css';
 const CATEGORY_LABEL: Record<PermissionRequest['category'], string> = {
   read: 'Lectura', write: 'Escritura', delete: 'Borrado', terminal: 'Terminal',
   git_commit: 'Git commit', git_push: 'Git push', network: 'Red', mcp: 'MCP',
+  // Doc 19 §2.5 (E3a): pedido de permiso para la tool `delegate`.
+  delegate: 'Delegación',
 };
 
 const RISK_LABEL: Record<PermissionRequest['risk'], string> = { low: 'Bajo', medium: 'Medio', high: 'Alto' };

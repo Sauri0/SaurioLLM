@@ -18,6 +18,21 @@ const BYTES_PER_ELEM: Record<KvCacheType, number> = { f16: 2, q8_0: 1.0625, q4_0
 const DEFAULT_OVERHEAD_BYTES = 1 * GIB;
 const SAFETY_MARGIN_BYTES = 512 * MIB;
 
+/** Hallazgo real (equipo #2, Intel Core Ultra 9 288V + Arc 140V iGPU, sesión 2026-09-18): gemma4:26b
+ *  (Q4, pesos 15.77 GiB + proyector de visión ~1.1 GiB, ambos YA sumados en `description.sizeBytes`
+ *  porque es el tamaño total instalado) NO entró en ~17.2 GiB de VRAM disponible según Ollama, pese a
+ *  que la suma de bytes por sí sola sugería que sí — el propio scheduler de Ollama no reserva memoria
+ *  de trabajo extra para el encoder de visión al decidir cuántas capas offloadear, así que el margen
+ *  real necesario es mayor que "pesos + KV + overhead genérico". `[HIPÓTESIS A PROBAR]`: 1.25 GiB es
+ *  un punto de partida (apenas por encima del proyector mismo) hasta que el Banco de pruebas mida el
+ *  margen real en más de un modelo de visión. */
+const VISION_OVERHEAD_BYTES = 1.25 * GIB;
+/** iGPU/memoria unificada (doc 13 §7): la memoria se comparte con el resto del sistema (compositor,
+ *  navegador, el propio Ollama fuera de la GPU), así que hace falta más margen que en una GPU
+ *  dedicada donde el sistema operativo no le disputa VRAM a nadie más. `[HIPÓTESIS A PROBAR]`: 10%
+ *  del total, con el margen fijo de `SAFETY_MARGIN_BYTES` como piso. */
+const INTEGRATED_GPU_SAFETY_MARGIN_RATIO = 0.10;
+
 /** El ModelManager es quien conoce cómo pedir ModelDescription (vía Provider) y cómo calibrar el
  *  overhead con model_load_samples (EMA); MemoryEstimator no depende de Provider ni de un
  *  repositorio SQLite directamente para mantenerse una unidad pura y testeable con fixtures.
@@ -110,12 +125,19 @@ export class MemoryEstimator implements MemoryEstimatorContract {
     const arch = parseArchInfo(description.modelInfo);
     const kvBytes = arch ? computeKvBytes(arch, numCtx, this.kvCacheType) : 0;
     const overhead = (await this.calibrator?.getCalibratedOverheadBytes(ref)) ?? DEFAULT_OVERHEAD_BYTES;
+    // Doc 13 §7 / hallazgo real equipo #2: modelos con visión necesitan más margen del que sugiere la
+    // simple suma de bytes (ver comentario de `VISION_OVERHEAD_BYTES`).
+    const visionOverhead = description.capabilities.vision ? VISION_OVERHEAD_BYTES : 0;
 
-    const vramNeededBytes = Math.round(weights + kvBytes + overhead);
+    const vramNeededBytes = Math.round(weights + kvBytes + overhead + visionOverhead);
     const vramTotal = hardware.gpu?.vramTotalBytes.value ?? 0;
     const vramUsed = hardware.gpu?.vramUsedBytes?.value ?? 0;
     const vramFree = Math.max(vramTotal - vramUsed, 0);
-    const vramAvailableBytes = Math.max(vramFree - SAFETY_MARGIN_BYTES, 0);
+    // iGPU/memoria unificada: más margen que en una GPU dedicada (ver comentario de la constante).
+    const safetyMarginBytes = hardware.gpu?.integrated
+      ? Math.max(SAFETY_MARGIN_BYTES, Math.round(vramTotal * INTEGRATED_GPU_SAFETY_MARGIN_RATIO))
+      : SAFETY_MARGIN_BYTES;
+    const vramAvailableBytes = Math.max(vramFree - safetyMarginBytes, 0);
 
     const fitClass: MemoryEstimate['fitClass'] =
       vramNeededBytes <= vramAvailableBytes

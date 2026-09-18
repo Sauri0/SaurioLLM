@@ -67,3 +67,117 @@
 .saurio-inline-action { margin-left: var(--space-2); }
 .saurio-models-title-icon { margin-right: 6px; }
 .saurio-models-folder-row { margin-bottom: var(--space-2); }
+
+/* Escala de seis niveles (TierClassifier, punto 3 del encargo "cobertura máxima del catálogo"):
+   tokens propios porque el set de `--success/--warning/--danger` de layout/theme.css solo cubre tres
+   colores y acá hacen falta seis, uno por nivel. `teal`/`orange`/`gray` son nuevos; `green`/`yellow`/
+   `red` reusan el valor de los tokens existentes para no duplicar la paleta. */
+:root {
+  --saurio-tier-green: var(--success);
+  --saurio-tier-green-subtle: var(--success-subtle);
+  --saurio-tier-teal: #2f9e8f;
+  --saurio-tier-teal-subtle: rgba(47, 158, 143, 0.14);
+  --saurio-tier-yellow: var(--warning);
+  --saurio-tier-yellow-subtle: var(--warning-subtle);
+  --saurio-tier-orange: #d97a3d;
+  --saurio-tier-orange-subtle: rgba(217, 122, 61, 0.16);
+  --saurio-tier-red: var(--danger);
+  --saurio-tier-red-subtle: var(--danger-subtle);
+  --saurio-tier-gray: var(--text-muted);
+  --saurio-tier-gray-subtle: rgba(148, 148, 148, 0.16);
+}
+
+.saurio-tier-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  border: 1px solid currentColor;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.saurio-tier-badge.green   { color: var(--saurio-tier-green);  border-color: var(--saurio-tier-green);  background: var(--saurio-tier-green-subtle); }
+.saurio-tier-badge.teal    { color: var(--saurio-tier-teal);   border-color: var(--saurio-tier-teal);   background: var(--saurio-tier-teal-subtle); }
+.saurio-tier-badge.yellow  { color: var(--saurio-tier-yellow); border-color: var(--saurio-tier-yellow); background: var(--saurio-tier-yellow-subtle); }
+.saurio-tier-badge.orange  { color: var(--saurio-tier-orange); border-color: var(--saurio-tier-orange); background: var(--saurio-tier-orange-subtle); }
+.saurio-tier-badge.red     { color: var(--saurio-tier-red);    border-color: var(--saurio-tier-red);    background: var(--saurio-tier-red-subtle); }
+.saurio-tier-badge.gray    { color: var(--saurio-tier-gray);   border-color: var(--saurio-tier-gray);   background: var(--saurio-tier-gray-subtle); }
+
+.saurio-tier-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: var(--space-3);
+  padding: var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.saurio-tier-legend__row { display: flex; align-items: baseline; gap: 8px; }
+.saurio-tier-legend__row .saurio-tier-badge { flex: 0 0 auto; min-width: 92px; justify-content: center; }
+
+/* Explorar v2 (doc 16 §12.6, punto 5 del encargo): búsqueda/filtros/orden/paginado, "descargar por
+   nombre", pestaña de Hugging Face y la ficha lateral con variantes. Todo con clases nuevas, sin
+   estilos inline (punto 6 del encargo: "sin estilos inline"). */
+.saurio-explore { position: relative; }
+.saurio-explore__source-tabs { margin-top: var(--space-2); }
+.saurio-explore__search {
+  flex: 1 1 220px;
+  min-width: 160px;
+  padding: 4px 8px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text-primary);
+}
+.saurio-explore__source-note { margin-bottom: var(--space-2); }
+.saurio-explore__pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+.saurio-row__title-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+.saurio-row__title-btn:hover .saurio-row__title { text-decoration: underline; }
+.saurio-row__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  flex-wrap: wrap;
+}
+.saurio-row--selected { border-color: var(--accent); }
+
+.saurio-explore__by-name { margin-bottom: var(--space-3); }
+.saurio-explore__by-name-row { display: flex; gap: var(--space-2); margin: var(--space-1) 0; }
+.saurio-explore__by-name-input { flex: 1; padding: 4px 8px; border-radius: var(--radius-md); border: 1px solid var(--border); background: var(--bg-1); color: var(--text-primary); }
+
+.saurio-explore__hf-files { margin-top: var(--space-2); padding-top: var(--space-2); border-top: 1px dashed var(--border-subtle); }
+
+/* Ficha lateral de variantes (punto 5 del encargo: "ficha lateral con variantes, selector de
+   contexto"). Panel fijo a la derecha en pantallas anchas; se apila abajo en angostas. */
+.saurio-side-panel {
+  position: sticky;
+  top: var(--space-2);
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-1);
+  max-width: 420px;
+}
+.saurio-side-panel__header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-2); }
+.saurio-side-panel__variants { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: var(--space-2); }
+.saurio-side-panel__ctx { display: flex; align-items: center; gap: 4px; margin: var(--space-2) 0; }

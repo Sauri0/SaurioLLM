@@ -1,0 +1,78 @@
+/* Pestaña "Agentes" (doc 19 §1.6) — apps/desktop/src/renderer/src/features/agents/.
+   Mismos tokens de layout/theme.css que el resto de las pestañas del panel derecho (punto 7 del
+   encargo: sin estilos inline). */
+
+.agents-panel { display: flex; flex-direction: column; gap: var(--space-3); height: 100%; overflow: auto; }
+.agents-panel__header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.agents-panel__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+
+.agents-panel__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  border: 1px solid var(--saurio-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+}
+
+.agents-panel__identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+  flex: 1;
+}
+
+.agents-panel__avatar {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--saurio-accent, #3a7bd5);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--text-sm);
+}
+
+.agents-panel__name-block { display: flex; flex-direction: column; min-width: 0; }
+.agents-panel__name { font-weight: 600; }
+.agents-panel__actions { display: flex; gap: var(--space-1); flex-shrink: 0; }
+
+/* AgentEditorModal.tsx */
+.agent-editor__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+}
+.agent-editor__card {
+  background: var(--saurio-bg-raised);
+  border: 1px solid var(--saurio-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  width: 520px;
+  max-height: 85vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.agent-editor__field { display: flex; flex-direction: column; gap: var(--space-1); }
+.agent-editor__field--small { flex: 1; }
+.agent-editor__row { display: flex; gap: var(--space-2); align-items: center; }
+.agent-editor__hint { margin: 0; }
+.agent-editor__tools { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-1); }
+.agent-editor__tool { display: flex; align-items: center; gap: var(--space-1); font-size: var(--text-sm); }
+.agent-editor__tool--delegate { margin-top: var(--space-1); }
+.agent-editor__actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-2); }

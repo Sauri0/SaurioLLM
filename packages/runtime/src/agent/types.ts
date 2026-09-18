@@ -4,7 +4,7 @@
 // Adjustment/RunError/ToolCallRecord tienen su schema zod en @saurio/shared (domain.ts) porque
 // cruzan IPC/RunEvent — doc 02 §3.
 import type {
-  RunState, ModelRef, AgentRole, Mode, ToolTransport, Adjustment, RunError, ToolCallRecord,
+  RunState, ModelRef, AgentRole, Mode, ToolTransport, Adjustment, RunError, ToolCallRecord, ModelMode,
 } from '@saurio/shared';
 import type { ChatRequest } from '../gateway/types.js';
 import type { PermissionPolicy } from '../permissions/types.js';
@@ -28,6 +28,10 @@ export interface AgentConfig {
   toolTransport: 'auto' | 'native' | 'text'; defaultMode: Mode;
   profileId?: string;
   fileScope?: string;          // v0.4: restringe el agente a un subárbol del proyecto
+  /** Doc 19 §1.5 (E2a "Mis agentes"): `undefined`/`'fixed'` = comportamiento previo a esta tarea
+   *  (el `model` de arriba es el que se usa siempre). `'auto'`: `RunController` puede resolverlo en
+   *  cada run vía `RunControllerDeps.resolveModelRef` (opcional) en vez de usar `model` tal cual. */
+  modelMode?: ModelMode;
 }
 
 /** Congelada al iniciar el run (regla 4: prefijo estable); nunca cambia dentro del mismo run. */

@@ -11,22 +11,25 @@
 import { useEffect, useState } from 'react';
 import type { Chat, Mode, ModelRef, Project } from '@saurio/shared';
 import { invoke } from '../ipc/client.js';
-import { ChatIcon, FolderIcon } from '../ui/icons.js';
+import { ChatIcon, FolderIcon, CpuIcon, SettingsIcon } from '../ui/icons.js';
 import { isDemoMode } from '../demo/demoState.js';
 import { useChatStore } from '../stores/chatStore.js';
 import { useModelsStore } from '../stores/modelsStore.js';
 import { useProvidersStore } from '../stores/providersStore.js';
+import { useOllamaHealthStore } from '../stores/ollamaHealthStore.js';
+import { useUiNavStore } from '../stores/uiNavStore.js';
 import { ModeSelector } from '../features/chat/ModeSelector.js';
 import { ModelSelect } from '../features/models/ModelSelect.js';
+import { pickDefaultModelRef } from './defaultModel.js';
+import type { CatalogItem } from '@saurio/shared';
 
 const EMPTY_CHATS: Chat[] = [];
 const DEFAULT_MODE: Mode = 'agent';
 
-/** Mismos valores que `layout/ChatCenter.tsx` usaba como fallback antes de que `models:list`
- *  responda (agente builtin sembrado por el runtime + modelo medido en este equipo). Vive acá
- *  ahora porque este bloque es el que crea el chat. */
+/** Agente builtin sembrado por el runtime al arrancar (packages/runtime/src/agent/defaults.ts) —
+ *  esto SÍ es estable (siempre existe, no depende de qué haya instalado el usuario). El modelo, en
+ *  cambio, ya no se asume: sale de `models:list` vía `pickDefaultModelRef` (PRIORIDAD CERO punto 6). */
 const DEFAULT_AGENT_ID = 'agent_builtin_lead';
-const DEFAULT_MODEL_REF = { providerId: 'ollama', name: 'qwen3:8b', locality: 'local' } as const;
 
 export interface SidebarProps {
   project: Project | null;
@@ -43,16 +46,31 @@ export function Sidebar({ project, onProjectChange, activeChatId, onSelectChat }
   const chats = useChatStore((s) => (project ? (s.chatsByProject[project.id] ?? EMPTY_CHATS) : EMPTY_CHATS));
   const loadChats = useChatStore((s) => s.loadChats);
   const createChat = useChatStore((s) => s.createChat);
-  const draftModelRef = useChatStore((s) => (project ? s.draftModelRefByProject[project.id] : undefined) ?? DEFAULT_MODEL_REF);
   const setDraftModelRef = useChatStore((s) => s.setDraftModelRef);
   const draftMode = useChatStore((s) => (project ? s.draftModeByProject[project.id] : undefined) ?? DEFAULT_MODE);
   const setDraftMode = useChatStore((s) => s.setDraftMode);
 
   const installedModels = useModelsStore((s) => s.installed);
+  // Tarea "ModelSelect: estados explícitos" (punto 2): `models:catalog` es la API PÚBLICA que ya
+  // expone el Centro de modelos por IPC (no se importa nada de packages/runtime/src/models/** ni de
+  // features/models/** fuera de este contrato) — cruzarla contra `installedModels` alcanza para
+  // "el mejor clasificado por la escala para este hardware" sin duplicar el cálculo del tier acá.
+  const [catalog, setCatalog] = useState<CatalogItem[] | undefined>(undefined);
+  // PRIORIDAD CERO punto 6 + tarea "ModelSelect: estados explícitos" — orden real: si el usuario ya
+  // eligió uno para el próximo chat, se respeta; si no, `pickDefaultModelRef` (último usado en este
+  // proyecto -> mejor clasificado para este hardware -> primer instalado); si no hay ningún modelo
+  // instalado, `draftModelRef` queda `undefined` y la UI lo dice explícito en vez de fingir un valor.
+  const draftModelRefStored = useChatStore((s) => (project ? s.draftModelRefByProject[project.id] : undefined));
+  const draftModelRef = draftModelRefStored ?? pickDefaultModelRef(installedModels, chats, catalog);
   const providers = useProvidersStore((s) => s.providers);
   const loadProviders = useProvidersStore((s) => s.load);
   const modelsRefresh = useModelsStore((s) => s.refresh);
   const modelsSubscribe = useModelsStore((s) => s.subscribe);
+  const ollamaOk = useOllamaHealthStore((s) => s.ok);
+  const ollamaStarting = useOllamaHealthStore((s) => s.starting);
+  const ollamaStartError = useOllamaHealthStore((s) => s.startError);
+  const startOllama = useOllamaHealthStore((s) => s.start);
+  const subscribeOllamaHealth = useOllamaHealthStore((s) => s.subscribe);
 
   useEffect(() => {
     // Modo demo (herramienta de verificación visual): el chat de ejemplo ya está sembrado en
@@ -70,6 +88,15 @@ export function Sidebar({ project, onProjectChange, activeChatId, onSelectChat }
     if (isDemoMode()) return;
     void loadProviders();
   }, [loadProviders]);
+
+  useEffect(() => subscribeOllamaHealth(), [subscribeOllamaHealth]);
+
+  useEffect(() => {
+    if (isDemoMode()) return;
+    invoke('models:catalog', undefined).then(setCatalog).catch(() => setCatalog(undefined));
+    // Se re-pide cuando Ollama vuelve a responder (auto-refresco del punto 2: el catálogo depende de
+    // muestrear el hardware real vía el provider, que recién puede hacerlo con Ollama arriba).
+  }, [ollamaOk]);
 
   async function handleOpenProject(): Promise<void> {
     setOpening(true);
@@ -90,7 +117,7 @@ export function Sidebar({ project, onProjectChange, activeChatId, onSelectChat }
   }
 
   async function handleCreateChat(): Promise<void> {
-    if (!project) return;
+    if (!project || !draftModelRef) return; // el botón ya queda deshabilitado sin modelo (ver JSX)
     setCreating(true);
     setError(null);
     try {
@@ -131,9 +158,23 @@ export function Sidebar({ project, onProjectChange, activeChatId, onSelectChat }
       {project ? (
         <>
           <div className="saurio-sidebar-section">
-            <button type="button" className="saurio-btn-primary saurio-sidebar-new-chat" onClick={() => void handleCreateChat()} disabled={creating}>
+            <button
+              type="button"
+              className="saurio-btn-primary saurio-sidebar-new-chat"
+              onClick={() => void handleCreateChat()}
+              disabled={creating || !draftModelRef}
+              title={draftModelRef ? undefined : 'Instalá o elegí un modelo en la pestaña "Modelos" antes de crear un chat'}
+            >
               {creating ? 'Creando…' : '+ Nuevo chat'}
             </button>
+            {/* PRIORIDAD CERO punto 6 (bloqueo real: la app proponía qwen3:8b sin importar si estaba
+                instalado): sin ningún modelo instalado, se lo dice explícito en vez de dejar el
+                selector con un valor que en realidad no existe en este equipo. */}
+            {!draftModelRef && (
+              <div className="saurio-banner saurio-sidebar-no-models">
+                No hay modelos instalados. Abrí la pestaña &quot;Modelos&quot; para instalar uno.
+              </div>
+            )}
           </div>
           <div className="saurio-sidebar-section saurio-sidebar-chats">
             {chats.length > 0 ? (
@@ -146,7 +187,11 @@ export function Sidebar({ project, onProjectChange, activeChatId, onSelectChat }
                   onClick={() => onSelectChat(chat.id)}
                   onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSelectChat(chat.id); }}
                 >
-                  <span className="saurio-sidebar-item__title">{chat.title ?? `(${chat.mode}) ${chat.id.slice(0, 8)}`}</span>
+                  {/* PRIORIDAD CERO punto 5 (bloqueo real: "(agent) chat_mu7" no dice nada del
+                      chat) — "Chat nuevo" mientras no tenga título propio; el título autogenerado
+                      desde el primer mensaje se muestra en la cabecera del chat (ChatHeader), que sí
+                      tiene el historial cargado. */}
+                  <span className="saurio-sidebar-item__title">{chat.title ?? 'Chat nuevo'}</span>
                   <span className="saurio-sidebar-item__badges">
                     <span className="saurio-badge">{chat.mode === 'agent' ? 'Agente' : chat.mode}</span>
                     {chat.modelRef && <span className="saurio-badge local" title={chat.modelRef.name}>{chat.modelRef.name}</span>}
@@ -176,11 +221,26 @@ export function Sidebar({ project, onProjectChange, activeChatId, onSelectChat }
               value={draftModelRef}
               onChange={handleModelChange}
               title="Modelo del próximo chat"
+              engineState={ollamaStarting ? 'starting' : (ollamaOk === false && installedModels.length === 0 ? 'down' : 'ready')}
+              onStartEngine={() => void startOllama()}
+              startEngineError={ollamaStartError}
             />
             <ModeSelector mode={draftMode} onChange={(m) => setDraftMode(project.id, m)} />
           </div>
         </div>
       )}
+
+      {/* Punto 3 de la tarea "Cerrá lo que falta" ("Accesos a Modelos y Ajustes desde la barra
+          lateral"): antes solo se llegaba a esas dos pestañas clickeando en el panel derecho, que
+          puede no ser obvio para un usuario nuevo. */}
+      <div className="saurio-sidebar-quicklinks">
+        <button type="button" className="saurio-btn-ghost" onClick={() => useUiNavStore.getState().requestTab('Modelos')}>
+          <CpuIcon width={14} height={14} /> Modelos
+        </button>
+        <button type="button" className="saurio-btn-ghost" onClick={() => useUiNavStore.getState().requestTab('Ajustes')}>
+          <SettingsIcon width={14} height={14} /> Ajustes
+        </button>
+      </div>
     </aside>
   );
 }

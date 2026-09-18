@@ -2,6 +2,7 @@
 // project:open abre un diálogo nativo (HostAdapter.showOpenDirectoryDialog) cuando no se pasa `path`.
 import path from 'node:path';
 import { ipc } from '@saurio/shared';
+import { PERSONAL_PROJECT_ID } from '@saurio/runtime/agent/personalProject';
 import type { RuntimeHost } from '../host/RuntimeHost.js';
 import { registerHandler } from './registerHandler.js';
 
@@ -57,6 +58,8 @@ export function registerProjectHandlers(host: RuntimeHost): void {
   registerHandler('project:list', ipc['project:list'], async () => {
     const repo = host.projectRepository;
     if (!repo) return [];
-    return repo.list();
+    // Doc 19 §0 (E2a "Mis agentes"): el proyecto personal sintético (chats directos con un agente
+    // fuera de cualquier proyecto abierto) nunca aparece en el selector visible de proyectos.
+    return (await repo.list()).filter((p) => p.id !== PERSONAL_PROJECT_ID);
   });
 }

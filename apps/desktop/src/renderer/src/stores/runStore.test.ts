@@ -7,6 +7,7 @@ import { reduceRunEvent, useRunStore, type RunStoreState } from './runStore.js';
 function emptyState(): Omit<RunStoreState, 'applyEvents' | 'clearChat' | 'dismissInterrupted' | 'hydratePendingPermissions'> {
   return {
     runStates: {},
+    runStartedAt: {},
     runChatIds: {},
     messagesByChat: {},
     metricsByMessage: {},
@@ -20,6 +21,8 @@ function emptyState(): Omit<RunStoreState, 'applyEvents' | 'clearChat' | 'dismis
     errorsByRun: {},
     interrupted: {},
     lastSeqByRun: {},
+    childRunsByParent: {},
+    childChatIdByRun: {},
   };
 }
 
@@ -31,6 +34,16 @@ describe('reduceRunEvent', () => {
     const next = reduceRunEvent(emptyState() as RunStoreState, event);
     expect(next.runStates['run-1']).toBe('generating');
     expect(next.runChatIds['run-1']).toBe('chat-1');
+  });
+
+  it('guarda runStartedAt con el ts del PRIMER run.state visto de un run, sin pisarlo después (tarea "carga de modelo")', () => {
+    const first: RunEvent = { ...base, ts: 1000, seq: 1, type: 'run.state', from: 'created', to: 'preparing' };
+    let next = reduceRunEvent(emptyState() as RunStoreState, first);
+    expect(next.runStartedAt['run-1']).toBe(1000);
+
+    const later: RunEvent = { ...base, ts: 5000, seq: 2, type: 'run.state', from: 'preparing', to: 'generating' };
+    next = reduceRunEvent(next, later);
+    expect(next.runStartedAt['run-1']).toBe(1000); // no se pisa con la vuelta siguiente del mismo run
   });
 
   it('acumula message.delta de content y thinking por separado y limpia streaming en message.done', () => {
@@ -123,6 +136,23 @@ describe('reduceRunEvent', () => {
     };
     const next = reduceRunEvent(state, event);
     expect(next.interrupted['run-1']).toEqual({ runId: 'run-1', chatId: 'chat-1', orphaned: [], abandoned: [] });
+  });
+
+  it('acumula childRunsByParent y childChatIdByRun con run.delegated (doc 19 §2.6)', () => {
+    const state = emptyState() as RunStoreState;
+    const event: RunEvent = {
+      ...base, seq: 1, type: 'run.delegated',
+      parentRunId: 'run-1', childRunId: 'run-2', childChatId: 'chat-2',
+      targetAgentId: 'agent-x', task: 'revisar el módulo X',
+    };
+    const next = reduceRunEvent(state, event);
+    expect(next.childRunsByParent['run-1']).toEqual(['run-2']);
+    expect(next.childChatIdByRun['run-2']).toBe('chat-2');
+
+    // Un segundo run.delegated del mismo padre se agrega, no reemplaza.
+    const event2: RunEvent = { ...event, seq: 2, childRunId: 'run-3', childChatId: 'chat-3' };
+    const next2 = reduceRunEvent(next, event2);
+    expect(next2.childRunsByParent['run-1']).toEqual(['run-2', 'run-3']);
   });
 });
 

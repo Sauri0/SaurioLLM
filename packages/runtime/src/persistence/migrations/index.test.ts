@@ -152,7 +152,11 @@ describe('persistence/migrations', () => {
          VALUES ('m1', 'c1', NULL, 1, 'user', 'hola', 0, 0)`,
       ).run();
 
-      runMigrations(driver);
+      // Doc 19 (migración 0004 agregada después): se fija explícitamente a las 3 primeras en vez de
+      // depender de que el default de `runMigrations` termine justo en la versión 3 — ese default
+      // ahora incluye migraciones posteriores (0004+), así que esta prueba puntual de la migración 3
+      // pasa la lista explícita para no volver a romperse con cada migración nueva.
+      runMigrations(driver, [MIGRATIONS[0]!, MIGRATIONS[1]!, MIGRATIONS[2]!]);
       expect((driver.pragma('user_version') as Array<{ user_version: number }>)[0]?.user_version).toBe(3);
 
       const columns = driver.prepare<{ name: string }>('PRAGMA table_info(messages)').all();

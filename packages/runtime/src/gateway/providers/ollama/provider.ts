@@ -79,6 +79,7 @@ export class OllamaProvider implements Provider {
         top_k: req.options.topK,
         seed: req.options.seed,
         stop: req.options.stop,
+        num_gpu: req.options.numGpu,
       },
     };
     if (req.tools !== undefined) wire.tools = toOllamaTools(req.tools);

@@ -40,6 +40,33 @@ export const agents = sqliteTable('agents', {
   profileId: text('profile_id').references((): AnySQLiteColumn => profiles.id),
   isBuiltin: integer('is_builtin').notNull().default(0),
   updatedAt: integer('updated_at').notNull(),
+  // Doc 19 §1.1 (E2a "Mis agentes", migración 0004): identidad de usuario + discriminador de
+  // owner_kind ('builtin'|'personal'|'worker'|'coordinator', doc 19 §0). Sin CHECK acá (columnas
+  // nuevas vía ADD COLUMN): se valida en la capa zod de @saurio/shared.
+  ownerKind: text('owner_kind').notNull().default('builtin'),
+  avatarEmoji: text('avatar_emoji'),
+  avatarColor: text('avatar_color'),
+  description: text('description'),
+  modelMode: text('model_mode').notNull().default('fixed'),
+  createdAt: integer('created_at'),
+  archivedAt: integer('archived_at'),
+});
+
+// Doc 19 §1.1/§1.7 (E2a, migración 0004): memoria propia de un agente con procedencia explícita;
+// `project_id: NULL` = memoria global del agente. El filtro de privacidad de T09 vive en
+// `AgentMemoryRepository.list` (packages/runtime/src/persistence/repositories/agentMemory.ts), no acá.
+export const agentMemories = sqliteTable('agent_memories', {
+  id: text('id').primaryKey(),
+  agentId: text('agent_id').notNull().references(() => agents.id),
+  projectId: text('project_id').references(() => projects.id),
+  content: text('content').notNull(),
+  sourceKind: text('source_kind').notNull(),
+  confidence: text('confidence').notNull(),
+  originRef: text('origin_ref'),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+  expiresAt: integer('expires_at'),
+  invalidatedAt: integer('invalidated_at'),
 });
 
 export const chats = sqliteTable('chats', {
@@ -54,6 +81,8 @@ export const chats = sqliteTable('chats', {
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
   archived: integer('archived').notNull().default(0),
+  // Doc 19 §2.1 (E3a delegación, migración 0005): chat hijo creado por `delegate` -> run padre.
+  originRunId: text('origin_run_id'),
 });
 
 // ── 4.2 Runs y log de eventos (fuente de verdad) ─────────────────────────────
@@ -78,6 +107,9 @@ export const runs = sqliteTable('runs', {
   lastEventSeq: integer('last_event_seq'),
   ownerSessionId: text('owner_session_id'),
   heartbeatAt: integer('heartbeat_at'),
+  // Doc 19 §2.1 (E3a delegación, migración 0005): profundidad de delegación de ESTE run (0 = run
+  // normal/padre; 1 = run hijo de una delegación — doc 19 §2.5 limita la profundidad máxima a 1).
+  delegationDepth: integer('delegation_depth').notNull().default(0),
 });
 
 export const runEvents = sqliteTable('run_events', {

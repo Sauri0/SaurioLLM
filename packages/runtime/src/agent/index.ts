@@ -12,6 +12,8 @@ export type {
 export { RUN_TRANSITIONS } from './types.js';
 export * from './ports.js';
 export * from './defaults.js';
+export * from './modelPolicy.js';
+export * from './personalProject.js';
 export * from './hash.js';
 export * from './RunStateMachine.js';
 export * from './LoopDetector.js';

@@ -58,9 +58,18 @@ export function classifyErrorMessage(message: string): ProviderErrorCode {
   if (lower.includes('exceeds context window') || lower.includes('too large for model')) {
     return 'context_too_large';
   }
-  if (lower.includes('out of memory') || lower.includes('cudamalloc failed') || lower.includes('oom')) {
+  if (
+    lower.includes('out of memory') || lower.includes('out-of-memory') || lower.includes('cudamalloc')
+    || lower.includes('oom') || lower.includes('failed to allocate') || lower.includes('model is too large')
+    || lower.includes('erroroutofdevicememory') || lower.includes('error_out_of_device_memory')
+  ) {
     // No podemos distinguir load vs generate desde el solo texto; el llamador (client.ts) decide
     // 'oom_load' vs 'oom_generate' según si ya se había emitido contenido en el stream.
+    // Ampliado (tarea "carga de modelo/oom_load") con los textos reales reportados por un usuario en
+    // Intel Arc/Vulkan: "out-of-memory during startup" (guionado, no "out of memory"), "failed to
+    // allocate Vulkan0 buffer...", "ErrorOutOfDeviceMemory" (enum de Vulkan) — fixture real:
+    // "llama-server reported out-of-memory during startup: GGML_ASSERT(buffer) failed
+    // alloc_tensor_range: failed to allocate Vulkan0 buffer of size 1072462848".
     return 'oom_load';
   }
   if (lower.includes('econnreset') || lower.includes('socket hang up') || lower.includes('unexpected end of')) {

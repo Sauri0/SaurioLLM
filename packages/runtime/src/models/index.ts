@@ -49,3 +49,19 @@ export { DownloadManager } from './DownloadManager.js';
 export { RegistryClient, FsBlobStoreProbe, FsDiskSpaceProbe, digestToBlobFilename } from './RegistryClient.js';
 export { RecommendationEngine } from './RecommendationEngine.js';
 export { loadModelCatalog, DEFAULT_CATALOG_PATH } from './catalog.js';
+export {
+  parseHumanSize, parseContextWindow, parseLibraryListHtml, parseTagsPageHtml,
+} from './ollamaLibraryParser.js';
+export type { OllamaLibraryFamilySummary, OllamaLibraryVariant } from './ollamaLibraryParser.js';
+export {
+  loadOllamaLibrarySnapshot, mergeSnapshotWithCuratedCatalog, DEFAULT_SNAPSHOT_PATH, OllamaLibrarySnapshotSchema,
+} from './ollamaLibrarySnapshot.js';
+export type {
+  OllamaLibrarySnapshot, OllamaLibrarySnapshotFamily, OllamaLibrarySnapshotVariant,
+} from './ollamaLibrarySnapshot.js';
+export { OllamaLibraryClient, DEFAULT_LIBRARY_CACHE_TTL_MS } from './OllamaLibraryClient.js';
+export type { LibraryCachePort, OllamaLibraryClientOptions } from './OllamaLibraryClient.js';
+export { HuggingFaceClient } from './HuggingFaceClient.js';
+export type { HuggingFaceGgufFile, HuggingFaceSearchResult } from './HuggingFaceClient.js';
+export { classifyModelTier, tierForCatalogWeights } from './TierClassifier.js';
+export type { ModelTier, ModelTierLevel, ModelTierColor, TierClassificationInput } from './TierClassifier.js';

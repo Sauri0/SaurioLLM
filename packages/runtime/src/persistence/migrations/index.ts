@@ -8,10 +8,12 @@ import type { SqliteDriver } from '../driver.js';
 import { migration0001 } from './0001_init.js';
 import { migration0002 } from './0002_downloads_status_and_git_head.js';
 import { migration0003 } from './0003_messages_model_ref.js';
+import { migration0004 } from './0004_agent_profiles.js';
+import { migration0005 } from './0005_delegation.js';
 import type { Migration } from './types.js';
 
-/** Orden ascendente por versión; agregar migraciones nuevas acá cuando existan (0004, ...). */
-const MIGRATIONS: Migration[] = [migration0001, migration0002, migration0003];
+/** Orden ascendente por versión; agregar migraciones nuevas acá cuando existan (0006, ...). */
+const MIGRATIONS: Migration[] = [migration0001, migration0002, migration0003, migration0004, migration0005];
 
 export class NewerSchemaError extends Error {
   constructor(public readonly dbVersion: number, public readonly codeVersion: number) {

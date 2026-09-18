@@ -12,11 +12,13 @@ import { ModelGatewayImpl, OllamaProvider, OpenAICompatProvider, AnthropicProvid
 import type { Provider } from '@saurio/runtime/gateway/Provider';
 import {
   HardwareProbe, ModelManager, DownloadManager, RegistryClient, FsBlobStoreProbe, FsDiskSpaceProbe,
-  RecommendationEngine, loadModelCatalog,
+  RecommendationEngine, loadModelCatalog, OllamaLibraryClient, HuggingFaceClient, loadOllamaLibrarySnapshot,
 } from '@saurio/runtime/models/index';
+import type { HardwareProbeOptions } from '@saurio/runtime/models/index';
 import type { ModelCatalogEntry, DownloadProvider } from '@saurio/runtime/models/index';
 import { Diagnostics, MetricsAggregator } from '@saurio/runtime/telemetry/index';
 import { SqlDownloadsRepository, seedOllamaProviderRow } from '../services/downloads/SqlDownloadsRepository.js';
+import { FileLibraryCache } from '../services/models/LibraryCache.js';
 import {
   SqlProvidersRepository, toProviderConfig, OLLAMA_PROVIDER_ID, type StoredProvider,
 } from '../services/providers/SqlProvidersRepository.js';
@@ -39,16 +41,21 @@ import {
   defaultIdGenerator, systemClock,
 } from '@saurio/runtime/agent/index';
 import type { RunControllerDeps } from '@saurio/runtime/agent/RunController';
-import type { ModelContextProbe, LastReadHashes } from '@saurio/runtime/agent/ports';
+import type { ModelContextProbe, LastReadHashes, ModelLayerCountProbe } from '@saurio/runtime/agent/ports';
 import type { DefaultNumCtxFor } from '@saurio/runtime/agent/defaults';
 import { recover as recoverRuns, type RecoverResult } from '@saurio/runtime/agent/recover';
+import { ensurePersonalProject } from '@saurio/runtime/agent/personalProject';
 import type { ModelRef, Project, ProviderConfig, ProviderPreset } from '@saurio/shared';
 import { NUM_CTX_SETTINGS_KEY, isNumCtxDefaults } from '@saurio/shared';
 import type { HostAdapter } from './RuntimeHost.js';
 import { BroadcastEventStore } from './BroadcastEventStore.js';
 
-/** URL de Ollama en modo attach (doc 13 §6): el servidor ya corre en la máquina del usuario. */
-export const OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
+/** URL de Ollama en modo attach (doc 13 §6): el servidor ya corre en la máquina del usuario.
+ *  `SAURIO_OLLAMA_URL` (tarea "carga de modelo/oom_load" punto 5, solo para pruebas): apunta la app
+ *  a un puerto vacío (p. ej. `http://127.0.0.1:11999`) para simular "Ollama apagado" de verdad sin
+ *  tocar una instancia real que pueda estar corriendo en esta máquina (útil cuando esta sesión de
+ *  trabajo comparte el equipo con otro proceso que sí depende de Ollama real en 11434). */
+export const OLLAMA_BASE_URL = process.env['SAURIO_OLLAMA_URL'] ?? 'http://127.0.0.1:11434';
 
 /** Presets con baseUrl por defecto (punto 2 del encargo: "Presets con baseUrl por defecto"). Doc 18
  *  §1/§2: OpenAI/OpenRouter hablan el dialecto `/v1/chat/completions` (`OpenAICompatProvider`, mismo
@@ -102,6 +109,13 @@ export interface GlobalRuntime {
    *  nunca como error fatal de arranque. */
   modelCatalog: ModelCatalogEntry[];
   recommendationEngine: RecommendationEngine;
+  /** Cobertura máxima del catálogo (doc 16 §12.6, puntos 1-3 del encargo): biblioteca completa de
+   *  Ollama (caché en userData con TTL 24h, fallback al snapshot empaquetado sin red) y búsqueda de
+   *  Hugging Face GGUF. Cambio aditivo mínimo en este archivo compartido (zona de models: ipc/models.ts
+   *  y packages/runtime/src/models/**, documentado acá igual que el resto de las piezas de `models`
+   *  ya cableadas más abajo). */
+  ollamaLibraryClient: OllamaLibraryClient;
+  huggingFaceClient: HuggingFaceClient;
   /** Ajustes > Proveedores (punto 3 del encargo): CRUD real sobre `providers` + almacén seguro de
    *  claves + auditoría de llamadas no locales (punto 4). Expuestos acá para que
    *  apps/desktop/src/main/ipc/providers.ts no tenga que reconstruir nada. */
@@ -158,7 +172,17 @@ function makeDownloadCallbacks(modelManager: ModelManager, gateway: ModelGateway
 
 export function createGlobalRuntime(
   hostAdapter: HostAdapter,
-  deps: { readResourceFile?: typeof readResourceFile; secureKeyStore?: SecureKeyStore } = {},
+  deps: {
+    readResourceFile?: typeof readResourceFile;
+    secureKeyStore?: SecureKeyStore;
+    /** Tarea "carga de modelo/oom_load" punto 4: fuente real de la línea `msg="inference compute"`
+     *  que `ollama serve` loguea por dispositivo — `main/index.ts` la arma envolviendo
+     *  `OllamaProcessManager.readInferenceComputeLine()` (log propio en `userData/logs/` o, en modo
+     *  attach, `%LOCALAPPDATA%\Ollama\server.log` en solo lectura). Opcional: sin esto, `HardwareProbe`
+     *  sigue el comportamiento previo (nvidia-smi -> registro de Windows, sin esta fuente adicional).
+     */
+    inferenceComputeSource?: HardwareProbeOptions['inferenceComputeSource'];
+  } = {},
 ): GlobalRuntime {
   const readResource = deps.readResourceFile ?? readResourceFile;
 
@@ -196,7 +220,7 @@ export function createGlobalRuntime(
     },
   });
 
-  const hardwareProbe = new HardwareProbe();
+  const hardwareProbe = new HardwareProbe({ inferenceComputeSource: deps.inferenceComputeSource });
   const modelManager = new ModelManager(currentProviders, hardwareProbe);
 
   function refreshProviders(): void {
@@ -252,6 +276,26 @@ export function createGlobalRuntime(
   }
   const recommendationEngine = new RecommendationEngine(modelCatalog);
 
+  // Punto 2 del encargo (doc 16 §12.6): snapshot empaquetado como último fallback sin red y sin
+  // ninguna caché en userData todavía (primera vez que se abre la app sin conexión) — best-effort,
+  // nunca fatal si falta o no parsea (empaquetado sin `extraResources`, o un `resources/` de dev roto,
+  // mismo criterio que `modelCatalog` arriba).
+  const snapshotJson = readResource('model-catalog.snapshot.json', {
+    appPath: hostAdapter.paths.appPath,
+    resourcesPath: hostAdapter.paths.resourcesPath,
+  });
+  let bundledSnapshot;
+  try {
+    bundledSnapshot = snapshotJson ? loadOllamaLibrarySnapshot(snapshotJson) : undefined;
+  } catch (error) {
+    console.warn('[createRuntime] resources/model-catalog.snapshot.json no parsea; sin fallback empaquetado', error);
+  }
+  const ollamaLibraryClient = new OllamaLibraryClient({
+    cache: new FileLibraryCache(path.join(hostAdapter.paths.userDataDir, 'model-library-cache.json')),
+    bundledSnapshot,
+  });
+  const huggingFaceClient = new HuggingFaceClient();
+
   return {
     persistence,
     events,
@@ -264,6 +308,8 @@ export function createGlobalRuntime(
     downloadManager,
     modelCatalog,
     recommendationEngine,
+    ollamaLibraryClient,
+    huggingFaceClient,
     providersRepository,
     secureKeyStore,
     auditLog,
@@ -290,6 +336,27 @@ async function loadNumCtxDefaults(runtime: GlobalRuntime): Promise<Record<string
  *  (doc 16 §9.6/§10.5, punto 1 del encargo) deriva el `ContextPolicy` de SEED del agente builtin desde
  *  `models.numCtxDefaults` en vez del literal fijo 8192 — sin preferencia guardada para
  *  `DEFAULT_MODEL_REF`, el comportamiento es exactamente el previo. */
+/** PRIORIDAD CERO punto 6 (bloqueo real reportado en OTRO equipo del usuario, sin qwen3:8b instalado
+ *  — solo gemma3:26b/31b, demasiado grandes para esa notebook): antes se sembraba el agente builtin
+ *  SIEMPRE con `DEFAULT_MODEL_REF` (`qwen3:8b`, medido en el equipo de referencia de este repo, doc
+ *  16), sin importar qué haya instalado el usuario real. `qwen3:8b` sigue existiendo como ÚLTIMO
+ *  recurso (si Ollama no responde todavía en este boot, o no hay ningún modelo instalado) para que la
+ *  fila del agente builtin tenga algún `model` con el que satisfacer la FK — no es una promesa de que
+ *  ese modelo esté instalado ni se usa para decidir qué mostrarle al usuario como modelo del próximo
+ *  chat (eso lo resuelve la UI consultando `models:list` directamente, `layout/Sidebar.tsx`). Best
+ *  effort real: si `ModelManager.listInstalled()` responde con algo, se usa el primero. */
+async function pickSeedModelRef(runtime: GlobalRuntime): Promise<ModelRef> {
+  try {
+    const installed = await runtime.modelManager.listInstalled();
+    if (installed.length > 0) return installed[0]!.ref;
+  } catch {
+    // Ollama no responde todavía en este boot (doc PRIORIDAD CERO punto 1: puede estar arrancando
+    // recién ahora) — se cae al último recurso de abajo; el agente builtin de todas formas no es lo
+    // que decide el modelo del próximo chat (ver comentario de la función).
+  }
+  return DEFAULT_MODEL_REF;
+}
+
 export async function initGlobalRuntime(runtime: GlobalRuntime, defaultWorkingDir: string): Promise<RecoverResult> {
   const { repositories } = runtime.persistence;
   const existing = await repositories.agents.get(DEFAULT_AGENT_ID);
@@ -299,8 +366,13 @@ export async function initGlobalRuntime(runtime: GlobalRuntime, defaultWorkingDi
       const value = numCtxDefaults?.[ref.name];
       return typeof value === 'number' && value > 0 ? value : undefined;
     };
-    await repositories.agents.save(createDefaultAgentConfig(defaultWorkingDir, DEFAULT_MODEL_REF, defaultNumCtxFor), true);
+    const seedModel = await pickSeedModelRef(runtime);
+    await repositories.agents.save(createDefaultAgentConfig(defaultWorkingDir, seedModel, defaultNumCtxFor), true);
   }
+  // Doc 19 §0 (E2a "Mis agentes"): proyecto personal sintético, creado una sola vez, para que un chat
+  // directo con un agente personal fuera de cualquier proyecto abierto tenga dónde vivir sin relajar
+  // `chats.project_id NOT NULL`. Idempotente (no-op en arranques posteriores).
+  await ensurePersonalProject(repositories.projects);
   return recoverRuns({
     runs: repositories.runs,
     toolCalls: repositories.toolCalls,
@@ -343,6 +415,20 @@ function makeRealSummarizer(runtime: GlobalRuntime): Summarizer {
       return JSON.parse(content) as CompactionSummary;
     },
   };
+}
+
+/** Tarea "carga de modelo/oom_load": busca `<arch>.block_count` en el bag crudo de `/api/show`
+ *  (`ModelDescription.modelInfo`) — mismo dato que `mapModelDescription`/`extractContextMax` de
+ *  `gateway/providers/ollama/mappers.ts` ya leen para `contextMax`, pero esa utilidad no está
+ *  exportada y ese módulo no es zona de esta tarea para agregarle una exportación nueva; se
+ *  reimplementa acá, chica y sola. `undefined` si no está presente (versión vieja de Ollama, modelo
+ *  sin esa clave) — nunca inventa un valor. */
+function extractBlockCount(modelInfo: Record<string, unknown> | undefined): number | undefined {
+  if (!modelInfo) return undefined;
+  for (const [key, value] of Object.entries(modelInfo)) {
+    if (key.endsWith('.block_count') && typeof value === 'number') return value;
+  }
+  return undefined;
 }
 
 /** Punto 5 del encargo ("el numCtx por defecto por modelo de Ajustes debe llegar al runtime"): lee
@@ -425,6 +511,16 @@ export function createProjectRuntime(
       return desc.contextMax;
     },
   };
+  // Tarea "carga de modelo/oom_load": `RunController.handleOomLoad` necesita `block_count` real
+  // para poder reintentar con ~75%/~50% de las capas en GPU en vez de saltar directo a CPU. Mismo
+  // criterio que `modelContextProbe` de arriba: envuelve `ModelManager.describeModel` (público, ya
+  // usado) en vez de tocar packages/runtime/src/models (fuera de esta zona).
+  const modelLayerCountProbe: ModelLayerCountProbe = {
+    async getBlockCount(ref) {
+      const desc = await runtime.modelManager.describeModel(ref);
+      return extractBlockCount(desc.modelInfo as Record<string, unknown> | undefined);
+    },
+  };
 
   const deps: RunControllerDeps = {
     gateway: runtime.gateway,
@@ -441,6 +537,10 @@ export function createProjectRuntime(
     toolCalls: repositories.toolCalls,
     checkpointRepo: repositories.checkpoints,
     agents: repositories.agents,
+    // Doc 19 §2.5 (E3a delegación): `AgentRepository` ya implementa `AgentProfilePort.createProfile`
+    // (packages/runtime/src/persistence/repositories/agent.ts) — se pasa el mismo repositorio, sin
+    // adaptarlo, para que `delegate` sin `targetAgentId` pueda crear un worker efímero real.
+    agentProfiles: repositories.agents,
     workspaceFs,
     clock: systemClock,
     ids: defaultIdGenerator,
@@ -450,6 +550,7 @@ export function createProjectRuntime(
     permissionMemory,
     projectId: project.id,
     modelContextProbe,
+    modelLayerCountProbe,
     numCtxForModel: makeNumCtxForModel(runtime),
     readHashes: readTracker satisfies LastReadHashes,
   };

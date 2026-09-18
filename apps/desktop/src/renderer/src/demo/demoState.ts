@@ -171,6 +171,11 @@ export interface DemoStateOptions {
    *  de capturar, así que esto deja elegirla desde `SAURIO_SMOKE_STATE` sin agregar ningún control
    *  nuevo a la UI real (fuera de modo demo, `getDemoRightPanelTab()` siempre devuelve `undefined`). */
   rightPanelTab?: string;
+  /** Tarea "carga de modelo/oom_load": siembra el run del chat como `failed`/`oom_load` (en vez de
+   *  `awaiting_permission`) para poder capturar `OomLoadCard` sin depender de una GPU real sin
+   *  memoria. Implica `omitPermission` (no tiene sentido mostrar las dos tarjetas terminales a la
+   *  vez — la de permiso es de un run en curso, la de oom_load es de uno ya fallado). */
+  oomError?: boolean;
 }
 
 function parseDemoStateOptions(raw: string | null): DemoStateOptions {
@@ -182,6 +187,7 @@ function parseDemoStateOptions(raw: string | null): DemoStateOptions {
     return {
       omitPermission: opts['omitPermission'] === true,
       rightPanelTab: typeof opts['rightPanelTab'] === 'string' ? opts['rightPanelTab'] : undefined,
+      oomError: opts['oomError'] === true,
     };
   } catch {
     return {};
@@ -212,9 +218,10 @@ export function seedDemoState(): void {
   }));
 
   const toolCalls = demoToolCalls();
+  const omitPermission = options.omitPermission || options.oomError;
   useRunStore.setState((state) => ({
     ...state,
-    runStates: { ...state.runStates, [DEMO_RUN_ID]: 'awaiting_permission' },
+    runStates: { ...state.runStates, [DEMO_RUN_ID]: options.oomError ? 'failed' : 'awaiting_permission' },
     runChatIds: { ...state.runChatIds, [DEMO_RUN_ID]: DEMO_CHAT_ID },
     messagesByChat: { ...state.messagesByChat, [DEMO_CHAT_ID]: demoMessages() },
     metricsByMessage: {
@@ -229,14 +236,26 @@ export function seedDemoState(): void {
     toolCallOrderByRun: { ...state.toolCallOrderByRun, [DEMO_RUN_ID]: toolCalls.map((c) => c.id) },
     checkpointsByChat: { ...state.checkpointsByChat, [DEMO_CHAT_ID]: [demoCheckpoint()] },
     tasksByChat: { ...state.tasksByChat, [DEMO_CHAT_ID]: demoTasks() },
-    pendingPermissions: options.omitPermission
+    pendingPermissions: omitPermission
       ? state.pendingPermissions
       : { ...state.pendingPermissions, 'tc-3': demoPermissionRequest() },
+    // Tarea "carga de modelo/oom_load": mismo texto real que reportó el usuario con iGPU
+    // Intel Arc/Vulkan (ver packages/runtime/src/gateway/providers/ollama/errors.test.ts) — para que
+    // la captura de OomLoadCard muestre un mensaje real, no uno inventado para la demo.
+    errorsByRun: options.oomError
+      ? {
+        ...state.errorsByRun,
+        [DEMO_RUN_ID]: [{
+          code: 'oom_load' as const,
+          message: 'llama-server reported out-of-memory during startup: GGML_ASSERT(buffer) failed alloc_tensor_range: failed to allocate Vulkan0 buffer of size 1072462848 (se reintentó bajando las capas en GPU hasta usar solo CPU y el modelo tampoco entró — probá con un modelo más chico)',
+        }],
+      }
+      : state.errorsByRun,
   }));
 
   // tc-3 (la tool call del permiso pendiente) tiene que existir para que ChatMessageList la matchee
   // contra `activeRunId` (busca `toolCalls[req.toolCallId]?.runId === activeRunId`).
-  if (!options.omitPermission) {
+  if (!omitPermission) {
     useRunStore.setState((state) => ({
       ...state,
       toolCalls: {

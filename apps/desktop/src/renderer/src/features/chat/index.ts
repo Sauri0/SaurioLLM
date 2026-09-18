@@ -8,6 +8,7 @@ export { ChatInput, type ChatInputProps } from './ChatInput.js';
 export { MessageBubble, type MessageBubbleProps } from './MessageBubble.js';
 export { MessageMetrics, type MessageMetricsProps } from './MessageMetrics.js';
 export { ToolCallCard, type ToolCallCardProps } from './ToolCallCard.js';
+export { DelegationCard, type DelegationCardProps } from './DelegationCard.js';
 export { CheckpointCard, type CheckpointCardProps } from './CheckpointCard.js';
 export { InterruptedRunCard, type InterruptedRunCardProps } from './InterruptedRunCard.js';
 export { ModeSelector, type ModeSelectorProps } from './ModeSelector.js';

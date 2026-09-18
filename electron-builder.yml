@@ -41,6 +41,12 @@ extraResources:
   #    @saurio/repomap vía `configureRepoMapResources()` — así que el destino acá es simple y plano.
   - from: ../../resources/model-catalog.json
     to: model-catalog.json
+  # Snapshot completo de ollama.com/library (doc 16 §12.6, punto 1/2 del encargo): fallback de
+  # OllamaLibraryClient sin red y sin caché en userData todavía (primera vez que se abre la app
+  # empaquetada sin conexión) — mismo criterio que model-catalog.json arriba (plano en resources/,
+  # createRuntime.ts lo lee con `readResourceFile('model-catalog.snapshot.json', ...)`).
+  - from: ../../resources/model-catalog.snapshot.json
+    to: model-catalog.snapshot.json
   - from: ../../resources/prompts
     to: prompts
   - from: ../../resources/grammars
@@ -60,3 +66,25 @@ win:
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
+  # Nombre estable y SIN espacios (auto-actualización, doc de esta tarea): el Release de v0.1.0 ya
+  # mostró el problema real — GitHub reescribe los espacios del nombre de archivo a puntos al subir un
+  # asset por la API/UI ("SaurioLLM Setup 0.1.0.exe" quedó publicado como
+  # "SaurioLLM.Setup.0.1.0.exe"), pero `latest.yml` (generado por electron-builder con el nombre de acá,
+  # SIN esa reescritura) seguiría apuntando al nombre con espacios. electron-updater arma la URL de
+  # descarga concatenando `releases/download/<tag>/` + el `path` de `latest.yml` tal cual, así que ese
+  # desajuste da 404 al descargar la actualización. Con guiones no hay reescritura posible: el nombre
+  # de archivo real y el que queda en `latest.yml` coinciden siempre.
+  artifactName: "${productName}-Setup-${version}.exe"
+# provider github (owner/repo de este mismo repo): necesario para DOS cosas, no solo para publicar
+# (que acá NUNCA lo hace electron-builder — ver --publish never en apps/desktop/package.json, la subida
+# real al Release la sigue haciendo `gh`/softprops a mano):
+#  1. Con esta config presente, electron-builder escribe `latest.yml` + `<instalador>.blockmap` en
+#     `apps/desktop/release/` en CADA build (aunque --publish sea never) — son los dos archivos que
+#     electron-updater necesita en el Release además del instalador.
+#  2. electron-builder empaqueta un `app-update.yml` (con este mismo owner/repo) DENTRO de la app
+#     instalada, en resources/ — es lo que electron-updater lee en runtime para saber dónde buscar
+#     actualizaciones (apps/desktop/src/main/services/updater/**).
+publish:
+  provider: github
+  owner: Sauri0
+  repo: SaurioLLM

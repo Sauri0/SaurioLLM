@@ -23,8 +23,16 @@ export interface StatusBarProps {
   chatId: string | null;
 }
 
+/** PRIORIDAD CERO puntos 1/2/7 (bloqueo real: "Ollama instalado pero apagado", la app no lo
+ *  reflejaba ni ofrecía arrancarlo). Antes `provider:health` se pedía UNA sola vez al montar el
+ *  componente: si Ollama se caía o volvía a arrancar durante la sesión, la barra de estado nunca se
+ *  actualizaba. 8s es corto para notarlo rápido sin martillar el proceso de Ollama con requests. */
+const HEALTH_POLL_MS = 8000;
+
 export function StatusBar({ projectId, chatId }: StatusBarProps): React.JSX.Element {
   const [ollamaOk, setOllamaOk] = useState<boolean | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | undefined>(undefined);
   const draftModelRef = useChatStore((s) => (projectId ? s.draftModelRefByProject[projectId] : undefined));
   const messages = useRunStore((s) => (chatId ? s.messagesByChat[chatId] : undefined));
   const metricsByMessage = useRunStore((s) => s.metricsByMessage);
@@ -40,11 +48,36 @@ export function StatusBar({ projectId, chatId }: StatusBarProps): React.JSX.Elem
       return;
     }
     let cancelled = false;
-    void invoke('provider:health', undefined)
-      .then((health) => { if (!cancelled) setOllamaOk(health.every((h) => h.ok)); })
-      .catch(() => { if (!cancelled) setOllamaOk(false); });
-    return () => { cancelled = true; };
+    function checkHealth(): void {
+      void invoke('provider:health', undefined)
+        .then((health) => { if (!cancelled) setOllamaOk(health.every((h) => h.ok)); })
+        .catch(() => { if (!cancelled) setOllamaOk(false); });
+    }
+    checkHealth();
+    const interval = setInterval(checkHealth, HEALTH_POLL_MS);
+    return () => { cancelled = true; clearInterval(interval); };
   }, []);
+
+  async function handleStartOllama(): Promise<void> {
+    setStarting(true);
+    setStartError(undefined);
+    try {
+      const result = await invoke('ollama:ensureRunning', undefined);
+      if (result.running) {
+        setOllamaOk(true);
+      } else {
+        setStartError(
+          result.error === 'ollama_not_installed'
+            ? 'Ollama no está instalado en este equipo.'
+            : 'Ollama no respondió a tiempo. Probá de nuevo en unos segundos.',
+        );
+      }
+    } catch (err) {
+      setStartError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStarting(false);
+    }
+  }
 
   const lastMessageId = messages && messages.length > 0 ? messages[messages.length - 1]!.id : undefined;
   const lastMetrics = lastMessageId ? metricsByMessage[lastMessageId] : undefined;
@@ -81,11 +114,18 @@ export function StatusBar({ projectId, chatId }: StatusBarProps): React.JSX.Elem
 
       <span className="saurio-statusbar__spacer" />
 
-      <span className="saurio-statusbar__item" title={ollamaOk === false ? 'provider:health respondió con error' : undefined}>
+      <span className="saurio-statusbar__item" title={startError ?? (ollamaOk === false ? 'provider:health respondió con error' : undefined)}>
         <PlugIcon />
         <span className={`saurio-statusbar__dot ${ollamaOk ? 'ok' : 'down'}`} aria-hidden="true" />
-        {ollamaOk === null ? 'Comprobando Ollama…' : ollamaOk ? 'Ollama conectado' : 'Ollama no conectado'}
+        {starting
+          ? 'Iniciando motor local…'
+          : ollamaOk === null ? 'Comprobando Ollama…' : ollamaOk ? 'Ollama conectado' : 'Ollama no conectado'}
       </span>
+      {!starting && ollamaOk === false && !isDemoMode() && (
+        <button type="button" className="saurio-btn-ghost saurio-statusbar__start-ollama" onClick={() => void handleStartOllama()}>
+          Iniciar Ollama
+        </button>
+      )}
     </footer>
   );
 }

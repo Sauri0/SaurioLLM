@@ -207,3 +207,63 @@ describe('DownloadManager.delete', () => {
     expect(deps.provider.delete).not.toHaveBeenCalled();
   });
 });
+
+describe('DownloadManager.pullKnownSize (hf.co/<user>/<repo>:<quant>, punto 3/4 del encargo)', () => {
+  it('descarga sin consultar el manifest del registry de Ollama (nombre hf.co no resuelve ahí)', async () => {
+    const deps = makeDeps({ freeBytes: 10 * GIB });
+    const dm = new DownloadManager(deps.provider, {
+      manifestFetcher: deps.manifestFetcher,
+      blobStore: deps.blobStore,
+      diskSpace: deps.diskSpace,
+      modelsFolder: async () => '/models',
+    });
+    const { downloadId } = await dm.pullKnownSize('hf.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M', 4 * GIB);
+    expect(downloadId).toBeTruthy();
+    expect(deps.manifestFetcher.fetchManifest).not.toHaveBeenCalled();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(deps.provider.pull).toHaveBeenCalledWith('hf.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M', expect.anything());
+  });
+
+  it('bloquea por espacio insuficiente contra el tamaño conocido + margen de 2 GiB', async () => {
+    const deps = makeDeps({ freeBytes: 3 * GIB });
+    const dm = new DownloadManager(deps.provider, {
+      manifestFetcher: deps.manifestFetcher,
+      blobStore: deps.blobStore,
+      diskSpace: deps.diskSpace,
+      modelsFolder: async () => '/models',
+    });
+    await expect(dm.pullKnownSize('hf.co/user/repo:Q4_K_M', 4 * GIB)).rejects.toThrow(/espacio insuficiente/);
+    expect(deps.provider.pull).not.toHaveBeenCalled();
+  });
+
+  it('registra insufficient_space en el repositorio igual que pull() (doc 16 §8 punto 1)', async () => {
+    const deps = makeDeps({ freeBytes: 1 * GIB });
+    const saved: DownloadRecord[] = [];
+    const repository: DownloadsRepositoryPort = {
+      save: vi.fn(async (record) => { saved.push(record); }),
+      get: vi.fn(async () => undefined),
+    };
+    const dm = new DownloadManager(deps.provider, {
+      manifestFetcher: deps.manifestFetcher,
+      blobStore: deps.blobStore,
+      diskSpace: deps.diskSpace,
+      modelsFolder: async () => '/models',
+      repository,
+    });
+    await expect(dm.pullKnownSize('hf.co/user/repo:Q4_K_M', 4 * GIB)).rejects.toThrow();
+    expect(saved.some((r) => r.status === 'insufficient_space')).toBe(true);
+  });
+
+  it('reusa el mismo downloadId si ya está en curso (mismo criterio que pull())', async () => {
+    const deps = makeDeps({ freeBytes: 10 * GIB });
+    const dm = new DownloadManager(deps.provider, {
+      manifestFetcher: deps.manifestFetcher,
+      blobStore: deps.blobStore,
+      diskSpace: deps.diskSpace,
+      modelsFolder: async () => '/models',
+    });
+    const first = await dm.pullKnownSize('hf.co/user/repo:Q4_K_M', 4 * GIB);
+    const second = await dm.pullKnownSize('hf.co/user/repo:Q4_K_M', 4 * GIB);
+    expect(second.downloadId).toBe(first.downloadId);
+  });
+});

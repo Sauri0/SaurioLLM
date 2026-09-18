@@ -12,6 +12,9 @@ import {
   FileTreeNodeSchema, FileReadResultSchema, ModelsFolderInfoSchema,
   CatalogItemSchema, RecommendationSchema, DownloadJobSchema,
   ProviderConfigSchema, ProviderPresetSchema, ProviderTestResultSchema, NonLocalCallAuditEntrySchema,
+  AgentProfileSchema, AgentMemorySchema, AgentCreateInputSchema,
+  HuggingFaceSearchResultSchema, HuggingFaceGgufFileSchema, LibraryCatalogResultSchema, ResolveModelByNameResultSchema,
+  ModelTierSchema,
 } from './domain.js';
 import { RunEventSchema } from './events.js';
 
@@ -37,12 +40,26 @@ const AppPingOutputSchema = z.object({
   versions: z.object({ node: z.string(), electron: z.string(), chrome: z.string() }),
 });
 
+/** PRIORIDAD CERO punto 1 (bloqueo real reportado tras instalar v0.1: "Ollama instalado pero
+ *  apagado" — la app no lo detectaba ni lo arrancaba sola). `apps/desktop/src/main/services/ollama/
+ *  OllamaProcessManager.ts` implementa la lógica real; este canal la expone. Se llama sola al
+ *  arrancar la app (main/index.ts) y también manualmente desde un botón "Iniciar Ollama" en la barra
+ *  de estado (`layout/StatusBar.tsx`) cuando el health check falla. `error` es un código estable
+ *  ('ollama_not_installed' | 'timeout_starting' | mensaje crudo del SO), no un texto para mostrar
+ *  directo — la UI decide el copy. */
+const OllamaEnsureRunningOutputSchema = z.object({
+  running: z.boolean(),
+  startedByApp: z.boolean(),
+  error: z.string().optional(),
+});
+
 export const ipc = {
   'app:ping':               { input: AppPingInputSchema, output: AppPingOutputSchema },
   // Asistente de primer arranque (punto 5 del encargo): "abre la descarga oficial de Ollama con
   // consentimiento explícito" — el consentimiento se pide en la UI (OnboardingWizard) ANTES de
   // invocar esto; este canal solo hace `shell.openExternal(url)`, nunca descarga ni ejecuta nada.
   'app:openExternal':       { input: z.object({ url: z.string().url() }), output: z.void() },
+  'ollama:ensureRunning':  { input: z.void(), output: OllamaEnsureRunningOutputSchema },
   'project:open':          { input: z.object({ path: z.string().optional() }), output: ProjectSchema },
   'project:list':          { input: z.void(), output: z.array(ProjectSchema) },
   // `confirmed`: mismo mecanismo que `chat:setModel` (frontera local/nube, punto 4 del encargo) —
@@ -84,6 +101,16 @@ export const ipc = {
   'models:catalog':        { input: z.void(), output: z.array(CatalogItemSchema) },
   'models:recommend':      { input: z.object({ use: z.enum(['coding', 'chat', 'analysis', 'vision']), goal: z.enum(['speed', 'quality']) }), output: z.array(RecommendationSchema) },
   'models:downloads':      { input: z.void(), output: z.array(DownloadJobSchema) },
+  // Cobertura máxima del catálogo (doc 16 §12.6, puntos 1-5 del encargo): biblioteca completa de
+  // Ollama (OllamaLibraryClient, caché 24h + snapshot empaquetado) y búsqueda de Hugging Face GGUF.
+  'models:libraryCatalog': { input: z.object({ forceRefresh: z.boolean().optional() }), output: LibraryCatalogResultSchema },
+  'models:hfSearch':       { input: z.object({ query: z.string() }), output: z.array(HuggingFaceSearchResultSchema) },
+  'models:hfFiles':        { input: z.object({ modelId: z.string() }), output: z.array(HuggingFaceGgufFileSchema) },
+  'models:resolveByName':  { input: z.object({ name: z.string() }), output: ResolveModelByNameResultSchema },
+  'models:pullExternal':   { input: z.object({ ref: z.string(), sizeBytes: z.number() }), output: z.object({ downloadId: z.string() }) },
+  // Selector de contexto 4k/8k/16k/32k de la ficha de Explorar (punto 5 del encargo): recalcula
+  // memoria/nivel para un tamaño de pesos ya conocido sin volver a pedir el catálogo completo.
+  'models:tierForSize':    { input: z.object({ sizeBytes: z.number(), numCtx: z.number() }), output: ModelTierSchema },
   'provider:health':       { input: z.void(), output: z.array(ProviderHealthSchema) },
   // Ajustes > Proveedores (punto 3 del encargo, doc 18 §3 "qué necesita el host"): CRUD sobre la
   // tabla `providers` (ya existía, doc 03) + almacén seguro de claves (Electron `safeStorage`, punto 1)
@@ -137,6 +164,20 @@ export const ipc = {
   'profiles:list':         { input: z.object({ projectId: z.string().optional() }), output: z.array(ProfileSchema) },  // v0.2
   'profiles:save':         { input: ProfileSchema, output: ProfileSchema },                                    // v0.2
   'profiles:setDefault':   { input: z.object({ projectId: z.string(), profileId: z.string() }), output: z.void() },  // v0.2
+
+  // Doc 19 §1.4 — E2a "Mis agentes". `agents:list` sin filtro devuelve solo `ownerKind: 'personal'`
+  // no archivados (la UI de "Mis agentes" nunca ve `'worker'`/`'coordinator'`, doc 19 §0/§1.5).
+  // `projectId` no filtra la LISTA de agentes (un agente personal es visible en cualquier proyecto,
+  // doc 19 §0 "alcance por proyecto" es de la MEMORIA, no del agente); se acepta igual en el input
+  // por si una vista futura lo necesita, sin uso todavía en el handler del MVP de esta entrega.
+  'agents:list':           { input: z.object({ projectId: z.string().optional(), includeArchived: z.boolean().optional() }), output: z.array(AgentProfileSchema) },
+  'agents:create':         { input: AgentCreateInputSchema, output: AgentProfileSchema },
+  'agents:update':         { input: z.object({ id: z.string(), patch: AgentCreateInputSchema.partial() }), output: AgentProfileSchema },
+  'agents:archive':        { input: z.object({ id: z.string() }), output: z.void() },
+  'agents:duplicate':      { input: z.object({ id: z.string(), name: z.string().optional() }), output: AgentProfileSchema },
+  'agent-memory:list':     { input: z.object({ agentId: z.string(), projectId: z.string().optional() }), output: z.array(AgentMemorySchema) },
+  'agent-memory:upsert':   { input: AgentMemorySchema.partial(), output: AgentMemorySchema },
+  'agent-memory:delete':   { input: z.object({ id: z.string() }), output: z.void() },
 } as const;
 
 export type IpcChannel = keyof typeof ipc;

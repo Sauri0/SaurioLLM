@@ -3,7 +3,12 @@
 // (DownloadManager) y models:catalog/recommend (RecommendationEngine + resources/model-catalog.json)
 // son v0.2/v0.3 (doc 13 §5/§8) — implementados acá con handler real, conectado de punta a punta
 // contra Ollama real (probado con all-minilm, ver packages/runtime/src/models/DownloadManager.ts).
-import { ipc, type CatalogItem } from '@saurio/shared';
+// models:libraryCatalog/hfSearch/hfFiles/resolveByName/pullExternal son la cobertura máxima del
+// catálogo (doc 16 §12.6, puntos 1-5 del encargo).
+import { ipc, type CatalogItem, type ModelTier, type ResolveModelByNameResult } from '@saurio/shared';
+import { tierForCatalogWeights } from '@saurio/runtime/models/TierClassifier';
+import { RegistryClient, mergeSnapshotWithCuratedCatalog } from '@saurio/runtime/models/index';
+import type { HardwareProfile, ModelCatalogEntry } from '@saurio/runtime/models/index';
 import type { RuntimeHost } from '../host/RuntimeHost.js';
 import { registerHandler } from './registerHandler.js';
 import { toDownloadJob } from '../services/downloads/SqlDownloadsRepository.js';
@@ -22,6 +27,40 @@ function catalogStatus(
   if (installedNames.has(fullName)) return 'installed_untested'; // "probado" solo con model_compat (Benchmark, v0.3)
   return 'not_installed';
 }
+
+/** Compartido por `models:catalog` (solo el curado, 16 entradas) y `models:libraryCatalog` (curado +
+ *  snapshot completo fusionados, cientos de entradas, doc 16 §12.6 punto 1/2) — mismo cálculo de
+ *  estado/nivel para las dos vistas, una sola vez. */
+function buildCatalogItem(
+  entry: ModelCatalogEntry, host: RuntimeHost,
+  installedNames: Set<string>, loadedNames: Set<string>,
+  hardware: HardwareProfile | undefined, freeDiskBytes: number | undefined,
+): CatalogItem {
+  const fullName = `${entry.name}:${entry.tag}`;
+  const downloadingId = host.downloadManager.isDownloading(fullName)
+    ? host.downloadManager.downloadIdFor(fullName)
+    : undefined;
+  const tier: ModelTier | undefined = hardware
+    ? tierForCatalogWeights(entry.sizeBytes, hardware, { freeDiskBytes })
+    : undefined;
+  return {
+    entry,
+    status: catalogStatus(entry, installedNames, loadedNames, downloadingId),
+    downloadId: downloadingId,
+    tier,
+  } satisfies CatalogItem;
+}
+
+/** `hf.co/<usuario>/<repo>:<quant>` (formato vigente, verificado contra la doc oficial de HF para
+ *  Ollama — ver HuggingFaceClient.ts). El repo puede tener `/` en el nombre del usuario/org pero nunca
+ *  en el `:quant` final, así que se corta en los DOS PRIMEROS `/` y en el ÚLTIMO `:`. */
+const HF_REF_RE = /^hf\.co\/([^/]+\/[^:]+):([^:]+)$/;
+
+/** Margen de seguridad antes de considerar "sin espacio" (mismo valor que
+ *  `DownloadManager.DEFAULT_FREE_SPACE_MARGIN_BYTES`, duplicado a propósito: ese valor es privado del
+ *  módulo y esto es solo una previsualización antes de decidir descargar, no la verificación real que
+ *  ya hace `DownloadManager.pull()`/`pullKnownSize()` en el momento de descargar de verdad). */
+const PREVIEW_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024;
 
 export function registerModelsHandlers(host: RuntimeHost): void {
   registerHandler('models:list', ipc['models:list'], async (input) =>
@@ -76,25 +115,114 @@ export function registerModelsHandlers(host: RuntimeHost): void {
   });
 
   // Pestaña "Explorar" (doc 13 §10): catálogo curado + estado derivado contra lo instalado/cargado/
-  // en descarga. No estima VRAM/tok-s acá (eso es models:fits/models:recommend, doc 13 §2).
+  // en descarga, MÁS la escala de seis niveles (punto 3 del encargo "cobertura máxima del catálogo"),
+  // para que la ficha muestre de entrada "¿me conviene este modelo en esta PC?" sin que el usuario
+  // tenga que abrir cada ficha y pedir models:fits una por una. Sigue sin estimar tok/s reales acá
+  // (eso es Benchmark/model_compat, v0.3) — TierClassifier solo decide el nivel 1-6.
   registerHandler('models:catalog', ipc['models:catalog'], async () => {
-    const [installed, loaded] = await Promise.all([
+    const [installed, loaded, hardware, folder] = await Promise.all([
       host.modelManager.listInstalled(),
       host.modelManager.listLoaded().catch(() => []),
+      host.hardwareProbe.sample().catch(() => undefined),
+      host.modelManager.detectedModelsFolder().catch(() => undefined),
     ]);
     const installedNames = new Set(installed.map((m) => m.ref.name));
     const loadedNames = new Set(loaded.map((m) => m.name));
-    return host.modelCatalog.map((entry) => {
-      const fullName = `${entry.name}:${entry.tag}`;
-      const downloadingId = host.downloadManager.isDownloading(fullName)
-        ? host.downloadManager.downloadIdFor(fullName)
-        : undefined;
-      return {
-        entry,
-        status: catalogStatus(entry, installedNames, loadedNames, downloadingId),
-        downloadId: downloadingId,
-      } satisfies CatalogItem;
-    });
+    const freeDiskBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
+    return host.modelCatalog.map((entry) => buildCatalogItem(entry, host, installedNames, loadedNames, hardware, freeDiskBytes));
+  });
+
+  // Punto 1/2 del encargo (doc 16 §12.6): biblioteca COMPLETA de Ollama (curado + snapshot fusionados
+  // por name:tag, cientos de entradas) en vez de solo las 16 del catálogo curado. `forceRefresh` es el
+  // botón "Actualizar catálogo" de la UI; sin él, `OllamaLibraryClient` decide caché/red/empaquetado
+  // según el TTL de 24h (nunca deja el Explorador sin catálogo alguno).
+  registerHandler('models:libraryCatalog', ipc['models:libraryCatalog'], async (input) => {
+    const [{ snapshot, source, cachedAt }, installed, loaded, hardware, folder] = await Promise.all([
+      host.ollamaLibraryClient.getCatalog({ forceRefresh: input.forceRefresh }),
+      host.modelManager.listInstalled(),
+      host.modelManager.listLoaded().catch(() => []),
+      host.hardwareProbe.sample().catch(() => undefined),
+      host.modelManager.detectedModelsFolder().catch(() => undefined),
+    ]);
+    const installedNames = new Set(installed.map((m) => m.ref.name));
+    const loadedNames = new Set(loaded.map((m) => m.name));
+    const freeDiskBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
+    const merged = mergeSnapshotWithCuratedCatalog(snapshot, host.modelCatalog);
+    return {
+      items: merged.map((entry) => buildCatalogItem(entry, host, installedNames, loadedNames, hardware, freeDiskBytes)),
+      source,
+      cachedAt,
+      familyCount: snapshot.familyCount,
+      variantCount: snapshot.variantCount,
+    };
+  });
+
+  // Punto 3 del encargo: búsqueda de modelos GGUF en Hugging Face por texto libre.
+  registerHandler('models:hfSearch', ipc['models:hfSearch'], async (input) =>
+    host.huggingFaceClient.searchModels(input.query));
+
+  // Punto 3 del encargo: archivos .gguf de un repo (tamaño real + cuantización) para elegir con cuál
+  // descargar (`hf.co/<repo>:<quant>`).
+  registerHandler('models:hfFiles', ipc['models:hfFiles'], async (input) =>
+    host.huggingFaceClient.listGgufFiles(input.modelId));
+
+  // Punto 4 del encargo ("Descargar por nombre"): valida el nombre libre contra el registry de Ollama
+  // o contra `hf.co/<usuario>/<repo>:<quant>`, sin descargar nada todavía — la ficha muestra tamaño,
+  // espacio y nivel de la escala ANTES de que el usuario confirme.
+  registerHandler('models:resolveByName', ipc['models:resolveByName'], async (input) => {
+    const name = input.name.trim();
+    if (name.length === 0) throw new Error('escribí un nombre de modelo');
+
+    const [folder, hardware] = await Promise.all([
+      host.modelManager.detectedModelsFolder().catch(() => undefined),
+      host.hardwareProbe.sample().catch(() => undefined),
+    ]);
+    const freeBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
+
+    const hfMatch = HF_REF_RE.exec(name);
+    let sizeBytes: number;
+    let source: ResolveModelByNameResult['source'];
+    if (hfMatch) {
+      const [, repo, quant] = hfMatch as unknown as [string, string, string];
+      const files = await host.huggingFaceClient.listGgufFiles(repo);
+      const match = files.find((f) => f.quant?.toLowerCase() === quant.toLowerCase());
+      if (!match) throw new Error(`no se encontró la cuantización "${quant}" en "${repo}" (revisá el nombre exacto del archivo .gguf)`);
+      if (match.sizeBytes === undefined) throw new Error(`"${repo}:${quant}" no trae tamaño en Hugging Face — no se puede verificar espacio`);
+      sizeBytes = match.sizeBytes;
+      source = 'huggingface';
+    } else {
+      const manifest = await new RegistryClient().fetchManifest(name);
+      const layers = manifest.config ? [...manifest.layers, manifest.config] : manifest.layers;
+      sizeBytes = layers.reduce((sum, layer) => sum + layer.size, 0);
+      source = 'ollama';
+    }
+
+    // Sin dato de espacio medido (`spaceQuality: 'unavailable'`), no se bloquea el botón "Descargar"
+    // con una respuesta que no se puede confirmar (mismo criterio que TierClassifier nivel 6: "si no
+    // hay dato de disco, nunca se fuerza por falta de disco").
+    const spaceOk = freeBytes === undefined || freeBytes >= sizeBytes + PREVIEW_FREE_SPACE_MARGIN_BYTES;
+    const tier = hardware ? tierForCatalogWeights(sizeBytes, hardware, { freeDiskBytes: freeBytes }) : undefined;
+
+    return { fullName: name, source, sizeBytes, freeBytes, spaceOk, tier } satisfies ResolveModelByNameResult;
+  });
+
+  // Punto 3/4 del encargo: descarga de una referencia que no vive en el registry de Ollama (hf.co/...
+  // o cualquier nombre resuelto por `models:resolveByName` como `source: 'huggingface'`) reutilizando
+  // DownloadManager (progreso/cancelación/eventos ya existentes, `pullKnownSize` en vez de `pull`
+  // porque no hay manifest Docker v2 que diffear contra `blobs/`).
+  registerHandler('models:pullExternal', ipc['models:pullExternal'], async (input) =>
+    host.downloadManager.pullKnownSize(input.ref, input.sizeBytes));
+
+  // Selector de contexto 4k/8k/16k/32k de la ficha de Explorar (punto 5 del encargo): recalcula
+  // nivel/memoria para un tamaño de pesos ya conocido (el que ya trae la ficha en pantalla) sin volver
+  // a pedir el catálogo completo — mismo `tierForCatalogWeights`, mismo hardware muestreado.
+  registerHandler('models:tierForSize', ipc['models:tierForSize'], async (input) => {
+    const [hardware, folder] = await Promise.all([
+      host.hardwareProbe.sample(),
+      host.modelManager.detectedModelsFolder().catch(() => undefined),
+    ]);
+    const freeDiskBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
+    return tierForCatalogWeights(input.sizeBytes, hardware, { freeDiskBytes, numCtx: input.numCtx });
   });
 
   // Pestaña "Recomendaciones" (doc 13 §8, v0.3): hardware actual (HardwareProbe, mismo que

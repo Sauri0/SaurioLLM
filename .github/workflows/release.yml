@@ -6,12 +6,21 @@
 # El instalador que sube este workflow NO está firmado digitalmente (no hay certificado de firma de
 # código): quien lo baje de Releases va a ver el aviso de Windows SmartScreen documentado en
 # docs/INSTALAR.md. Es esperable para un proyecto sin ese certificado (pago), no un error del workflow.
+#
+# Auto-actualización (apps/desktop/src/main/services/updater/**): además del instalador, este workflow
+# tiene que subir `latest.yml` y el `.blockmap` — son los dos archivos que electron-updater necesita
+# para detectar y verificar la próxima versión. `electron-builder.yml` (nsis.artifactName) fija un
+# nombre de instalador SIN espacios («SaurioLLM-Setup-${version}.exe»): con espacios, GitHub reescribe
+# el nombre del asset a puntos al subirlo (comprobado en el asset real de v0.1.0,
+# "SaurioLLM Setup 0.1.0.exe" quedó como "SaurioLLM.Setup.0.1.0.exe"), pero `latest.yml` seguiría
+# apuntando al nombre con espacios — electron-updater arma la URL de descarga concatenando ese `path`
+# tal cual, así que ese desajuste da 404 al bajar la actualización.
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  # Manual por ahora: los releases se publican a mano con gh (scripts/release-local.mjs)
+  # para que instalador, .blockmap y latest.yml salgan del mismo build verificado.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -51,12 +60,13 @@ jobs:
       - name: Empaquetar (carpeta desempaquetada + instalador NSIS x64)
         run: pnpm --filter @saurio/desktop run build:installer
 
-      - name: Subir instalador al Release del tag
+      - name: Subir instalador + latest.yml + blockmap al Release del tag
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            apps/desktop/release/SaurioLLM Setup *.exe
-            apps/desktop/release/SaurioLLM Setup *.exe.blockmap
+            apps/desktop/release/SaurioLLM-Setup-*.exe
+            apps/desktop/release/SaurioLLM-Setup-*.exe.blockmap
+            apps/desktop/release/latest.yml
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -46,6 +46,21 @@ function denseDescription(sizeBytes: number): ModelDescription {
   };
 }
 
+function visionDescription(sizeBytes: number): ModelDescription {
+  return { ...denseDescription(sizeBytes), capabilities: { tools: true, thinking: true, vision: true, embedding: false } };
+}
+
+function integratedGpuHardware(vramTotalGiB: number, vramAvailableGiB: number): HardwareProfile {
+  return {
+    ...hardware(vramTotalGiB, vramTotalGiB - vramAvailableGiB),
+    gpu: {
+      vendor: 'intel', integrated: true,
+      vramTotalBytes: { value: vramTotalGiB * GIB, quality: 'measured', source: 'ollama:inference-compute', sampledAt: 1 },
+      vramUsedBytes: { value: (vramTotalGiB - vramAvailableGiB) * GIB, quality: 'measured', source: 'ollama:inference-compute', sampledAt: 1 },
+    },
+  };
+}
+
 function hybridDescription(sizeBytes: number): ModelDescription {
   return {
     ...denseDescription(sizeBytes),
@@ -114,6 +129,30 @@ describe('MemoryEstimator', () => {
     const withDefault = await new MemoryEstimator(describer).fits(ref, 2048, hardware(24));
     const withCalibration = await new MemoryEstimator(describer, calibrator).fits(ref, 2048, hardware(24));
     expect(withCalibration.vramNeededBytes).toBeGreaterThan(withDefault.vramNeededBytes);
+  });
+
+  it('modelos con visión piden más VRAM que uno de texto del mismo tamaño (margen del proyector)', async () => {
+    const textDescriber: ModelDescriber = { describeModel: async () => denseDescription(10 * GIB) };
+    const visionDescriber: ModelDescriber = { describeModel: async () => visionDescription(10 * GIB) };
+    const textEstimate = await new MemoryEstimator(textDescriber).fits(ref, 8192, hardware(24));
+    const visionEstimate = await new MemoryEstimator(visionDescriber).fits(ref, 8192, hardware(24));
+    expect(visionEstimate.vramNeededBytes).toBeGreaterThan(textEstimate.vramNeededBytes);
+  });
+
+  it('caso real equipo #2: gemma4:26b (pesos+proyector ≈ 16.9 GB) NO entra en 18 GiB de iGPU (available 17.2 GiB)', async () => {
+    // Q4, 15.77 GiB de pesos + ~1.1 GiB de proyector ya sumados en sizeBytes (tamaño total instalado).
+    const describer: ModelDescriber = { describeModel: async () => visionDescription(Math.round((15.77 + 1.1) * GIB)) };
+    const estimator = new MemoryEstimator(describer);
+    const estimate = await estimator.fits(ref, 8192, integratedGpuHardware(18.0, 17.2));
+    expect(estimate.fitClass).not.toBe('fits_gpu');
+  });
+
+  it('iGPU/memoria unificada: el margen de seguridad efectivo es mayor que en una GPU dedicada equivalente', async () => {
+    const describer: ModelDescriber = { describeModel: async () => denseDescription(5 * GIB) };
+    const estimator = new MemoryEstimator(describer);
+    const dedicated = await estimator.fits(ref, 8192, hardware(18, 0.8));
+    const integrated = await estimator.fits(ref, 8192, integratedGpuHardware(18.0, 17.2));
+    expect(integrated.vramAvailableBytes).toBeLessThan(dedicated.vramAvailableBytes);
   });
 
   it('sin GPU (vramTotal 0): vramAvailable es 0 y modelos con peso > 0 son no_fit', async () => {

@@ -19,9 +19,16 @@ export interface HardwareProfile {
   cpu: { name: HardwareDatum<string>; threads: HardwareDatum<number>; physicalCores?: HardwareDatum<number> };
   ram: { totalBytes: HardwareDatum<number>; freeBytes: HardwareDatum<number> };
   gpu?: {
-    vendor: 'nvidia' | 'amd' | 'apple' | 'other';
+    vendor: 'nvidia' | 'amd' | 'intel' | 'apple' | 'other';
     vramTotalBytes: HardwareDatum<number>; vramUsedBytes?: HardwareDatum<number>;
     utilizationPct?: HardwareDatum<number>; temperatureC?: HardwareDatum<number>; powerW?: HardwareDatum<number>;
+    /** `true` para iGPU/memoria unificada (Intel Arc iGPU, Apple Silicon, APU de AMD): la VRAM
+     *  reportada es un techo compartido con la RAM del sistema, no memoria dedicada — la escala de
+     *  seis niveles (`TierClassifier`) y `MemoryEstimator` lo usan para ser más conservadores (margen
+     *  mayor, ancho de banda menor) en vez de tratarlo como una GPU dedicada. Sesión de hardware real
+     *  (equipo #2, Intel Core Ultra 9 288V + Arc 140V): Ollama reporta `type=iGPU`, total 18.0 GiB
+     *  sobre 32 GB de RAM total (`[COMPROBADO EN EQUIPO]`, ver `parseOllamaInferenceComputeLog`). */
+    integrated?: boolean;
   };
   fingerprint: string;      // hash(gpu_uuid, vram_total, cpu_model, ram_total); invalida ModelCompat si cambia
   sampledAt: number;
@@ -145,6 +152,11 @@ export interface DownloadManagerOptions {
 export interface ModelCatalogEntry {                     // resources/model-catalog.json, v0.2
   name: string; tag: string; sizeBytes: number; capabilities: ModelInfo['capabilities'];
   contextMax: number; suggestedUse: ('coding' | 'chat' | 'analysis' | 'vision')[]; notes?: string;
+  // Campo aditivo (ya existía en el zod schema de ./catalog.ts y en packages/shared/src/domain.ts,
+  // faltaba acá): cuantización curada a mano ("Q4_K_M", etc.) — doc 13 §3, esquema por entrada del
+  // catálogo curado. `loadModelCatalog` ya lo devolvía en la práctica (zod-inferido), esta interfaz
+  // solo estaba desactualizada respecto de su propio schema.
+  quantization?: string;
 }
 
 /** Salida del RecommendationEngine (v0.3); función pura sobre inventario x catálogo x ModelCompat.

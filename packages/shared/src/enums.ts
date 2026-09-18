@@ -20,6 +20,7 @@ export const PermissionCategory = z.enum([
   'read', 'write', 'delete', 'terminal', 'git_commit', 'git_push',
   'network',   // v0.3
   'mcp',       // v0.3
+  'delegate',  // E3a (doc 19 §2): tool_calls.category ya admite este valor desde la migración 0001.
 ]);
 export type PermissionCategory = z.infer<typeof PermissionCategory>;
 
@@ -53,3 +54,31 @@ export type MatchLevel = z.infer<typeof MatchLevel>;
 /** Toda cifra que ve el usuario declara su procedencia (regla 6 de la columna). */
 export const Quality = z.enum(['measured', 'estimated', 'unavailable']);
 export type Quality = z.infer<typeof Quality>;
+
+// ── Doc 19 §1.2 (E2a "Mis agentes") ──────────────────────────────────────────
+// `owner_kind` discrimina configuraciones de ejecución (`builtin`) de identidades de usuario
+// (`personal`) y de las dos mecánicas de ejecución que reusan la misma fila por costo de FK
+// (`worker`: subagente efímero de delegación, E3a; `coordinator`: fila casi vacía que solo satisface
+// `chats.agent_id` en un chat de equipo, E3b) — doc 19 §0. `worker`/`coordinator` nunca se exponen en
+// la UI de "Mis agentes" (siempre filtrados por `AgentRepository.listProfiles`).
+export const AgentOwnerKind = z.enum(['builtin', 'personal', 'worker', 'coordinator']);
+export type AgentOwnerKind = z.infer<typeof AgentOwnerKind>;
+
+/** `fixed`: el agente usa siempre `AgentProfile.model`. `auto`: `agent/modelPolicy.ts` elige en
+ *  tiempo de ejecución (doc 19 §1.5) — heurística mínima, ver comentario de ese archivo. */
+export const ModelMode = z.enum(['fixed', 'auto']);
+export type ModelMode = z.infer<typeof ModelMode>;
+
+/** Procedencia de una fila de `agent_memories` (doc 19 §1.1/§1.7): nunca se muestra como hecho
+ *  plano en el prompt ensamblado, siempre con esta etiqueta visible. */
+export const MemorySourceKind = z.enum(['user_stated', 'inferred', 'file_derived']);
+export type MemorySourceKind = z.infer<typeof MemorySourceKind>;
+
+export const MemoryConfidence = z.enum(['confirmed', 'hypothesis']);
+export type MemoryConfidence = z.infer<typeof MemoryConfidence>;
+
+/** Mismos tres valores que `PermissionPolicy.preset` (packages/runtime/src/permissions/types.ts,
+ *  unión TS literal, sin zod porque no cruzaba IPC hasta esta tarea) — acá se necesita un schema zod
+ *  porque `AgentProfileSchema`/`AgentCreateInputSchema` sí cruzan `agents:*` (doc 19 §1.4). */
+export const PermissionPreset = z.enum(['strict', 'balanced', 'trusting']);
+export type PermissionPreset = z.infer<typeof PermissionPreset>;
