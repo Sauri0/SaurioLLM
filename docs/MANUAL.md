@@ -241,7 +241,7 @@ límite o servicio ocupado. Los reintentos automáticos son acotados y el últim
 El instalador y sus archivos de actualización tienen integridad verificada. El tamaño y SHA-256
 están publicados en [el seguimiento del proyecto](../PROYECTO.md).
 
-El gate de fuente está aprobado: **1.356 pruebas aprobadas y 5 omitidas**, typecheck y lint limpios, y
+El gate de fuente está aprobado: **1.359 pruebas aprobadas y 5 omitidas**, typecheck y lint limpios, y
 evaluación real **20/20 en 250,1 s** con lecturas y tareas en modo Plan, edición semántica,
 checkpoint, diff, reversión, permisos y delegación. La matriz local/API y modelo retirado pasó sobre
 el paquete final: error visible sin fallback. La preparación de esa prueba registra consentimiento
@@ -250,3 +250,7 @@ explícito por IPC; no automatiza el clic en la confirmación nativa de nube.
 La validación externa en Windows limpio y una notebook con gráficos integrados se realizará como
 trabajo de v0.2.4. La prueba real con lector de pantalla sigue pendiente, sin versión asignada. No se
 afirma compatibilidad universal a partir de las pruebas del equipo de desarrollo.
+
+Alcance de la corrección final: la suite de 1.359 pruebas incluye recomendaciones sin motor. La evaluación real 20/20 y los smokes de API, permisos, migración y zoom corresponden al corte anterior, cuyos módulos no cambiaron. Persistencia/reinicio se verificaron nuevamente sobre el instalador corregido.
+
+Recorrido UI completo repetido sobre el instalador corregido: 12 pantallas, recomendaciones con motor apagado, chat del Director y colaboradores persistidos, borrador conservado ante error y cero excepciones del renderer.

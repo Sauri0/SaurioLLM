@@ -8,6 +8,11 @@ import type {
 } from './types.js';
 
 const SAFETY_MARGIN_BYTES = 512 * 1024 * 1024;
+const ENRICHMENT_UNAVAILABLE = Symbol.for('saurio.recommendation-enrichment-unavailable');
+
+function isEnrichmentUnavailable(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && Reflect.get(error, ENRICHMENT_UNAVAILABLE) === true;
+}
 
 /** Sin instalar el modelo no hay `model_info` para la fórmula de MemoryEstimator. Este proxy escala
  * el margen con el contexto máximo anunciado y siempre se expone como `estimated`; para instalados
@@ -32,6 +37,17 @@ export interface InstalledFitLookup {
     fitQuality: 'measured' | 'estimated';
     contextUsed: number;
   } | undefined>;
+}
+
+/** Señala que el enriquecimiento con el inventario local no está disponible en este momento.
+ * El adaptador concreto debe convertir únicamente fallos esperables del proveedor a este error;
+ * los errores de datos o programación siguen propagándose. */
+export class RecommendationEnrichmentUnavailableError extends Error {
+  constructor(cause?: unknown) {
+    super('El inventario local no está disponible para enriquecer recomendaciones.', { cause });
+    this.name = 'RecommendationEnrichmentUnavailableError';
+    Object.defineProperty(this, ENRICHMENT_UNAVAILABLE, { value: true });
+  }
 }
 
 export class RecommendationEngine implements RecommendationEngineContract {
@@ -66,16 +82,17 @@ export class RecommendationEngine implements RecommendationEngineContract {
     });
 
     const results: Recommendation[] = [];
-    let installedFitAvailable = true;
+    let enrichmentAvailable = true;
     for (const entry of filtered) {
       let installedAssessment: Awaited<ReturnType<InstalledFitLookup['fitClassFor']>>;
-      if (installedFitAvailable) {
+      if (enrichmentAvailable) {
         try {
           installedAssessment = await this.installedFit?.fitClassFor(entry, entry.contextMax, hardware.fingerprint);
-        } catch {
+        } catch (error) {
+          if (!isEnrichmentUnavailable(error)) throw error;
           // Un motor apagado no impide recomendar la primera descarga. Evita además repetir el
-          // mismo timeout por cada entrada; esta consulta conserva estimaciones explícitas.
-          installedFitAvailable = false;
+          // mismo timeout en los otros enriquecimientos y conserva estimaciones explícitas.
+          enrichmentAvailable = false;
         }
       }
       const fitClass = installedAssessment?.fitClass
@@ -86,9 +103,15 @@ export class RecommendationEngine implements RecommendationEngineContract {
       const speedHint: Recommendation['speedHint'] =
         fitClass === 'fits_gpu' ? 'fast' : fitClass === 'tight' ? 'medium' : 'slow';
 
-      const testedRow = this.tested && hardware.fingerprint
-        ? await this.tested.lookup(entry, hardware.fingerprint)
-        : undefined;
+      let testedRow: Awaited<ReturnType<TestedLookup['lookup']>>;
+      if (enrichmentAvailable && this.tested && hardware.fingerprint) {
+        try {
+          testedRow = await this.tested.lookup(entry, hardware.fingerprint);
+        } catch (error) {
+          if (!isEnrichmentUnavailable(error)) throw error;
+          enrichmentAvailable = false;
+        }
+      }
 
       results.push({
         catalogEntry: entry,

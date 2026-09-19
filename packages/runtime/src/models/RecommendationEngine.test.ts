@@ -1,6 +1,6 @@
 // Tests de RecommendationEngine — packages/runtime/src/models/RecommendationEngine.test.ts.
 import { describe, expect, it } from 'vitest';
-import { RecommendationEngine } from './RecommendationEngine.js';
+import { RecommendationEngine, RecommendationEnrichmentUnavailableError } from './RecommendationEngine.js';
 import type { HardwareProfile, ModelCatalogEntry } from './types.js';
 
 const GIB = 1024 * 1024 * 1024;
@@ -29,15 +29,46 @@ function entry(overrides: Partial<ModelCatalogEntry>): ModelCatalogEntry {
 }
 
 describe('RecommendationEngine', () => {
-  it('recomienda con estimaciones si el motor está apagado, sin repetir su error por cada modelo', async () => {
+  it('recomienda con estimaciones si el enriquecimiento está offline, sin repetir el sondeo', async () => {
     let probes = 0;
     const engine = new RecommendationEngine([
       entry({ name: 'small', sizeBytes: GIB }), entry({ name: 'other', sizeBytes: 2 * GIB }),
-    ], undefined, { fitClassFor: async () => { probes++; throw new Error('motor apagado'); } });
+    ], undefined, {
+      fitClassFor: async () => {
+        probes++;
+        throw new RecommendationEnrichmentUnavailableError(new Error('motor apagado'));
+      },
+    });
     const results = await engine.recommend(hw(8), 'coding', 'quality');
     expect(probes).toBe(1);
     expect(results).toHaveLength(2);
     expect(results.every((result) => result.fitQuality === 'estimated' && result.contextUsed === 40960)).toBe(true);
+  });
+
+  it('mantiene las recomendaciones curadas si falla el lookup tested opcional', async () => {
+    let probes = 0;
+    const engine = new RecommendationEngine([
+      entry({ name: 'small', sizeBytes: GIB }), entry({ name: 'other', sizeBytes: 2 * GIB }),
+    ], {
+      lookup: async () => {
+        probes++;
+        throw new RecommendationEnrichmentUnavailableError(new Error('Ollama offline'));
+      },
+    });
+
+    const results = await engine.recommend(hw(8), 'coding', 'speed');
+
+    expect(probes).toBe(1);
+    expect(results.map((result) => result.catalogEntry.name)).toEqual(['small', 'other']);
+    expect(results.every((result) => result.fitQuality === 'estimated' && result.tested === undefined)).toBe(true);
+  });
+
+  it('no oculta errores generales del lookup opcional', async () => {
+    const engine = new RecommendationEngine([entry({})], undefined, {
+      fitClassFor: async () => { throw new Error('inventario corrupto'); },
+    });
+
+    await expect(engine.recommend(hw(8), 'coding', 'quality')).rejects.toThrow('inventario corrupto');
   });
 
   it('no anuncia tight en una GPU integrada si excede la RAM compartida disponible', async () => {

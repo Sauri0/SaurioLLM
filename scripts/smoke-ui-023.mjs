@@ -106,6 +106,9 @@ try {
   await clickText('Crear equipo base');
   const agents = await cdp.invoke('agents:list', {});
   for (const name of ['Director', 'Programador', 'Tester', 'Revisor']) if (!agents.some((agent) => agent.name === name)) throw new Error(`Missing team agent ${name}`);
+  // La captura pública debe mostrar los cuatro perfiles creados por el recorrido real, no el
+  // estado vacío previo al botón "Crear equipo base".
+  states.agents = await capture('agents');
   await click('input[aria-label="Buscar agente"]');
   await cdp.call('Input.insertText', { text: 'Director' });
   await delay(150);
@@ -130,15 +133,26 @@ try {
   }
   states.agentEditor = await capture('agent-editor');
   await clickText('Cancelar', '[role="dialog"] button');
-  await clickText('Abrir chat', 'button');
+  const directorOpen = await cdp.evaluate(`(() => {
+    const row = [...document.querySelectorAll('.agents-panel__row')].find((candidate) => candidate.textContent.includes('Director'));
+    const button = [...(row?.querySelectorAll('button') ?? [])].find((candidate) => candidate.textContent.trim() === 'Abrir chat');
+    if (!button) throw new Error('Missing Director open-chat control');
+    button.setAttribute('data-smoke-director-open', 'true');
+    return true;
+  })()`);
+  if (!directorOpen) throw new Error('Director open-chat control unavailable');
+  await click('[data-smoke-director-open]');
+  await cdp.evaluate(`document.querySelector('[data-smoke-director-open]')?.removeAttribute('data-smoke-director-open')`);
   states.team = await capture('team');
   const director = agents.find(agent => agent.name === 'Director');
   const tester = agents.find(agent => agent.name === 'Tester');
   const managed = projects.find(item => item.name === 'Proyecto desde interfaz');
-  const teamChat = await cdp.invoke('chat:create', { projectId: managed.id, agentId: director.id, mode: 'agent', modelRef: { providerId: 'ollama', name: 'qwen3:8b', locality: 'local' } });
-  await cdp.invoke('chat:rename', { chatId: teamChat.id, title: 'Equipo de prueba visual' });
-  await click('nav button[title^="Chats ("]');
-  await clickText('Equipo de prueba visual', '.saurio-sidebar-item');
+  // "Abrir chat" usa chatStore y ya dejó el chat en la vista. Crear otro por IPC después de
+  // eso persiste una fila fuera de la store del renderer y convierte este smoke en una prueba
+  // de sincronización accidental, no del recorrido de interfaz.
+  const teamChat = (await cdp.invoke('chat:list', { projectId: managed.id })).find((item) => item.agentId === director?.id && !item.archived);
+  if (!teamChat) throw new Error('Abrir chat no creó el chat del Director');
+  if (!await cdp.evaluate(`Boolean(document.querySelector('.chat-collaborators'))`)) throw new Error('Abrir chat no dejó visible el panel del chat');
   await click('.chat-collaborators summary');
   const testerIndex = await cdp.evaluate(`(() => { const labels=[...document.querySelectorAll('.chat-collaborators label')]; const label=labels.find(e=>e.textContent.includes('Tester'));if(!label)throw new Error('Missing Tester checkbox');label.querySelector('input').setAttribute('data-smoke-tester','true');return true;})()`);
   if (!testerIndex) throw new Error('Tester unavailable');
@@ -151,7 +165,7 @@ try {
   await click('.chat-input__send');
   const retainedDraft = await cdp.evaluate(`document.querySelector('textarea[aria-label="Mensaje para el agente"]')?.value`);
   if (retainedDraft !== 'Este borrador debe conservarse si no hay modelo.') throw new Error('Failed send discarded the draft');
-  if (!await cdp.evaluate(`document.querySelector('.chat-input [role="alert"]')?.textContent?.includes('ya no está instalado')`)) throw new Error('Failed send did not display an actionable error');
+  if (!await cdp.evaluate(`document.querySelector('.chat-input [role="alert"]')?.textContent?.includes('modo automático no encontró un modelo local')`)) throw new Error('Failed send did not display the automatic-model availability error');
   states.failedSend = await capture('failed-send');
   await click('nav button[title^="Ajustes ("]');
   await clickText('Motor y recursos', '.saurio-settings-nav button');

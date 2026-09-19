@@ -409,13 +409,30 @@ export function createGlobalRuntime(
   if (!catalogJson) {
     console.warn('[createRuntime] no se pudo leer resources/model-catalog.json; catálogo vacío (ver services/resources.ts)');
   }
+  function isOllamaHttpError(error: unknown): error is Error & { code: string; status: number } {
+    if (!(error instanceof Error) || error.name !== 'OllamaHttpError') return false;
+    const candidate = error as Error & { code?: unknown; status?: unknown };
+    return typeof candidate.code === 'string' && typeof candidate.status === 'number';
+  }
+  async function optionalOllamaEnrichment<T>(read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (error) {
+      if (isOllamaHttpError(error)) {
+        const unavailable = new Error('El inventario local no está disponible para enriquecer recomendaciones.', { cause: error });
+        Object.defineProperty(unavailable, Symbol.for('saurio.recommendation-enrichment-unavailable'), { value: true });
+        throw unavailable;
+      }
+      throw error;
+    }
+  }
   async function compatibilityFor(entry: ModelCatalogEntry, hardwareFingerprint: string) {
     if (!hardwareFingerprint) return undefined;
     const expectedName = `${entry.name}:${entry.tag}`;
-    const installed = (await modelManager.listInstalled()).find((model) =>
+    const installed = (await optionalOllamaEnrichment(() => modelManager.listInstalled())).find((model) =>
       model.ref.locality === 'local' && model.ref.name === expectedName && model.digest);
     if (!installed?.digest) return undefined;
-    const description = await modelManager.describeModel(installed.ref);
+    const description = await optionalOllamaEnrichment(() => modelManager.describeModel(installed.ref));
     const contextUsed = description.contextMax;
     if (!contextUsed || contextUsed <= 0) return undefined;
     const evidence = await persistence.repositories.modelCompat.latest({
@@ -441,13 +458,13 @@ export function createGlobalRuntime(
         if (fitClass) return { fitClass, fitQuality: 'measured' as const, contextUsed: resolved.contextUsed };
       }
       const expectedName = `${entry.name}:${entry.tag}`;
-      const installed = (await modelManager.listInstalled()).find((model) =>
+      const installed = (await optionalOllamaEnrichment(() => modelManager.listInstalled())).find((model) =>
         model.ref.locality === 'local' && model.ref.name === expectedName);
       if (!installed) return undefined;
-      const description = await modelManager.describeModel(installed.ref);
+      const description = await optionalOllamaEnrichment(() => modelManager.describeModel(installed.ref));
       const contextUsed = description.contextMax;
       if (!contextUsed || contextUsed <= 0) return undefined;
-      const estimate = await modelManager.fits(installed.ref, contextUsed);
+      const estimate = await optionalOllamaEnrichment(() => modelManager.fits(installed.ref, contextUsed));
       return { fitClass: estimate.fitClass, fitQuality: 'estimated', contextUsed };
     },
   });

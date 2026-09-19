@@ -98,7 +98,7 @@ La versión integra las siguientes áreas:
 Las verificaciones se ejecutaron con perfiles aislados y actualizaciones deshabilitadas.
 La evidencia disponible incluye:
 
-- suite automática final de fuente con **1.356 pruebas aprobadas y 5 omitidas**; typecheck y lint
+- suite automática final de fuente con **1.359 pruebas aprobadas y 5 omitidas**; typecheck y lint
   aprobados;
 - evaluación real **20/20 en 250,1 s**: modo Plan inspeccionó fuentes y guardó tareas; la edición
   cumplió el criterio semántico y verificó checkpoint, diff y reversión; permisos y delegación
@@ -144,8 +144,8 @@ se presenta como aprobado ni se promete compatibilidad universal.
 |---|---|
 | Versión | v0.2.3 |
 | Publicación | [Release v0.2.3](https://github.com/Sauri0/SaurioLLM/releases/tag/v0.2.3) |
-| Instalador | SaurioLLM-Setup-0.2.3.exe — 132.225.343 bytes |
-| SHA-256 | b6d9906faa0fe8282e587c09b918a266b30bd396d7f295efa0de831c4031d35d |
+| Instalador | SaurioLLM-Setup-0.2.3.exe — 132.224.974 bytes |
+| SHA-256 | a7240f826b4fcb73db743b78a930858e76950c0cc7399bb1a04017b8aa0241cc |
 | Firma | No firmado |
 | Versión publicada anterior | v0.2.2 |
 
@@ -158,3 +158,13 @@ se presenta como aprobado ni se promete compatibilidad universal.
 
 Las notas internas de investigación, perfiles de prueba y registros de aceptación no forman parte del
 árbol público.
+
+## Corrección del candidato inicial
+
+Se corrigieron las recomendaciones por rol cuando el motor local está apagado: usan estimaciones del catálogo y omiten el enriquecimiento que requiere Ollama, sin ocultar errores de programación ni presentar compatibilidad medida. Si instalaste el primer candidato de v0.2.3, descargá y reinstalá el instalador vigente: compartir número de versión no activa una actualización automática.
+
+Alcance de la corrección final: la suite de 1.359 pruebas incluye recomendaciones sin motor. La evaluación real 20/20 y los smokes de API, permisos, migración y zoom corresponden al corte anterior, cuyos módulos no cambiaron. Persistencia/reinicio se verificaron nuevamente sobre el instalador corregido.
+
+Recorrido UI completo repetido sobre el instalador corregido: 12 pantallas, recomendaciones con motor apagado, chat del Director y colaboradores persistidos, borrador conservado ante error y cero excepciones del renderer.
+
+Matriz local/API repetida y aprobada sobre el instalador corregido: selección y persistencia, respuestas sintéticas, retiro de modelo con error 404 visible y cero fallback o llamadas externas. Se mantiene la limitación del consentimiento preparado por IPC.

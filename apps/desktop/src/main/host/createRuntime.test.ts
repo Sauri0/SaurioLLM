@@ -72,6 +72,30 @@ describe('createRuntime (integración)', () => {
     expect(runtime.gateway.status().slots).toHaveLength(1);
   });
 
+  it('recomienda el catálogo curado con estimaciones cuando el inventario de Ollama está offline', async () => {
+    const offline = Object.assign(new Error('fetch failed'), {
+      name: 'OllamaHttpError', status: 0, code: 'connection_refused',
+    });
+    const listInstalled = vi.spyOn(runtime.modelManager, 'listInstalled').mockRejectedValue(offline);
+    const hardware = {
+      cpu: {
+        name: { value: 'fixture', quality: 'measured' as const, source: 'os', sampledAt: 0 },
+        threads: { value: 8, quality: 'measured' as const, source: 'os', sampledAt: 0 },
+      },
+      ram: {
+        totalBytes: { value: 32 * 1024 ** 3, quality: 'measured' as const, source: 'os', sampledAt: 0 },
+        freeBytes: { value: 16 * 1024 ** 3, quality: 'measured' as const, source: 'os', sampledAt: 0 },
+      },
+      fingerprint: 'offline-fixture', sampledAt: 0,
+    };
+
+    const recommendations = await runtime.recommendationEngine.recommend(hardware, 'coding', 'quality');
+
+    expect(recommendations.length).toBeGreaterThan(0);
+    expect(recommendations.every((item) => item.fitQuality === 'estimated' && item.tested === undefined)).toBe(true);
+    expect(listInstalled).toHaveBeenCalledTimes(1);
+  });
+
   it('aplica models.localOnly en la frontera del gateway sin llamar al provider configurado', async () => {
     let providerCalls = 0;
     const cloudProvider: Provider = {

@@ -6,7 +6,7 @@ un chat, usando un modelo local preparado por SaurioLLM o una instalación exist
 [Ollama](https://ollama.com/) (gratis y privado), o un proveedor por API (OpenAI-compatible o Anthropic)
 si preferís no correr modelos en tu máquina.
 
-![Chat con tool calls, checkpoint y checklist de tareas](docs/capturas/01-chat-overview.png)
+![Equipo de agentes de SaurioLLM v0.2.3](docs/capturas/11-agentes-023.png)
 
 ## ¿Ya tenés el instalador o querés bajarlo?
 
@@ -33,13 +33,7 @@ Más detalle de requisitos, espacio en disco e instalación paso a paso en
 
 ## Capturas
 
-| | |
-|---|---|
-| ![Tarjeta de permiso pendiente](docs/capturas/02-permiso.png) | ![Centro de modelos](docs/capturas/04-modelos.png) |
-| Permisos: la app pide confirmación antes de acciones sensibles | Centro de modelos: instalados, explorar catálogo y descargas |
-
-Más capturas (estado vacío, panel de rendimiento, asistente de primer arranque) en
-[`docs/MANUAL.md`](docs/MANUAL.md#8-capturas).
+La captura superior muestra el equipo base creado en v0.2.3. Las capturas de versiones anteriores se conservan en [`docs/capturas/`](docs/capturas/) como referencia histórica; consultá el [manual vigente](docs/MANUAL.md) para los recorridos actuales.
 
 ---
 

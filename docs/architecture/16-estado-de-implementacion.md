@@ -87,7 +87,7 @@ instalador se completará después del build final.
 
 Los cortes integrados recientes cuentan con:
 
-- suite automática de fuente con **1.356 pruebas aprobadas y 5 omitidas**; typecheck y lint aprobados;
+- suite automática de fuente con **1.359 pruebas aprobadas y 5 omitidas**; typecheck y lint aprobados;
 - evaluación real **20/20 en 250,1 s**: Plan leyó fuentes y guardó tareas; la edición cumplió el
   criterio semántico y verificó checkpoint, diff y reversión; permisos y delegación completaron sus
   criterios;
@@ -175,9 +175,13 @@ implementación ni de los gates de v0.2.3.
 |---|---|
 | Versión | v0.2.3 |
 | Distribución | [Release](https://github.com/Sauri0/SaurioLLM/releases/tag/v0.2.3) |
-| Build final | Verificado — 132.225.343 bytes |
-| SHA-256 | b6d9906faa0fe8282e587c09b918a266b30bd396d7f295efa0de831c4031d35d |
+| Build final | Verificado — 132.224.974 bytes |
+| SHA-256 | a7240f826b4fcb73db743b78a930858e76950c0cc7399bb1a04017b8aa0241cc |
 | Firma | No firmado |
 
 Este resumen no incluye rutas locales, identificadores de procesos, inventario de hardware ni nombres
 de logs del entorno de desarrollo.
+
+Alcance de la corrección final: la suite de 1.359 pruebas incluye recomendaciones sin motor. La evaluación real 20/20 y los smokes de API, permisos, migración y zoom corresponden al corte anterior, cuyos módulos no cambiaron. Persistencia/reinicio se verificaron nuevamente sobre el instalador corregido.
+
+Recorrido UI completo repetido sobre el instalador corregido: 12 pantallas, recomendaciones con motor apagado, chat del Director y colaboradores persistidos, borrador conservado ante error y cero excepciones del renderer.
