@@ -458,6 +458,17 @@ export const ModelCatalogEntrySchema = z.object({
   quantization: z.string().optional(),
   suggestedUse: z.array(z.enum(['coding', 'chat', 'analysis', 'vision'])),
   notes: z.string().optional(),
+  /** Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar"): variante de
+   *  NUBE de Ollama (tag terminado en "-cloud", o alias "cloud" — corre en los servidores de Ollama,
+   *  nunca en la PC del usuario). `sizeBytes` en estas entradas es siempre 0 (no ocupa disco local);
+   *  la UI las muestra aparte con insignia NUBE, ocultas por defecto, y nunca ofrece "Descargar". */
+  cloud: z.boolean().optional(),
+  /** Variante LOCAL cuyo tamaño no se pudo confirmar por parseo del HTML de ollama.com/library
+   *  (formato de la página cambió, o la fila no trae el dato) — antes se descartaba en silencio y
+   *  desaparecía del catálogo sin explicación; ahora se muestra igual (con `sizeBytes: 0` de
+   *  placeholder) y la ficha la resuelve contra el registry de Ollama al abrirla
+   *  (`models:resolveByName`), quedando descargable. */
+  sizeUnresolved: z.boolean().optional(),
 });
 export type ModelCatalogEntry = z.infer<typeof ModelCatalogEntrySchema>;
 
@@ -537,6 +548,14 @@ export const LibraryCatalogResultSchema = z.object({
   items: z.array(CatalogItemSchema),
   source: LibraryCatalogSourceSchema,
   cachedAt: z.number().optional(),
+  // Fecha de generación del snapshot devuelto (ISO), presente para las tres fuentes (incluida
+  // 'bundled', que no tiene `cachedAt` porque nunca se cacheó en userData) — la UI la usa para
+  // "Catálogo del <fecha>" sin importar de dónde salió.
+  generatedAt: z.string().optional(),
+  // Stale-while-revalidate (doc 16 §16.5): `true` cuando lo devuelto es caché vencida o el snapshot
+  // empaquetado y YA se disparó una sincronización real en segundo plano contra ollama.com/library —
+  // la UI muestra "actualizando…" y espera el evento `models:libraryUpdated` para refrescarse sola.
+  syncing: z.boolean().optional(),
   familyCount: z.number(),
   variantCount: z.number(),
 });

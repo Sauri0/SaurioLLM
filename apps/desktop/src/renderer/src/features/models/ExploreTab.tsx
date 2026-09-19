@@ -5,7 +5,7 @@
 // apps/desktop/src/renderer/src/features/models/ExploreTab.tsx.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type {
-  CatalogItem, DownloadJob, HuggingFaceGgufFile, HuggingFaceSearchResult, LibraryCatalogSource,
+  CatalogItem, DownloadJob, HuggingFaceGgufFile, HuggingFaceSearchResult, LibraryCatalogResult, LibraryCatalogSource,
   ModelRef, ModelTier, ResolveModelByNameResult,
 } from '@saurio/shared';
 import { invoke, onEvent } from '../../ipc/client.js';
@@ -77,6 +77,15 @@ export function ExploreTab(): React.JSX.Element {
   const [items, setItems] = useState<CatalogItem[]>([]);
   const [librarySource, setLibrarySource] = useState<LibraryCatalogSource | null>(null);
   const [cachedAt, setCachedAt] = useState<number | undefined>(undefined);
+  // Stale-while-revalidate (doc 16 §16.5): `generatedAt` es la fecha del snapshot devuelto (la hay
+  // para las tres fuentes, incluso 'bundled'); `syncing` marca que lo mostrado es caché vencida/
+  // snapshot empaquetado y ya se disparó una sincronización real en segundo plano; `justUpdated` es un
+  // aviso breve ("actualizado") cuando esa sincronización termina; `updateError` es el aviso NO
+  // bloqueante si falla (se sigue mostrando lo que ya había, nunca se borra el catálogo en pantalla).
+  const [generatedAt, setGeneratedAt] = useState<string | undefined>(undefined);
+  const [syncing, setSyncing] = useState(false);
+  const [justUpdated, setJustUpdated] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Record<string, DownloadJob>>({});
   const [filters, setFilters] = useState<ExploreFilters>(DEFAULT_EXPLORE_FILTERS);
   const [sortMode, setSortMode] = useState<ExploreSortMode>('recommended');
@@ -94,22 +103,33 @@ export function ExploreTab(): React.JSX.Element {
   const setChatModel = useChatStore((s) => s.setChatModel);
   const setDraftModelRef = useChatStore((s) => s.setDraftModelRef);
 
+  // Aplica un `LibraryCatalogResult` al estado sin depender de dónde vino (invoke directo o el evento
+  // `models:libraryUpdated` de una sincronización en segundo plano) — `resetPage` solo se pide cuando
+  // el USUARIO disparó el pedido (montar la pestaña, "Actualizar catálogo"); una actualización que
+  // llega sola de fondo nunca resetea página/filtros/búsqueda (punto central del encargo: "sin perder
+  // búsqueda, filtros ni página").
+  const applyLibraryResult = useCallback((result: LibraryCatalogResult, opts: { resetPage?: boolean } = {}) => {
+    setItems(result.items);
+    setLibrarySource(result.source);
+    setCachedAt(result.cachedAt);
+    setGeneratedAt(result.generatedAt);
+    setSyncing(result.syncing ?? false);
+    if (opts.resetPage) setPage(1);
+  }, []);
+
   const refresh = useCallback(async (forceRefresh = false) => {
     if (forceRefresh) setRefreshing(true); else setLoading(true);
     setError(null);
     try {
       const result = await invoke('models:libraryCatalog', { forceRefresh });
-      setItems(result.items);
-      setLibrarySource(result.source);
-      setCachedAt(result.cachedAt);
-      setPage(1);
+      applyLibraryResult(result, { resetPage: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [applyLibraryResult]);
 
   useEffect(() => {
     void refresh(false);
@@ -129,8 +149,24 @@ export function ExploreTab(): React.JSX.Element {
       });
       setError(`Descarga fallida: ${err}`);
     });
-    return () => { offProgress(); offDone(); offFailed(); };
-  }, [refresh]);
+    // Stale-while-revalidate (doc 16 §16.5): la sincronización real contra ollama.com/library corrió
+    // en segundo plano (host `OllamaLibraryClient`) mientras esta pestaña ya mostraba la caché vencida
+    // o el snapshot empaquetado — al terminar, este evento trae el catálogo fusionado ya armado.
+    const offLibraryUpdated = onEvent('models:libraryUpdated', (result) => {
+      applyLibraryResult(result, { resetPage: false });
+      setUpdateError(null);
+      setJustUpdated(true);
+      window.setTimeout(() => setJustUpdated(false), 5000);
+    });
+    const offLibraryFailed = onEvent('models:libraryUpdateFailed', ({ error: err }) => {
+      // No bloqueante a propósito (encargo: "si la sincronización falla, quedarse con lo mostrado"):
+      // no toca `items`/`error` (ese es el banner con "Reintentar" de una carga inicial fallida), solo
+      // apaga el "actualizando…" y agrega el aviso discreto.
+      setSyncing(false);
+      setUpdateError(err);
+    });
+    return () => { offProgress(); offDone(); offFailed(); offLibraryUpdated(); offLibraryFailed(); };
+  }, [refresh, applyLibraryResult]);
 
   const filtered = useMemo(() => filterCatalogItems(items, filters), [items, filters]);
   const sorted = useMemo(() => sortCatalogItems(filtered, sortMode), [filtered, sortMode]);
@@ -259,6 +295,17 @@ export function ExploreTab(): React.JSX.Element {
             <select value={sortMode} onChange={(e) => setSortMode(e.target.value as ExploreSortMode)} aria-label="Ordenar por">
               {(Object.keys(SORT_LABELS) as ExploreSortMode[]).map((key) => <option key={key} value={key}>Orden: {SORT_LABELS[key]}</option>)}
             </select>
+            {/* Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar"):
+                las variantes de NUBE (corren en los servidores de Ollama, no se pueden descargar)
+                van ocultas por defecto — este filtro las muestra a propósito. */}
+            <label className="saurio-filter-chip saurio-explore__cloud-toggle">
+              <input
+                type="checkbox"
+                checked={filters.showCloud}
+                onChange={(e) => { setFilters((f) => ({ ...f, showCloud: e.target.checked })); setPage(1); }}
+              />
+              {' '}Mostrar modelos en la nube
+            </label>
             <span className="saurio-filter-row__spacer" />
             {freeDiskBytes !== undefined && (
               <span className="saurio-row__line--muted">Espacio libre: {formatBytes(freeDiskBytes)}</span>
@@ -270,15 +317,43 @@ export function ExploreTab(): React.JSX.Element {
 
           {librarySource && (
             <div className="saurio-row__line--muted saurio-explore__source-note">
-              Catálogo {SOURCE_LABELS[librarySource]}
-              {cachedAt !== undefined && ` (${new Date(cachedAt).toLocaleString('es-AR')})`}
+              {/* Stale-while-revalidate (doc 16 §16.5): "Catálogo del <fecha> · actualizando…" mientras
+                  la sincronización real corre en segundo plano, "· actualizado" un ratito cuando
+                  termina, y si no está sincronizando el detalle de fuente/hora de siempre. */}
+              Catálogo del {generatedAt ? new Date(generatedAt).toLocaleDateString('es-AR') : '—'}
+              {syncing
+                ? ' · actualizando…'
+                : justUpdated
+                  ? ' · actualizado'
+                  : ` · ${SOURCE_LABELS[librarySource]}${cachedAt !== undefined ? ` (${new Date(cachedAt).toLocaleString('es-AR')})` : ''}`}
               {' '}· {items.length.toLocaleString('es-AR')} variantes en {new Set(items.map((i) => i.entry.name)).size} familias.
+              {updateError && (
+                <span> — no se pudo actualizar en segundo plano ({updateError}); se sigue mostrando el catálogo de arriba.</span>
+              )}
             </div>
           )}
 
-          {error && <div className="saurio-banner danger">{error}</div>}
+          {error && (
+            <div className="saurio-banner danger">
+              {error}
+              <button type="button" className="saurio-inline-action" onClick={() => void refresh(false)}>Reintentar</button>
+            </div>
+          )}
 
-          {pageResult.total === 0 && !loading ? (
+          {/* Bug real (captura docs/capturas/smoke-models-explore.png, sesión 2026-09-18): la
+              primera sincronización contra ollama.com/library (~240 familias) puede tardar varios
+              segundos — antes de este fix, mientras `loading` seguía en `true`, esta sección ya
+              mostraba "Página 1 de 1 (0 modelos)" (mismo aspecto que un filtro sin resultados o que
+              un catálogo genuinamente vacío), sin ningún indicio de que todavía estaba cargando. */}
+          {loading && items.length === 0 ? (
+            <div className="saurio-empty-state">
+              <span className="saurio-empty-state__title">Cargando catálogo…</span>
+              <span className="saurio-empty-state__hint">
+                Puede tardar la primera vez (sincroniza contra ollama.com/library); si tarda demasiado o
+                falla, cae al catálogo incluido con la app.
+              </span>
+            </div>
+          ) : pageResult.total === 0 ? (
             <div className="saurio-empty-state">
               <span className="saurio-empty-state__title">Sin modelos para este filtro</span>
               <span className="saurio-empty-state__hint">Probá con otro uso, nivel o tamaño, o limpiá la búsqueda.</span>
@@ -299,14 +374,28 @@ export function ExploreTab(): React.JSX.Element {
                         </button>
                         <span className="saurio-row__badges">
                           <TierBadge tier={item.tier} />
-                          <span className="saurio-badge local">LOCAL</span>
+                          {item.entry.cloud ? (
+                            <span className="saurio-badge cloud" title="Se ejecuta en los servidores de Ollama, no en tu PC">NUBE</span>
+                          ) : (
+                            <span className="saurio-badge local">LOCAL</span>
+                          )}
                           <span className="saurio-badge">{STATUS_LABELS[item.status]}</span>
                         </span>
                       </div>
                       <div className="saurio-row__meta">
-                        Descarga: {formatBytes(item.entry.sizeBytes)} · contexto máx {item.entry.contextMax.toLocaleString('es-AR')}
+                        {item.entry.cloud
+                          ? 'Corre en los servidores de Ollama (no ocupa espacio en tu disco)'
+                          : item.entry.sizeUnresolved
+                            ? 'Tamaño de descarga sin confirmar todavía — se resuelve al abrir la ficha ("Ver variantes")'
+                            : `Descarga: ${formatBytes(item.entry.sizeBytes)}`}
+                        {' '}· contexto máx {item.entry.contextMax.toLocaleString('es-AR')}
                         {item.entry.quantization && ` · ${item.entry.quantization}`}
                       </div>
+                      {item.entry.cloud && (
+                        <div className="saurio-row__line saurio-row__line--muted">
+                          Este modelo se ejecuta en los servidores de Ollama, no en tu PC — no se puede descargar ni usar sin conexión.
+                        </div>
+                      )}
                       {item.tier && <div className="saurio-row__line">{item.tier.explanation}</div>}
                       <div className="saurio-row__line">
                         Capabilities: {capabilityBadges(item.entry).join(', ') || 'sin capabilities declaradas'}
@@ -330,7 +419,7 @@ export function ExploreTab(): React.JSX.Element {
 
                       <div className="saurio-row__actions">
                         <button type="button" onClick={() => setSelectedFamily(item.entry.name)}>Ver variantes</button>
-                        {item.status === 'not_installed' && (
+                        {item.entry.cloud ? null : item.status === 'not_installed' && (
                           <button type="button" className="saurio-btn-primary" disabled={isBusy} onClick={() => void handleDownload(item)}>
                             {isBusy ? 'Iniciando…' : 'Descargar'}
                           </button>
@@ -406,6 +495,13 @@ function VariantSidePanel(props: {
   const [numCtx, setNumCtx] = useState<NumCtxOption>(DEFAULT_NUM_CTX_OPTION);
   const [liveTier, setLiveTier] = useState<ModelTier | undefined>(undefined);
   const [tierLoading, setTierLoading] = useState(false);
+  // Punto 4 del encargo (doc 16, "las que sí son locales pero fallan por parseo... deben resolverse
+  // contra el registry al abrir la ficha"): `resolvedSizeBytes` guarda el tamaño real que devuelve
+  // `models:resolveByName` (ya existente, contra el registry de Ollama) cuando la variante llegó acá
+  // marcada `sizeUnresolved` (el scraper de ollama.com/library no pudo leerle el tamaño). `undefined`
+  // mientras no se resolvió o si la variante no lo necesita.
+  const [resolvedSizeBytes, setResolvedSizeBytes] = useState<number | undefined>(undefined);
+  const [resolvingSize, setResolvingSize] = useState(false);
 
   const selected = group.variants.find((v) => v.entry.tag === selectedTag) ?? group.variants[0];
 
@@ -414,15 +510,30 @@ function VariantSidePanel(props: {
   }, [group]);
 
   useEffect(() => {
-    if (!selected) return;
+    setResolvedSizeBytes(undefined);
+    if (!selected || selected.entry.cloud || !selected.entry.sizeUnresolved) return;
+    let cancelled = false;
+    const name = `${selected.entry.name}:${selected.entry.tag}`;
+    setResolvingSize(true);
+    invoke('models:resolveByName', { name })
+      .then((result) => { if (!cancelled) setResolvedSizeBytes(result.sizeBytes); })
+      .catch(() => { /* sigue mostrando el placeholder; "Descargar" no depende de haber resuelto el tamaño */ })
+      .finally(() => { if (!cancelled) setResolvingSize(false); });
+    return () => { cancelled = true; };
+  }, [selected]);
+
+  const effectiveSizeBytes = resolvedSizeBytes ?? selected?.entry.sizeBytes ?? 0;
+
+  useEffect(() => {
+    if (!selected || selected.entry.cloud) { setLiveTier(undefined); return; }
     let cancelled = false;
     setTierLoading(true);
-    invoke('models:tierForSize', { sizeBytes: selected.entry.sizeBytes, numCtx })
+    invoke('models:tierForSize', { sizeBytes: effectiveSizeBytes, numCtx })
       .then((tier) => { if (!cancelled) setLiveTier(tier); })
       .catch(() => { if (!cancelled) setLiveTier(undefined); })
       .finally(() => { if (!cancelled) setTierLoading(false); });
     return () => { cancelled = true; };
-  }, [selected, numCtx]);
+  }, [selected, numCtx, effectiveSizeBytes]);
 
   if (!selected) return <></>;
   const fullName = `${selected.entry.name}:${selected.entry.tag}`;
@@ -444,40 +555,54 @@ function VariantSidePanel(props: {
             className={`saurio-filter-chip ${v.entry.tag === selectedTag ? 'active' : ''}`}
             onClick={() => setSelectedTag(v.entry.tag)}
           >
-            {v.entry.tag} · {formatBytes(v.entry.sizeBytes)}
+            {v.entry.tag} · {v.entry.cloud ? 'NUBE' : v.entry.sizeUnresolved ? 'tamaño sin confirmar' : formatBytes(v.entry.sizeBytes)}
           </button>
         ))}
       </div>
 
       <div className="saurio-row__header">
         <strong className="saurio-mono">{fullName}</strong>
-        <TierBadge tier={liveTier ?? selected.tier} />
+        {selected.entry.cloud
+          ? <span className="saurio-badge cloud" title="Se ejecuta en los servidores de Ollama, no en tu PC">NUBE</span>
+          : <TierBadge tier={liveTier ?? selected.tier} />}
       </div>
       <div className="saurio-row__meta">
-        {formatBytes(selected.entry.sizeBytes)} · contexto máx {selected.entry.contextMax.toLocaleString('es-AR')}
+        {selected.entry.cloud
+          ? 'Corre en los servidores de Ollama (no ocupa espacio en tu disco)'
+          : resolvingSize
+            ? 'Resolviendo tamaño contra el registry de Ollama…'
+            : formatBytes(effectiveSizeBytes)}
+        {' '}· contexto máx {selected.entry.contextMax.toLocaleString('es-AR')}
         {selected.entry.quantization && ` · ${selected.entry.quantization}`}
       </div>
+      {selected.entry.cloud && (
+        <div className="saurio-row__line saurio-row__line--muted">
+          Este modelo se ejecuta en los servidores de Ollama, no en tu PC — no se puede descargar ni usar sin conexión.
+        </div>
+      )}
       <div className="saurio-row__line">
         Capabilities: {capabilityBadges(selected.entry).join(', ') || 'sin capabilities declaradas'}
       </div>
 
-      <div className="saurio-side-panel__ctx">
-        <span>Contexto a usar: </span>
-        {NUM_CTX_OPTIONS.map((ctx) => (
-          <button
-            key={ctx}
-            type="button"
-            className={`saurio-filter-chip ${ctx === numCtx ? 'active' : ''}`}
-            onClick={() => setNumCtx(ctx)}
-          >
-            {ctx >= 1024 ? `${ctx / 1024}k` : ctx}
-          </button>
-        ))}
-      </div>
+      {!selected.entry.cloud && (
+        <div className="saurio-side-panel__ctx">
+          <span>Contexto a usar: </span>
+          {NUM_CTX_OPTIONS.map((ctx) => (
+            <button
+              key={ctx}
+              type="button"
+              className={`saurio-filter-chip ${ctx === numCtx ? 'active' : ''}`}
+              onClick={() => setNumCtx(ctx)}
+            >
+              {ctx >= 1024 ? `${ctx / 1024}k` : ctx}
+            </button>
+          ))}
+        </div>
+      )}
       {tierLoading && <div className="saurio-row__line--muted">Recalculando…</div>}
       {liveTier && <div className="saurio-row__line">{liveTier.explanation}</div>}
 
-      {freeDiskBytes !== undefined && (
+      {freeDiskBytes !== undefined && !selected.entry.cloud && (
         <div className="saurio-row__line--muted">Espacio libre en disco: {formatBytes(freeDiskBytes)}</div>
       )}
 
@@ -487,7 +612,7 @@ function VariantSidePanel(props: {
           <button type="button" className="saurio-inline-action" onClick={() => void onCancel(selected.downloadId!)}>Cancelar</button>
         </div>
       )}
-      {selected.status === 'not_installed' && (
+      {!selected.entry.cloud && selected.status === 'not_installed' && (
         <button type="button" className="saurio-btn-primary" disabled={isBusy} onClick={() => void onDownload(selected)}>
           {isBusy ? 'Iniciando…' : 'Descargar'}
         </button>

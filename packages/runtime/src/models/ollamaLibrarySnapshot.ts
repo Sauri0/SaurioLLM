@@ -56,6 +56,18 @@ export function loadOllamaLibrarySnapshot(jsonText: string): OllamaLibrarySnapsh
  *  arma el número). */
 const FALLBACK_CONTEXT_MAX = 4096;
 
+/** Variantes de NUBE de Ollama (punto 4 del encargo, doc 16 — "modelos con X / sin compatibilidad
+ *  para descargar"): corren en los servidores de Ollama, nunca en la PC del usuario, y por eso
+ *  ollama.com/library nunca les publica un tamaño de descarga ("-" en vez de "3.3GB" en la fila de
+ *  tags — confirmado en vivo contra ollama.com/library/gpt-oss: "gpt-oss:20b-cloud"/"gpt-oss:120b-
+ *  cloud"). El tag siempre es literalmente "cloud" (alias corto) o termina en "-cloud" (variante con
+ *  tamaño de parámetros, p. ej. "480b-cloud") — señal estable y por-variante, a diferencia del badge
+ *  "cloud" de la página de listado (que es por-familia y no todas las familias con variantes cloud lo
+ *  traen en el HTML de forma consistente). */
+export function isCloudTag(tag: string): boolean {
+  return /(^|-)cloud$/i.test(tag);
+}
+
 /** Heurística de `suggestedUse` a partir de los hints de la familia (`[HIPÓTESIS A PROBAR]`: es una
  *  primera aproximación editorial, no una medición — el catálogo curado la pisa en cuanto exista una
  *  entrada a mano para ese `name`+`tag`, igual que ya pasa con `notes`/`quantization`). */
@@ -104,16 +116,29 @@ export function mergeSnapshotWithCuratedCatalog(
       seen.add(key);
       const curatedEntry = curatedByKey.get(key);
       const sizeBytes = variant.sizeBytes ?? curatedEntry?.sizeBytes;
-      if (sizeBytes === undefined) continue; // sin tamaño confirmado en ninguna fuente: no se agrega (nunca inventar).
+      const cloud = isCloudTag(variant.tag);
+
+      // Antes: `if (sizeBytes === undefined) continue` — una variante sin tamaño confirmado
+      // desaparecía en silencio del catálogo, sin ninguna explicación (punto 4 del encargo, doc 16:
+      // "nunca un ícono X sin explicación"). Dos casos posibles, y los dos se muestran ahora:
+      //  - `cloud`: nunca va a tener tamaño (corre en los servidores de Ollama) — se agrega con
+      //    `sizeBytes: 0` y `cloud: true`; la UI la aparta con insignia NUBE, oculta por defecto, y
+      //    nunca ofrece "Descargar" (`ipc/models.ts` tampoco le calcula nivel de la escala).
+      //  - variante LOCAL cuyo tamaño falló al parsear (formato de ollama.com/library cambió, o la
+      //    fila no lo trae): se agrega con `sizeBytes: 0` y `sizeUnresolved: true`; la ficha lateral
+      //    (`ExploreTab.tsx`) la resuelve contra el registry de Ollama al abrirla
+      //    (`models:resolveByName`, ya existente) y queda descargable con el tamaño real.
       merged.push({
         name: family.name,
         tag: variant.tag,
-        sizeBytes,
+        sizeBytes: sizeBytes ?? 0,
         contextMax: variant.contextMax ?? curatedEntry?.contextMax ?? FALLBACK_CONTEXT_MAX,
         capabilities: curatedEntry?.capabilities ?? capabilitiesFor(family, variant),
         quantization: curatedEntry?.quantization,
         suggestedUse: curatedEntry?.suggestedUse ?? inferSuggestedUse(family.capabilityHints),
         notes: curatedEntry?.notes,
+        ...(cloud ? { cloud: true } : {}),
+        ...(!cloud && sizeBytes === undefined ? { sizeUnresolved: true } : {}),
       });
     }
   }

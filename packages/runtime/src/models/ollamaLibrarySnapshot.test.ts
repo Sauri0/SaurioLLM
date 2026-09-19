@@ -93,7 +93,13 @@ describe('mergeSnapshotWithCuratedCatalog', () => {
     expect(merged[0]!.capabilities.embedding).toBe(true);
   });
 
-  it('sin tamaño en snapshot NI en curado, la variante no se agrega (nunca inventar)', () => {
+  // Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar"): antes esta
+  // variante desaparecía en silencio del catálogo ("nunca inventar" se aplicaba borrándola, sin
+  // explicación); ahora se agrega igual, marcada `sizeUnresolved`, para que la ficha la resuelva
+  // contra el registry de Ollama al abrirla (`models:resolveByName`) en vez de mostrar un ícono X sin
+  // explicación — nunca se inventa un `sizeBytes` real, se deja el placeholder `0` explícitamente
+  // marcado.
+  it('sin tamaño en snapshot NI en curado, la variante se agrega marcada sizeUnresolved (no cloud)', () => {
     const noSize = snapshot({
       families: [{
         name: 'algo-nuevo', capabilityHints: [], sizeHints: [],
@@ -101,6 +107,40 @@ describe('mergeSnapshotWithCuratedCatalog', () => {
       }],
     });
     const merged = mergeSnapshotWithCuratedCatalog(noSize, []);
-    expect(merged.find((e) => e.name === 'algo-nuevo')).toBeUndefined();
+    const entry = merged.find((e) => e.name === 'algo-nuevo');
+    expect(entry).toBeDefined();
+    expect(entry?.sizeBytes).toBe(0);
+    expect(entry?.sizeUnresolved).toBe(true);
+    expect(entry?.cloud).toBeUndefined();
+  });
+
+  // Punto 4 del encargo: variantes de NUBE (tag "cloud" o terminado en "-cloud", el formato real que
+  // usa ollama.com/library para gpt-oss:20b-cloud/gpt-oss:120b-cloud, confirmado en vivo) se agregan
+  // marcadas `cloud: true`, nunca `sizeUnresolved` (nunca van a tener un tamaño real que resolver: no
+  // corren en la PC del usuario).
+  it('una variante "-cloud" se agrega marcada cloud, con sizeBytes 0 y sin sizeUnresolved', () => {
+    const cloudSnapshot = snapshot({
+      families: [{
+        name: 'gpt-oss', capabilityHints: [], sizeHints: [],
+        variants: [{ tag: '20b-cloud', contextMax: 131072, vision: false }],
+      }],
+    });
+    const merged = mergeSnapshotWithCuratedCatalog(cloudSnapshot, []);
+    const entry = merged.find((e) => e.name === 'gpt-oss' && e.tag === '20b-cloud');
+    expect(entry).toBeDefined();
+    expect(entry?.cloud).toBe(true);
+    expect(entry?.sizeBytes).toBe(0);
+    expect(entry?.sizeUnresolved).toBeUndefined();
+  });
+
+  it('el alias corto "cloud" (sin sufijo de tamaño) también se detecta como cloud', () => {
+    const cloudSnapshot = snapshot({
+      families: [{
+        name: 'gemma4', capabilityHints: [], sizeHints: [],
+        variants: [{ tag: 'cloud', contextMax: 131072, vision: false }],
+      }],
+    });
+    const merged = mergeSnapshotWithCuratedCatalog(cloudSnapshot, []);
+    expect(merged.find((e) => e.name === 'gemma4' && e.tag === 'cloud')?.cloud).toBe(true);
   });
 });

@@ -5,13 +5,14 @@
 // está instalado en esta máquina — usar powershell.exe por defecto y pwsh.exe solo si existe) y doc 09
 // §6 (CommandParser: patrones de instalación/migración/git destructivo para `classify`, heurística
 // abierta, no exhaustiva).
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import type { Risk } from '@saurio/shared';
 import type { ToolClassification, ToolDefinition, ToolContext } from '../types.js';
 import type { BuiltinToolsDeps } from './deps.js';
+import { execFileSyncHidden } from '../../util/spawnHidden.js';
 
 const ArgsSchema = z.object({
   command: z.coerce.string().min(1),
@@ -23,9 +24,12 @@ type Args = z.infer<typeof ArgsSchema>;
 const MAX_OUTPUT_CHARS = 30_000;
 const HALF_KEEP = 15_000;
 
+/** BUG REAL v0.2.0 ("ventanas de consola parpadeando al iniciar"): `where`/`taskkill` son ejecutables
+ *  de consola en Windows — sin `windowsHide: true` abren una ventana visible un instante. Se usa el
+ *  wrapper único del paquete (`execFileSyncHidden`) en vez de `execFileSync` directo. */
 function commandExists(name: string): boolean {
   try {
-    execFileSync(process.platform === 'win32' ? 'where' : 'which', [name], { stdio: 'ignore' });
+    execFileSyncHidden(process.platform === 'win32' ? 'where' : 'which', [name], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
@@ -74,7 +78,7 @@ interface RunOutcome { exitCode: number | null; signal: NodeJS.Signals | null; t
 
 function killTree(pid: number): void {
   if (process.platform === 'win32') {
-    try { execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); } catch { /* ya murió */ }
+    try { execFileSyncHidden('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); } catch { /* ya murió */ }
   } else {
     try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* ya murió */ } }
   }

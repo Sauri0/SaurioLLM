@@ -162,6 +162,17 @@ export class HardwareProbe implements HardwareProbeContract {
   private readonly platform: NodeJS.Platform;
   private readonly options: HardwareProbeOptions;
   private nvidiaSmiAvailable: boolean | undefined;
+  /** Bug real v0.2.0 ("cachear la detección de hardware... no reintentar en bucle fuentes que no
+   *  existen"): `sample()` lo llaman varios canales IPC (models:catalog/libraryCatalog/resolveByName/
+   *  tierForSize/recommend) cada vez que el usuario abre/interactúa con Explorar — en un equipo sin
+   *  NVIDIA (p. ej. el reportado, Intel Core Ultra 9 288V + iGPU Arc) cada una de esas llamadas volvía
+   *  a intentar `nvidia-smi` (falla) y, si tampoco había `inferenceComputeSource`, a spawnear
+   *  PowerShell DOS veces más (registro + WMI) sabiendo de antemano que iba a fallar/repetir el mismo
+   *  resultado. La detección de GPU (vendor/VRAM total — hardware que no cambia en caliente durante
+   *  la sesión) se cachea acá una única vez por arranque; CPU/RAM siguen siendo `os.*` en vivo en cada
+   *  `sample()` (baratos, sin child_process). `refreshGpu()` es el "refresco manual" pedido por el
+   *  encargo. */
+  private gpuCache: { profile: HardwareProfile['gpu']; gpuRow: NvidiaSmiRow | undefined } | undefined;
 
   constructor(options: HardwareProbeOptions = {}) {
     this.options = options;
@@ -176,6 +187,14 @@ export class HardwareProbe implements HardwareProbeContract {
     return this.nvidiaSmiAvailable ?? true;
   }
 
+  /** Refresco manual (encargo, punto 2: "cachear... refresco manual"): descarta la detección de GPU
+   *  cacheada, para que el próximo `sample()` vuelva a sondear todas las fuentes desde cero (p. ej. si
+   *  el usuario conecta/desconecta una GPU externa en caliente). */
+  refreshGpu(): void {
+    this.gpuCache = undefined;
+    this.nvidiaSmiAvailable = undefined;
+  }
+
   async sample(): Promise<HardwareProfile> {
     const sampledAt = this.now();
     const cpuInfo = cpus();
@@ -184,6 +203,36 @@ export class HardwareProbe implements HardwareProbeContract {
 
     const ramTotal = totalmem();
     const ramFree = freemem();
+
+    const { gpu, gpuRow } = await this.probeGpuCached(sampledAt);
+
+    const fingerprint = this.fingerprint({
+      gpuUuid: gpuRow?.uuid,
+      vramTotal: gpu?.vramTotalBytes.value,
+      cpuModel: cpuName,
+      ramTotal,
+    });
+
+    return {
+      cpu: {
+        name: datum(cpuName, 'measured', 'os.cpus', sampledAt),
+        threads: datum(threads, 'measured', 'os.cpus', sampledAt),
+      },
+      ram: {
+        totalBytes: datum(ramTotal, 'measured', 'os.totalmem', sampledAt, 'bytes'),
+        freeBytes: datum(ramFree, 'measured', 'os.freemem', sampledAt, 'bytes'),
+      },
+      ...(gpu ? { gpu } : {}),
+      fingerprint,
+      sampledAt,
+    };
+  }
+
+  /** Sondea GPU (nvidia-smi -> log de inference compute de Ollama -> registro/WMI de Windows ->
+   *  memoria unificada estimada) UNA sola vez por arranque; llamadas siguientes devuelven el resultado
+   *  cacheado sin volver a spawnear nada, hasta `refreshGpu()`. */
+  private async probeGpuCached(sampledAt: number): Promise<{ gpu: HardwareProfile['gpu']; gpuRow: NvidiaSmiRow | undefined }> {
+    if (this.gpuCache) return { gpu: this.gpuCache.profile, gpuRow: this.gpuCache.gpuRow };
 
     const gpuRow = await this.probeNvidiaSmi();
     let gpu: HardwareProfile['gpu'] = gpuRow
@@ -207,26 +256,8 @@ export class HardwareProbe implements HardwareProbeContract {
       gpu = this.unifiedMemoryFallback(sampledAt);
     }
 
-    const fingerprint = this.fingerprint({
-      gpuUuid: gpuRow?.uuid,
-      vramTotal: gpu?.vramTotalBytes.value,
-      cpuModel: cpuName,
-      ramTotal,
-    });
-
-    return {
-      cpu: {
-        name: datum(cpuName, 'measured', 'os.cpus', sampledAt),
-        threads: datum(threads, 'measured', 'os.cpus', sampledAt),
-      },
-      ram: {
-        totalBytes: datum(ramTotal, 'measured', 'os.totalmem', sampledAt, 'bytes'),
-        freeBytes: datum(ramFree, 'measured', 'os.freemem', sampledAt, 'bytes'),
-      },
-      ...(gpu ? { gpu } : {}),
-      fingerprint,
-      sampledAt,
-    };
+    this.gpuCache = { profile: gpu, gpuRow };
+    return { gpu, gpuRow };
   }
 
   private async probeNvidiaSmi(): Promise<NvidiaSmiRow | undefined> {

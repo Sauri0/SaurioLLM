@@ -15,6 +15,7 @@ interface ItemOptions {
   notes?: string;
   suggestedUse?: CatalogItem['entry']['suggestedUse'];
   capabilities?: Partial<CatalogItem['entry']['capabilities']>;
+  cloud?: boolean;
 }
 
 function item(opts: ItemOptions): CatalogItem {
@@ -23,6 +24,7 @@ function item(opts: ItemOptions): CatalogItem {
       name: opts.name, tag: opts.tag, sizeBytes: opts.sizeBytes,
       capabilities: { tools: false, thinking: false, vision: false, embedding: false, ...opts.capabilities },
       contextMax: 8192, suggestedUse: opts.suggestedUse ?? ['chat'], notes: opts.notes,
+      ...(opts.cloud ? { cloud: true } : {}),
     },
     status: 'not_installed',
     tier: opts.tier,
@@ -94,6 +96,32 @@ describe('filterCatalogItems', () => {
   it('combina búsqueda + filtros', () => {
     const result = filterCatalogItems(items, { ...DEFAULT_EXPLORE_FILTERS, search: 'qwen', sizeBucket: 'medium' });
     expect(result.map((i) => i.entry.name)).toEqual(['qwen3']);
+  });
+
+  // Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar"): las variantes
+  // de NUBE van ocultas por defecto, y aparecen solo con showCloud: true.
+  describe('showCloud (variantes de NUBE)', () => {
+    const withCloud: CatalogItem[] = [
+      ...items,
+      item({ name: 'gpt-oss', tag: '20b-cloud', sizeBytes: 0, cloud: true }),
+    ];
+
+    it('por defecto (showCloud: false) no incluye variantes cloud', () => {
+      const result = filterCatalogItems(withCloud, DEFAULT_EXPLORE_FILTERS);
+      expect(result.map((i) => i.entry.name)).not.toContain('gpt-oss');
+      expect(result).toHaveLength(3);
+    });
+
+    it('con showCloud: true, las variantes cloud aparecen', () => {
+      const result = filterCatalogItems(withCloud, { ...DEFAULT_EXPLORE_FILTERS, showCloud: true });
+      expect(result.map((i) => i.entry.name)).toContain('gpt-oss');
+      expect(result).toHaveLength(4);
+    });
+
+    it('una variante cloud no se descarta por el filtro de tamaño (sizeBytes es un placeholder)', () => {
+      const result = filterCatalogItems(withCloud, { ...DEFAULT_EXPLORE_FILTERS, showCloud: true, sizeBucket: 'large' });
+      expect(result.map((i) => i.entry.name)).toContain('gpt-oss');
+    });
   });
 });
 

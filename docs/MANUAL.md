@@ -244,10 +244,11 @@ Intel Arc (Vulkan, sin `nvidia-smi`) y solo `gemma4:26b/31b` instalados:
   último usado en este proyecto (si sigue instalado), después el mejor clasificado por la escala de
   seis niveles para tu hardware, y por último el primer modelo instalado. Nunca se permite enviar un
   mensaje a un modelo local que ya no está instalado: se avisa antes de intentarlo.
-- **Pantalla de inicio** cuando no hay ningún chat abierto: estado del motor local y de los modelos
-  instalados, y tres accesos grandes — Abrir/cambiar carpeta, Elegir o instalar un modelo, Nuevo chat —
-  más un enlace a "Configurar proveedores" (API de nube). La barra lateral suma accesos directos fijos
-  a "Modelos" y "Ajustes".
+- **Pantalla de inicio** cuando no hay ningún proyecto o chat abierto: estado del motor local y de los
+  modelos instalados, y tres accesos grandes — Abrir/cambiar carpeta, Elegir o instalar un modelo,
+  Nuevo chat — más un enlace a "Configurar proveedores" (API de nube). Rediseño de navegación (sección
+  8): "Inicio" es ahora una sección propia de la barra de navegación izquierda, no un estado dentro del
+  chat.
 - **Log de `ollama serve`**: cuando la app arranca Ollama por su cuenta, su stdout/stderr queda en
   `%APPDATA%\SaurioLLM\logs\ollama-serve.log`; al cerrar la app, se detiene SOLO ese proceso (nunca uno
   que ya estuviera corriendo o que hayas arrancado vos). En equipos sin `nvidia-smi` (iGPU Intel/AMD),
@@ -337,22 +338,76 @@ tarjeta de video) y qué tan grande sea el proyecto que tengas abierto.
 
 ## 8. Capturas
 
-Capturas reales de la UI (pasada de diseño visual), tomadas con la herramienta de verificación
-visual descripta en `docs/architecture/01-arquitectura.md` §4.1 (`SAURIO_SMOKE_SHOT` +
-`SAURIO_SMOKE_STATE`, implementada en `apps/desktop/src/main/index.ts`): el proceso main espera a
-que el renderer termine de dibujar, captura la ventana con `webContents.capturePage()` y guarda el
-PNG — sin retoques manuales. El contenido de ejemplo (chat, tool calls, checkpoint, tareas, permiso)
-sale de `apps/desktop/src/renderer/src/demo/demoState.ts`, que siembra los stores de zustand para
-poder mostrar la UI con datos sin necesitar Ollama corriendo.
+Capturas reales de la UI, tomadas con la herramienta de verificación visual descripta en
+`docs/architecture/01-arquitectura.md` §4.1 (`SAURIO_SMOKE_SHOT` + `SAURIO_SMOKE_STATE` +
+`SAURIO_SMOKE_CLICK`, implementada en `apps/desktop/src/main/index.ts`): el proceso main espera a
+que el renderer termine de dibujar, opcionalmente hace clic en algún selector (para navegar a una
+sección o abrir una subpestaña antes de capturar), captura la ventana con `webContents.capturePage()`
+y guarda el PNG — sin retoques manuales. El contenido de ejemplo (chat, tool calls, checkpoint,
+tareas, permiso) sale de `apps/desktop/src/renderer/src/demo/demoState.ts`, que siembra los stores de
+zustand para poder mostrar la UI con datos sin necesitar Ollama corriendo; varias capturas de esta
+sección, en cambio, son contra Ollama real (se aclara en cada una).
+
+### 8.1 Rediseño de navegación (feedback real: "todo junto a la derecha... muy compacto")
+
+Un usuario real de la v0.2.0 reportó que el panel derecho angosto con siete pestañas abreviadas
+("Arch.", "Diff", "Term.", "Mod.", "Ag.", "Rend.", "Ajus.") no le cerraba — "es compleja y difícil de
+usar, muchas cosas muy compactas". El rediseño separa dos ideas que antes vivían juntas en ese panel:
+
+- **Barra de navegación izquierda** (`layout/NavRail.tsx`), angosta pero con ícono + etiqueta completa
+  siempre visible (nunca abreviada): Inicio, Chats, Modelos, Agentes, Rendimiento, Ajustes. Cada una es
+  una sección a pantalla completa, con atajos `Ctrl+1`...`Ctrl+6`.
+- **Panel contextual de la vista Chats** (`layout/RightPanel.tsx`, ahora reducido a esto): Archivos,
+  Cambios (antes "Diff") y Terminal — lo único que de verdad acompaña a un chat puntual. Tiene nombre
+  completo en las tres pestañas, ancho ajustable arrastrando su borde izquierdo y un botón para
+  ocultarlo (queda una franja angosta con un ícono para volver a mostrarlo); arranca oculto por
+  defecto en ventanas angostas (`stores/uiNavStore.ts`).
+
+![Vista Chats: proyecto y chats a la izquierda, conversación al centro, panel contextual con nombre completo a la derecha](capturas/01-chat-overview.png)
+
+Chat con tool calls, checkpoint y tareas, más el panel contextual en "Archivos" con las tres pestañas
+completas (nunca abreviadas) y su botón de cerrar (×) arriba a la derecha.
+
+![Sección Modelos a pantalla completa, Instalados, contra Ollama real](capturas/smoke-models-panel.png)
+![Sección Agentes a pantalla completa (estado vacío con guía)](capturas/08-agentes.png)
+![Sección Ajustes a pantalla completa](capturas/09-ajustes.png)
+
+Modelos, Agentes, Rendimiento y Ajustes dejaron de competir por 380px: ahora usan todo el ancho
+disponible, con su propio encabezado, tipografía base más grande (14-15px) y un máximo de ancho de
+lectura (`layout/WideView.tsx`) para que las tarjetas no se estiren de borde a borde en pantallas
+grandes. Los paneles en sí (`features/models/**`, `features/agents/**`, `features/perf/**`,
+`features/settings/**`) no cambiaron de lógica — solo cambió cómo se montan.
+
+![Inicio sin proyecto abierto, con el asistente de primer arranque (que sigue funcionando igual)](capturas/03-estado-vacio.png)
+
+"Inicio" es ahora una sección propia (antes era un estado dentro del centro de chat) y la vista por
+defecto sin proyecto abierto. El asistente de primer arranque (modal) sigue apareciendo igual arriba
+de cualquier sección — acá, detectando Ollama real y recomendando modelos para programar en este
+equipo.
+
+![Ventana mínima 960×600: el panel contextual arranca oculto (queda la franja angosta a la derecha) y no hay overflow horizontal](capturas/05-minimo-960x600.png)
+![Pantalla grande (2000×1200): la vista Chats no desborda ni deja huecos raros](capturas/10-pantalla-grande.png)
+
+Responsivo desde 960×600 (mínimo de la ventana) hasta pantallas grandes: en 960×600 el panel
+contextual arranca cerrado (se puede abrir a mano igual, con la barra lateral y el centro de chat
+repartiéndose el resto del ancho sin scroll horizontal); en pantallas grandes las secciones anchas
+mantienen su máximo de lectura y la vista Chats reparte el espacio extra en el centro de la
+conversación.
+
+**Límite conocido de esta sesión**: la pestaña "Rendimiento" no pudo capturarse con métricas reales
+esta vez — otra sesión en paralelo dejó momentáneamente roto el canal `metrics:snapshot` en
+`apps/desktop/src/main/**` (fuera de la zona de este encargo, que era `layout/**`/`App.tsx`/CSS). La
+captura de más abajo (`smoke-perf-panel.png`) muestra igual el layout nuevo (título, aire, estado
+vacío con guía "Medir ahora"), solo que sin datos medidos — no se inventaron números.
 
 ### Chat con tool calls, checkpoint y tareas
 
 ![Chat con tool calls, checkpoint y checklist de tareas](capturas/01-chat-overview.png)
 
-Barra lateral con proyecto y chats, checklist de tareas fijo arriba del centro de chat, dos tarjetas
-de tool call (una con salida colapsable abierta), tarjeta de checkpoint con archivos +48/−6, árbol de
-archivos en el panel derecho y barra de estado inferior (LOCAL, modelo activo, contexto usado, tok/s,
-estado de Ollama).
+Barra de proyecto y chats a la izquierda, checklist de tareas fijo arriba del centro de chat, dos
+tarjetas de tool call (una con salida colapsable abierta), tarjeta de checkpoint con archivos +48/−6,
+árbol de archivos en el panel contextual y barra de estado inferior (LOCAL, modelo activo, contexto
+usado, tok/s, estado de Ollama).
 
 ### Tarjeta de permiso
 
@@ -366,23 +421,27 @@ motivo del pedido, preview del diff, patrón a recordar editable y jerarquía de
 
 ![Estado vacío antes de abrir un proyecto](capturas/03-estado-vacio.png)
 
-Guía explícita en vez de una pantalla en blanco: "Abrí una carpeta para empezar" en el centro de
-chat y en la lista de chats, botón primario "Abrir carpeta…" en la barra lateral, y la barra de
-estado mostrando "Contexto: —" / "— tok/s" / "Ollama no conectado" en vez de valores inventados.
+Guía explícita en vez de una pantalla en blanco: sección "Inicio" con "Bienvenido a SaurioLLM" detrás,
+y el asistente de primer arranque (contra Ollama real, corriendo en este ejemplo) recomendando
+`qwen2.5-coder:1.5b`, `qwen2.5-coder:3b` y `qwen3:4b` para programar en este equipo. Ver
+`capturas/07-motor-apagado.png` más abajo para el mismo estado con Ollama apagado.
 
-### Centro de modelos — Instalados y Explorar (sesión 2026-09-18, tarde)
+### Centro de modelos — Instalados y Explorar (recapturado con la navegación nueva)
 
 ![Centro de modelos, pestaña Instalados, con los 4 modelos reales de esta máquina](capturas/smoke-models-panel.png)
-![Centro de modelos, pestaña Explorar, catálogo curado con qwen3:8b cargado en ese momento](capturas/smoke-models-explore.png)
+![Centro de modelos, pestaña Explorar, con la leyenda de los seis niveles](capturas/smoke-models-explore.png)
 
-Capturas contra Ollama real (no modo demo): "Instalados" muestra los 4 modelos reales de esta
-máquina con la carpeta `N:\OllamaModels` detectada; "Explorar" muestra el catálogo curado con
-filtros por uso, `qwen3:8b` marcado "cargado" (coincide con el estado real del servidor en el
-momento de la captura) y modelos no instalados con el botón "Descargar" habilitado.
+Capturas contra Ollama real (no modo demo), ya con la sección "Modelos" a pantalla completa en vez
+del panel angosto de antes: "Instalados" muestra los 4 modelos reales de esta máquina con la carpeta
+`N:\OllamaModels` detectada y "Abrí o creá un chat para poder usarlo" en cada uno (no hay ningún chat
+activo en esta captura puntual, así que ninguno queda marcado "en uso en este chat" — ver más abajo);
+"Explorar" muestra la leyenda de los seis niveles de la escala. El catálogo de Explorar salió vacío en
+esta corrida puntual (0 modelos listados) porque esta máquina todavía no había sincronizado contra
+`ollama.com/library` en esta carpeta de datos — no es un problema del rediseño de navegación.
 
-### Centro de modelos — escala de seis niveles y usabilidad (sesión 2026-09-18, cobertura máxima del catálogo)
+### Centro de modelos — escala de seis niveles y usabilidad
 
-![Pestaña Explorar con la leyenda de los seis niveles y el badge "1 · Perfecto" en qwen3:8b](capturas/smoke-explorar-tiers-ollama-on.png)
+![Pestaña Explorar con la leyenda de los seis niveles](capturas/smoke-explorar-tiers-ollama-on.png)
 ![Pestaña Instalados con los 4 modelos reales y la guía "Abrí o creá un chat para poder usarlo"](capturas/smoke-instalados-usar-en-chat.png)
 
 Feedback real de un usuario que instaló la v0.1 ("no entiendo cómo instalar, seleccionar y saber si
@@ -424,27 +483,36 @@ y borrado, confirmados contra `/api/tags` real antes y después.
 
 ### Panel de rendimiento con muestreo continuo
 
-![Panel de rendimiento con CPU/RAM/GPU/VRAM medidos y un modelo real cargado](capturas/smoke-perf-panel.png)
+![Sección Rendimiento a pantalla completa (estado vacío con guía, layout nuevo)](capturas/smoke-perf-panel.png)
 
-CPU 9.6%, RAM 14 GB, GPU 16.0%, VRAM 6.9 GB, temperatura 43°C y potencia 28 W, todos `measured`;
-gráficos de historial de los últimos segundos (ring buffer en memoria) y "qwen3:8b" real en Runtime
-con su VRAM/contexto efectivos — sin alertas activas en el momento de la captura.
+**Nota de esta sesión (rediseño de navegación)**: la captura anterior de esta sección mostraba
+mediciones reales (CPU 9.6%, RAM 14 GB, GPU 16.0%, VRAM 6.9 GB...) con `qwen3:8b` cargado. No se pudo
+volver a capturar así esta vez: otra sesión en paralelo dejó momentáneamente sin handler el canal
+`metrics:snapshot` (`apps/desktop/src/main/**`, fuera de la zona de este encargo) y el panel muestra el
+error de esa llamada en vez de datos. Lo que sí queda documentado acá es el layout nuevo — título
+"Rendimiento" grande, más aire, estado vacío con guía y botón "Medir ahora" ocupando todo el ancho — y
+el resto del texto de esta sección (qué mide, cuándo, límites) sigue describiendo el panel real, sin
+cambios de comportamiento de `features/perf/**`.
 
 ### Asistente de primer arranque
 
-![Asistente de primer arranque recomendando modelos para programar](capturas/smoke-onboarding-recommendations.png)
+![Asistente de primer arranque recomendando modelos para programar, sobre la sección Inicio nueva](capturas/smoke-onboarding-recommendations.png)
 
 Con Ollama ya corriendo, el asistente recomienda `qwen2.5-coder:1.5b`, `qwen2.5-coder:3b` y
 `qwen3:4b` para programar en este equipo (RecommendationEngine real, ordenados de menor a mayor
-tamaño porque el objetivo por defecto es velocidad), cada uno con su badge LOCAL y "estimado".
+tamaño porque el objetivo por defecto es velocidad), cada uno con su badge LOCAL y "estimado". El
+asistente se muestra igual que antes (modal encima de todo) — lo que cambió es lo que se ve detrás: la
+sección "Inicio" nueva, con la barra de navegación a la izquierda.
 
 ### Ajustes > Proveedores
 
-![Ajustes > Proveedores: agregar un proveedor OpenAI y Ollama ya configurado](capturas/smoke-settings-providers.png)
+![Ajustes > Proveedores en la sección Ajustes a pantalla completa](capturas/smoke-settings-providers.png)
 
 Formulario para agregar un proveedor (tipo, nombre, base URL, clave de API) y la lista de
 proveedores configurados — acá, el Ollama local sembrado por defecto, con "Probar conexión" y el
-campo para pegar/reemplazar la clave.
+campo para pegar/reemplazar la clave. "Ajustes" ya no es una pestaña de 380px: es una sección propia a
+pantalla completa (`layout/WideView.tsx`), a la que se llega desde la barra de navegación izquierda o
+con `Ctrl+6`.
 
 ### Tarjeta "el modelo no entró en la memoria" (oom_load)
 
@@ -453,10 +521,12 @@ campo para pegar/reemplazar la clave.
 Cuando Ollama devuelve un error real de falta de memoria (aquí, el texto real reportado por un
 usuario con iGPU Intel Arc/Vulkan: `GGML_ASSERT(buffer) failed alloc_tensor_range: failed to
 allocate Vulkan0 buffer...`), `RunController` ya reintentó automáticamente bajando `numGpu`
-(~75% → ~50% → 0 = solo CPU) antes de rendirse; la tarjeta ofrece abrir el Centro de modelos o
+(~75% → ~50% → 0 = solo CPU) antes de rendirse; la tarjeta ofrece "Elegir otro modelo" (ahora navega
+directo a la sección "Modelos" a pantalla completa, verificado con un clic real en esta sesión) o
 reintentar desde cero (útil si mientras tanto se liberó memoria). Capturada en modo demo
 (`?demoState={"oomError":true}`, `apps/desktop/src/renderer/src/demo/demoState.ts`) para no
-depender de una GPU real sin memoria.
+depender de una GPU real sin memoria; el panel contextual a la derecha (Archivos/Cambios/Terminal, ya
+con nombre completo) es el mismo rediseño de la sección 8.1.
 
 ### Motor local apagado: pantalla de inicio, selector de modelo y barra de estado
 
@@ -464,12 +534,12 @@ depender de una GPU real sin memoria.
 
 Capturada apuntando la app a un puerto vacío (`SAURIO_OLLAMA_URL=http://127.0.0.1:11999`, variable
 solo para pruebas — simula "Ollama apagado" de verdad sin tocar ninguna instancia real de Ollama de
-esta máquina, ver `apps/desktop/src/main/host/createRuntime.ts`). La pantalla de inicio muestra
-"Motor local no conectado (Ollama)" en rojo y "Sin modelos
-instalados", la barra de estado inferior muestra "Ollama no conectado" con el botón "Iniciar
-Ollama", y el asistente de primer arranque detecta lo mismo y ofrece instalar Ollama o configurar
-una clave de API. Los accesos directos "Modelos"/"Ajustes" quedan visibles al pie de la barra
-lateral en todo momento.
+esta máquina, ver `apps/desktop/src/main/host/createRuntime.ts`). La sección "Inicio" muestra
+"Bienvenido a SaurioLLM" en rojo detrás del asistente de primer arranque, que detecta lo mismo y
+ofrece "Modelos en mi PC" (instalar Ollama) o "Tengo una clave de API"; la barra de estado inferior
+muestra "Ollama no conectado" con el botón "Iniciar Ollama". "Modelos" y "Ajustes" ya no son accesos
+al pie de una barra lateral: son secciones propias, siempre visibles en la barra de navegación
+izquierda, con o sin proyecto abierto.
 
 ## 9. Usar modelos por API
 
@@ -478,7 +548,8 @@ Además de Ollama local, podés usar un modelo de OpenAI, OpenRouter, Anthropic 
 
 ### 9.1 Agregar un proveedor
 
-1. Abrí **Ajustes** (ícono de engranaje en el panel derecho) y bajá hasta **Proveedores**.
+1. Abrí **Ajustes** (ícono de engranaje en la barra de navegación izquierda) y bajá hasta
+   **Proveedores**.
 2. Elegí el **tipo**: OpenAI, OpenRouter, Anthropic, Ollama (attach — para otra instancia, por
    ejemplo en tu LAN) u "OpenAI-compatible personalizado" (para LM Studio/llama.cpp/vLLM/Groq/etc.,
    con base URL libre).
@@ -567,8 +638,9 @@ todavía no están implementados).
 
 ### 11.1 Mis agentes (opcional, nunca obligatorio)
 
-- Pestaña **"Agentes"** del panel derecho: lista tus agentes personales (avatar/nombre/rol), con
-  "+ Nuevo agente". El único campo obligatorio es el nombre — modelo, herramientas, permisos y
+- Sección **"Agentes"** de la barra de navegación izquierda: lista tus agentes personales
+  (avatar/nombre/rol), con "+ Nuevo agente". El único campo obligatorio es el nombre — modelo,
+  herramientas, permisos y
   memoria tienen un default sensato, así que crear un agente nunca es un paso necesario para usar la
   app (el chat con el agente builtin sigue siendo el camino por defecto).
 - Al crear/editar un agente elegís: emoji + color, rol, **modelo fijo** (uno instalado puntual) o
@@ -576,7 +648,7 @@ todavía no están implementados).
   modelo configurado — todavía en evaluación, no hay selección "inteligente" por tarea), qué
   herramientas puede usar (checklist), preset de permisos (estricto/balanceado/confiado) y si su
   memoria es global o solo de este proyecto.
-- **Chat directo con un agente personal**: hacé clic en el agente (desde la pestaña "Agentes") para
+- **Chat directo con un agente personal**: hacé clic en el agente (desde la sección "Agentes") para
   abrir o crear un chat con él. Si no tenés ningún proyecto abierto, el chat vive en un proyecto
   personal interno (nunca aparece en el selector de proyectos). La cabecera del chat muestra el
   nombre/avatar del agente junto al selector de modelo cuando no es el agente builtin.

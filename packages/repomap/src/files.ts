@@ -1,10 +1,10 @@
 // Listado de archivos del proyecto: `rg --files` + `.saurioignore`, exclusión de binarios y
 // archivos > 1 MB (doc 07 §2.1 paso 1).
-import { spawn } from 'node:child_process';
 import { statSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import ignore from 'ignore';
 import type { RepoFile, SupportedLang } from './types.js';
+import { spawnHidden } from './spawnHidden.js';
 
 export const MAX_FILE_BYTES = 1024 * 1024; // 1 MB (doc 07 §2.1 paso 1)
 
@@ -72,9 +72,12 @@ function loadSaurioIgnore(projectRoot: string): string[] {
   return lines;
 }
 
+/** BUG REAL v0.2.0 ("ventanas de consola parpadeando al iniciar"): `rg` es un ejecutable de consola —
+ *  sin `windowsHide: true` abre una ventana visible cada vez que se indexa un proyecto (apertura +
+ *  cada reindexado disparado por cambios de archivos). `spawnHidden` lo fuerza siempre. */
 function runRgFiles(projectRoot: string): Promise<string[] | null> {
   return new Promise((resolve) => {
-    const child = spawn('rg', ['--files', '--hidden', '--glob', '!.git'], { cwd: projectRoot });
+    const child = spawnHidden('rg', ['--files', '--hidden', '--glob', '!.git'], { cwd: projectRoot });
     let out = '';
     let errored = false;
     child.stdout.on('data', (chunk: Buffer) => {

@@ -206,6 +206,17 @@ export interface RendererEvents {
   // se emite cuando un archivo cambia en disco por fuera de una escritura hecha por una tool de
   // SaurioLLM; `relPath` en POSIX, relativo a la raíz del proyecto.
   'files:changed': { projectId: string; relPath: string; kind: 'modified' | 'removed' };
+  // Stale-while-revalidate de "Explorar" (doc 16 §16.5, arreglo real de la causa —"Cargando
+  // catálogo…" ~13s contra ollama.com/library— en vez de solo el síntoma en la UI que ya cubría §16.5):
+  // `models:libraryCatalog` ahora puede devolver de inmediato una caché vencida o el snapshot
+  // empaquetado (`syncing: true`) mientras `OllamaLibraryClient` sincroniza en segundo plano; al
+  // terminar esa sincronización, el host reenvía acá el mismo shape que la respuesta de
+  // `models:libraryCatalog` (aditivo: reutiliza `LibraryCatalogResultSchema`, no reemplaza ningún canal
+  // existente) para que `ExploreTab.tsx` se refresque sola sin perder búsqueda/filtros/página.
+  'models:libraryUpdated': z.infer<typeof LibraryCatalogResultSchema>;
+  // Si la sincronización de fondo falla, la UI se queda con lo que ya estaba mostrando y solo agrega
+  // un aviso no bloqueante (nunca bloquea ni borra el catálogo ya visible).
+  'models:libraryUpdateFailed': { error: string };
   // el puerto de datos de la terminal NO viaja por acá: ver 'terminal:port' más abajo
 }
 

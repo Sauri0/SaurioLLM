@@ -2,9 +2,9 @@
 // §4.10). Terminal interactiva del usuario, independiente de `run_command` (que en packages/runtime
 // usa child_process.spawn sin pty). pwsh por defecto, fallback powershell (doc 01 §5, tabla de
 // procesos; N:\saurio-smoke\RESULTADOS-electron.md: "pwsh 7 NO está instalado en esta máquina").
-import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import * as pty from 'node-pty';
+import { execFileSyncHidden } from '../process/spawnHidden.js';
 
 export interface TerminalSpawnOptions {
   cwd: string;
@@ -19,8 +19,13 @@ export type PtySpawnFn = (shell: string, args: string[], options: pty.IPtyForkOp
 
 const defaultPtySpawn: PtySpawnFn = (shell, args, options) => pty.spawn(shell, args, options);
 
-/** true si `cmd` resuelve a un ejecutable en PATH. Windows: `where`; POSIX: `command -v`. */
-export function commandExists(cmd: string, execSync: typeof execFileSync = execFileSync): boolean {
+/** true si `cmd` resuelve a un ejecutable en PATH. Windows: `where`; POSIX: `command -v`.
+ *
+ *  BUG REAL v0.2.0 ("ventanas de consola parpadeando al iniciar"): el `where` de Windows es un
+ *  ejecutable de consola — sin `windowsHide: true` abre una ventana visible un instante cada vez que
+ *  se resuelve el shell (cada `terminal:create`). Ahora usa `execFileSyncHidden`, que lo fuerza
+ *  siempre; se mantiene el parámetro inyectable (misma forma que antes) para los tests. */
+export function commandExists(cmd: string, execSync: typeof execFileSyncHidden = execFileSyncHidden): boolean {
   try {
     if (process.platform === 'win32') {
       execSync('where', [cmd], { stdio: 'ignore' });

@@ -107,6 +107,11 @@ export class RuntimeHost {
   readonly settings: LocalSettingsStore;
   private readonly deps: RuntimeHostDeps;
   private projectRuntime: ProjectRuntime | undefined;
+  /** Bug real v0.2.0 (doc 16, "crash al cerrar"): `dispose()` puede llegar a llamarse más de una vez
+   *  (p. ej. un 'before-quit' que se dispara dos veces) — `Database.close()` de better-sqlite3 lanza
+   *  "The database connection is not open" si se llama sobre una conexión ya cerrada. Este flag hace
+   *  que la segunda llamada sea un no-op en vez de repetir el cierre. */
+  private disposed = false;
 
   constructor(hostAdapter: HostAdapter, deps: RuntimeHostDeps = {}) {
     this.hostAdapter = hostAdapter;
@@ -125,8 +130,11 @@ export class RuntimeHost {
     return initGlobalRuntime(this.deps.runtime, this.deps.defaultWorkingDir ?? this.hostAdapter.paths.userDataDir);
   }
 
-  /** Cierra la base al salir de la app. */
+  /** Cierra la base al salir de la app. Idempotente (ver comentario de `disposed` arriba) — llamarla
+   *  dos veces no vuelve a intentar cerrar una conexión ya cerrada. */
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.deps.runtime?.persistence.close();
   }
 

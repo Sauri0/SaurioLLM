@@ -11,13 +11,12 @@
 import { useEffect, useState } from 'react';
 import type { Chat, Mode, ModelRef, Project } from '@saurio/shared';
 import { invoke } from '../ipc/client.js';
-import { ChatIcon, FolderIcon, CpuIcon, SettingsIcon } from '../ui/icons.js';
+import { ChatIcon, FolderIcon } from '../ui/icons.js';
 import { isDemoMode } from '../demo/demoState.js';
 import { useChatStore } from '../stores/chatStore.js';
 import { useModelsStore } from '../stores/modelsStore.js';
 import { useProvidersStore } from '../stores/providersStore.js';
 import { useOllamaHealthStore } from '../stores/ollamaHealthStore.js';
-import { useUiNavStore } from '../stores/uiNavStore.js';
 import { ModeSelector } from '../features/chat/ModeSelector.js';
 import { ModelSelect } from '../features/models/ModelSelect.js';
 import { pickDefaultModelRef } from './defaultModel.js';
@@ -229,18 +228,6 @@ export function Sidebar({ project, onProjectChange, activeChatId, onSelectChat }
           </div>
         </div>
       )}
-
-      {/* Punto 3 de la tarea "Cerrá lo que falta" ("Accesos a Modelos y Ajustes desde la barra
-          lateral"): antes solo se llegaba a esas dos pestañas clickeando en el panel derecho, que
-          puede no ser obvio para un usuario nuevo. */}
-      <div className="saurio-sidebar-quicklinks">
-        <button type="button" className="saurio-btn-ghost" onClick={() => useUiNavStore.getState().requestTab('Modelos')}>
-          <CpuIcon width={14} height={14} /> Modelos
-        </button>
-        <button type="button" className="saurio-btn-ghost" onClick={() => useUiNavStore.getState().requestTab('Ajustes')}>
-          <SettingsIcon width={14} height={14} /> Ajustes
-        </button>
-      </div>
     </aside>
   );
 }

@@ -5,13 +5,24 @@
 // contra Ollama real (probado con all-minilm, ver packages/runtime/src/models/DownloadManager.ts).
 // models:libraryCatalog/hfSearch/hfFiles/resolveByName/pullExternal son la cobertura máxima del
 // catálogo (doc 16 §12.6, puntos 1-5 del encargo).
-import { ipc, type CatalogItem, type ModelTier, type ResolveModelByNameResult } from '@saurio/shared';
+import {
+  ipc, type CatalogItem, type LibraryCatalogResult, type ModelTier, type ResolveModelByNameResult,
+} from '@saurio/shared';
 import { tierForCatalogWeights } from '@saurio/runtime/models/TierClassifier';
 import { RegistryClient, mergeSnapshotWithCuratedCatalog } from '@saurio/runtime/models/index';
-import type { HardwareProfile, ModelCatalogEntry } from '@saurio/runtime/models/index';
+import type { HardwareProfile, ModelCatalogEntry, OllamaLibrarySnapshot } from '@saurio/runtime/models/index';
 import type { RuntimeHost } from '../host/RuntimeHost.js';
 import { registerHandler } from './registerHandler.js';
 import { toDownloadJob } from '../services/downloads/SqlDownloadsRepository.js';
+
+/** Reenvía `models:libraryUpdated`/`models:libraryUpdateFailed` al renderer (doc 16 §16.5: stale-
+ *  while-revalidate de "Explorar") — mismo patrón que `FilesChangeEmitter` (`ipc/files.ts`): el host
+ *  arma el objeto real (`webContents.send`, requiere la `BrowserWindow`) en `main/index.ts` y lo
+ *  inyecta acá, así esta lógica de "cómo se arma el catálogo fusionado" queda en un solo lugar. */
+export interface LibraryUpdateEmitter {
+  emitUpdated(result: LibraryCatalogResult): void;
+  emitFailed(message: string): void;
+}
 
 /** Estado derivado de una entrada del catálogo curado contra `models`(instalado)/`/api/ps`(cargado)/
  *  descargas en curso (doc 13 §11: estados de ficha, no una columna SQL nueva). */
@@ -40,7 +51,12 @@ function buildCatalogItem(
   const downloadingId = host.downloadManager.isDownloading(fullName)
     ? host.downloadManager.downloadIdFor(fullName)
     : undefined;
-  const tier: ModelTier | undefined = hardware
+  // Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar"): una entrada
+  // `cloud` o `sizeUnresolved` trae `sizeBytes: 0` de placeholder (nunca un tamaño real medido/
+  // confirmado) — calcularle un nivel de la escala mostraría "Perfecto" de forma engañosa. Sin `tier`,
+  // la UI sabe que no hay nada que clasificar todavía (cloud: nunca lo va a haber; sizeUnresolved: la
+  // ficha lo resuelve contra el registry y recién ahí pide `models:tierForSize` con el tamaño real).
+  const tier: ModelTier | undefined = hardware && !entry.cloud && !entry.sizeUnresolved
     ? tierForCatalogWeights(entry.sizeBytes, hardware, { freeDiskBytes })
     : undefined;
   return {
@@ -49,6 +65,36 @@ function buildCatalogItem(
     downloadId: downloadingId,
     tier,
   } satisfies CatalogItem;
+}
+
+/** Arma el `LibraryCatalogResult` que expone `models:libraryCatalog` (curado + snapshot fusionados +
+ *  estado derivado) a partir del resultado crudo de `OllamaLibraryClient.getCatalog()` — factorizado
+ *  para reutilizarse tal cual desde el handler de request/response Y desde el listener de
+ *  `'libraryUpdated'` que arma el evento en segundo plano (doc 16 §16.5, stale-while-revalidate), sin
+ *  duplicar la lógica de "instalado/cargado/hardware/espacio libre" en dos lugares. */
+async function buildLibraryCatalogResult(
+  host: RuntimeHost,
+  raw: { snapshot: OllamaLibrarySnapshot; source: LibraryCatalogResult['source']; cachedAt?: number; syncing?: boolean },
+): Promise<LibraryCatalogResult> {
+  const [installed, loaded, hardware, folder] = await Promise.all([
+    host.modelManager.listInstalled(),
+    host.modelManager.listLoaded().catch(() => []),
+    host.hardwareProbe.sample().catch(() => undefined),
+    host.modelManager.detectedModelsFolder().catch(() => undefined),
+  ]);
+  const installedNames = new Set(installed.map((m) => m.ref.name));
+  const loadedNames = new Set(loaded.map((m) => m.name));
+  const freeDiskBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
+  const merged = mergeSnapshotWithCuratedCatalog(raw.snapshot, host.modelCatalog);
+  return {
+    items: merged.map((entry) => buildCatalogItem(entry, host, installedNames, loadedNames, hardware, freeDiskBytes)),
+    source: raw.source,
+    cachedAt: raw.cachedAt,
+    generatedAt: raw.snapshot.generatedAt,
+    syncing: raw.syncing,
+    familyCount: raw.snapshot.familyCount,
+    variantCount: raw.snapshot.variantCount,
+  };
 }
 
 /** `hf.co/<usuario>/<repo>:<quant>` (formato vigente, verificado contra la doc oficial de HF para
@@ -62,7 +108,7 @@ const HF_REF_RE = /^hf\.co\/([^/]+\/[^:]+):([^:]+)$/;
  *  ya hace `DownloadManager.pull()`/`pullKnownSize()` en el momento de descargar de verdad). */
 const PREVIEW_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024;
 
-export function registerModelsHandlers(host: RuntimeHost): void {
+export function registerModelsHandlers(host: RuntimeHost, libraryUpdates?: LibraryUpdateEmitter): void {
   registerHandler('models:list', ipc['models:list'], async (input) =>
     host.modelManager.listInstalled(input.refresh));
 
@@ -135,27 +181,29 @@ export function registerModelsHandlers(host: RuntimeHost): void {
   // Punto 1/2 del encargo (doc 16 §12.6): biblioteca COMPLETA de Ollama (curado + snapshot fusionados
   // por name:tag, cientos de entradas) en vez de solo las 16 del catálogo curado. `forceRefresh` es el
   // botón "Actualizar catálogo" de la UI; sin él, `OllamaLibraryClient` decide caché/red/empaquetado
-  // según el TTL de 24h (nunca deja el Explorador sin catálogo alguno).
+  // según el TTL de 24h (stale-while-revalidate, doc 16 §16.5: nunca deja el Explorador esperando la
+  // sincronización real de ~13s — devuelve la caché vencida/el snapshot empaquetado de inmediato y
+  // sincroniza en segundo plano, ver `libraryUpdates` más abajo).
   registerHandler('models:libraryCatalog', ipc['models:libraryCatalog'], async (input) => {
-    const [{ snapshot, source, cachedAt }, installed, loaded, hardware, folder] = await Promise.all([
-      host.ollamaLibraryClient.getCatalog({ forceRefresh: input.forceRefresh }),
-      host.modelManager.listInstalled(),
-      host.modelManager.listLoaded().catch(() => []),
-      host.hardwareProbe.sample().catch(() => undefined),
-      host.modelManager.detectedModelsFolder().catch(() => undefined),
-    ]);
-    const installedNames = new Set(installed.map((m) => m.ref.name));
-    const loadedNames = new Set(loaded.map((m) => m.name));
-    const freeDiskBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
-    const merged = mergeSnapshotWithCuratedCatalog(snapshot, host.modelCatalog);
-    return {
-      items: merged.map((entry) => buildCatalogItem(entry, host, installedNames, loadedNames, hardware, freeDiskBytes)),
-      source,
-      cachedAt,
-      familyCount: snapshot.familyCount,
-      variantCount: snapshot.variantCount,
-    };
+    const raw = await host.ollamaLibraryClient.getCatalog({ forceRefresh: input.forceRefresh });
+    return buildLibraryCatalogResult(host, raw);
   });
+
+  // Stale-while-revalidate (doc 16 §16.5): cuando `OllamaLibraryClient` termina una sincronización que
+  // se disparó en segundo plano (ver arriba), arma el mismo `LibraryCatalogResult` y lo reenvía al
+  // renderer (`models:libraryUpdated`) para que "Explorar" se refresque sola. `libraryUpdates` es
+  // `undefined` en los tests de este archivo (host falso sin `BrowserWindow`) y en cualquier llamador
+  // que no lo necesite — no registrar el listener ahí es intencional, no un olvido.
+  if (libraryUpdates) {
+    host.ollamaLibraryClient.on('libraryUpdated', (result) => {
+      buildLibraryCatalogResult(host, { snapshot: result.snapshot, source: 'network', cachedAt: result.cachedAt })
+        .then((payload) => libraryUpdates.emitUpdated(payload))
+        .catch((error: unknown) => libraryUpdates.emitFailed(error instanceof Error ? error.message : String(error)));
+    });
+    host.ollamaLibraryClient.on('libraryUpdateFailed', (error) => {
+      libraryUpdates.emitFailed(error.message);
+    });
+  }
 
   // Punto 3 del encargo: búsqueda de modelos GGUF en Hugging Face por texto libre.
   registerHandler('models:hfSearch', ipc['models:hfSearch'], async (input) =>

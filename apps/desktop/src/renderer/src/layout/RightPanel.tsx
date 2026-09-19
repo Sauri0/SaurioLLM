@@ -1,125 +1,88 @@
-// Panel derecho con pestañas Archivos / Diff / Terminal / Modelos / Rendimiento / Ajustes
-// (doc 02 §1 y §2, doc 01 §4.1 "Paneles del MVP"). apps/desktop/src/renderer/src/layout/RightPanel.tsx.
+// Panel CONTEXTUAL de la vista Chats: Archivos / Cambios / Terminal (punto 2 del encargo de
+// rediseño) — apps/desktop/src/renderer/src/layout/RightPanel.tsx.
 //
-// Pasada de diseño #3: las 6 pestañas con su nombre completo no entraban en los 380px del panel
-// (`--right-panel-width`) y la barra hacía scroll horizontal — "Ajustes" quedaba fuera de vista.
-// Ahora cada pestaña es ícono + etiqueta corta, todas con `flex: 1` (`theme.css` .saurio-tabs), así
-// entran siempre las 6 sin scroll: si el texto no entra, se recorta con ellipsis pero el ícono y el
-// estado activo/seleccionado siguen visibles (el `title` conserva el nombre completo).
-import { lazy, Suspense, useEffect, useState, type ComponentType } from 'react';
-import { useUiNavStore } from '../stores/uiNavStore.js';
-import type { SVGProps } from 'react';
+// Antes este archivo era el panel derecho de TODA la app, angosto (380px) y con siete pestañas
+// (Archivos, Diff, Terminal, Modelos, Agentes, Rendimiento, Ajustes) — con etiquetas abreviadas
+// ("Arch.", "Mod.", "Ag.") porque no entraban todas juntas, que es exactamente lo que reportó un
+// usuario real de la v0.2.0 ("todo junto a la derecha... muchas cosas muy compactas"). Modelos,
+// Agentes, Rendimiento y Ajustes ahora son secciones a pantalla completa de la barra de navegación
+// izquierda (`layout/NavRail.tsx`, `layout/AppLayout.tsx`) — acá solo queda lo que ACOMPAÑA a un
+// chat puntual, con nombre completo (nunca abreviado), colapsable y de ancho ajustable.
+import { lazy, Suspense } from 'react';
+import { useUiNavStore, type ContextTabId } from '../stores/uiNavStore.js';
 import { FilesPanel } from '../features/files/index.js';
 import { DiffPanel } from '../features/diff/index.js';
-import { ModelsPanel } from '../features/models/index.js';
-import { PerfPanel } from '../features/perf/index.js';
-import { SettingsPanel } from '../features/settings/index.js';
-import { AgentsPanel } from '../features/agents/index.js';
-import { useModelsStore } from '../stores/modelsStore.js';
-import { useProvidersStore } from '../stores/providersStore.js';
-import { useChatStore } from '../stores/chatStore.js';
-import { pickDefaultModelRef } from './defaultModel.js';
+import { FileIcon, GitBranchIcon, TerminalIcon, PanelRightIcon, CloseIcon } from '../ui/icons.js';
 
-// Punto 7 del encargo (code-splitting): `@xterm/xterm` no tiene por qué ir en el chunk inicial del
-// renderer si el usuario nunca abre la pestaña Terminal — mismo criterio que `FileViewer` (CodeMirror)
-// en `features/files/FilesPanel.tsx`.
+// Punto 7 del encargo original (code-splitting), sin cambios de comportamiento: `@xterm/xterm` no
+// tiene por qué ir en el chunk inicial del renderer si el usuario nunca abre la pestaña Terminal.
 const TerminalPanel = lazy(() => import('../features/terminal/index.js').then((m) => ({ default: m.TerminalPanel })));
-import { FileIcon, GitBranchIcon, TerminalIcon, CpuIcon, GaugeIcon, SettingsIcon, UserIcon } from '../ui/icons.js';
-import { getDemoRightPanelTab } from '../demo/demoState.js';
 
-type Tab = 'Archivos' | 'Diff' | 'Terminal' | 'Modelos' | 'Agentes' | 'Rendimiento' | 'Ajustes';
-
-const TAB_IDS: Tab[] = ['Archivos', 'Diff', 'Terminal', 'Modelos', 'Agentes', 'Rendimiento', 'Ajustes'];
-
-/** Doc 19 §0: proyecto personal sintético (packages/runtime/src/agent/personalProject.ts,
- *  PERSONAL_PROJECT_ID) — se repite acá el literal en vez de importarlo (la UI no depende
- *  directamente de @saurio/runtime, doc 01 §2 principio 9; mismo criterio que DEFAULT_AGENT_ID en
- *  Sidebar.tsx/ChatCenter.tsx). Un chat directo con un agente personal, sin proyecto abierto, vive ahí. */
-const PERSONAL_PROJECT_ID = 'project_personal';
-
-function initialTab(): Tab {
-  const requested = getDemoRightPanelTab();
-  return (TAB_IDS as string[]).includes(requested ?? '') ? (requested as Tab) : 'Archivos';
-}
-
-// `label` es lo que se ve en la pestaña ACTIVA (icono + texto, doc de la pasada de diseño #3): a
-// 380px / 6 pestañas hay ~60px por pestaña, así que va abreviado; `fullLabel` es el nombre completo,
-// siempre disponible como `title` (tooltip) en cualquier pestaña, activa o no.
-const TABS: { id: Tab; label: string; fullLabel: string; icon: ComponentType<SVGProps<SVGSVGElement>> }[] = [
-  { id: 'Archivos', label: 'Arch.', fullLabel: 'Archivos', icon: FileIcon },
-  { id: 'Diff', label: 'Diff', fullLabel: 'Diff', icon: GitBranchIcon },
-  { id: 'Terminal', label: 'Term.', fullLabel: 'Terminal', icon: TerminalIcon },
-  { id: 'Modelos', label: 'Mod.', fullLabel: 'Modelos', icon: CpuIcon },
-  { id: 'Agentes', label: 'Ag.', fullLabel: 'Agentes', icon: UserIcon },
-  { id: 'Rendimiento', label: 'Rend.', fullLabel: 'Rendimiento', icon: GaugeIcon },
-  { id: 'Ajustes', label: 'Ajus.', fullLabel: 'Ajustes', icon: SettingsIcon },
+const TABS: { id: ContextTabId; icon: typeof FileIcon }[] = [
+  { id: 'Archivos', icon: FileIcon },
+  { id: 'Cambios', icon: GitBranchIcon },
+  { id: 'Terminal', icon: TerminalIcon },
 ];
 
 export interface RightPanelProps {
   projectId: string | null;
   chatId: string | null;
-  /** Doc 19 §1.6: click en un agente de la pestaña "Agentes" abre (o crea) un chat directo con él,
-   *  reusando el flujo de creación de chat existente — mismo criterio que Sidebar.tsx. */
-  onSelectChat?: (chatId: string) => void;
 }
 
-export function RightPanel({ projectId, chatId, onSelectChat }: RightPanelProps): React.JSX.Element {
-  const [tab, setTab] = useState<Tab>(initialTab);
-  const requestedTab = useUiNavStore((s) => s.requestedTab);
-  const clearRequestedTab = useUiNavStore((s) => s.clearRequestedTab);
-  const installedModels = useModelsStore((s) => s.installed);
-  const providers = useProvidersStore((s) => s.providers);
-  const createChat = useChatStore((s) => s.createChat);
+/** Franja angosta que reemplaza al panel cuando está oculto (punto 2: "botón para ocultarlo") — un
+ *  único botón vertical para volver a mostrarlo, siempre visible para que no sea un panel "perdido". */
+export function ContextPanelRail(): React.JSX.Element {
+  const setContextOpen = useUiNavStore((s) => s.setContextOpen);
+  return (
+    <button
+      type="button"
+      className="saurio-context-rail"
+      title="Mostrar panel de archivos, cambios y terminal"
+      onClick={() => setContextOpen(true)}
+    >
+      <PanelRightIcon width={16} height={16} />
+    </button>
+  );
+}
 
-  // Navegación pedida desde afuera del panel (doc del asistente de primer arranque, punto 5:
-  // "Tengo una clave de API" lleva a Ajustes > Proveedores) — ver stores/uiNavStore.ts.
-  useEffect(() => {
-    if (requestedTab && (TAB_IDS as string[]).includes(requestedTab)) {
-      setTab(requestedTab as Tab);
-      clearRequestedTab();
-    }
-  }, [requestedTab, clearRequestedTab]);
+export function RightPanel({ projectId, chatId }: RightPanelProps): React.JSX.Element {
+  const tab = useUiNavStore((s) => s.contextTab);
+  const setTab = useUiNavStore((s) => s.setContextTab);
+  const setContextOpen = useUiNavStore((s) => s.setContextOpen);
+  const width = useUiNavStore((s) => s.contextWidth);
 
   return (
-    <section className="saurio-right-panel" aria-label="Panel de proyecto">
+    <section className="saurio-right-panel" aria-label="Panel de archivos, cambios y terminal" style={{ width }}>
       <div className="saurio-tabs" role="tablist">
-        {TABS.map(({ id, label, fullLabel, icon: Icon }) => (
+        {TABS.map(({ id, icon: Icon }) => (
           <div
             key={id}
             role="tab"
             aria-selected={tab === id}
-            title={fullLabel}
             className={`saurio-tab${tab === id ? ' active' : ''}`}
             onClick={() => setTab(id)}
           >
-            <Icon width={14} height={14} />
-            <span className="saurio-tab__label">{label}</span>
+            <Icon width={15} height={15} />
+            <span className="saurio-tab__label">{id}</span>
           </div>
         ))}
+        <button
+          type="button"
+          className="saurio-context-panel__close"
+          title="Ocultar panel"
+          onClick={() => setContextOpen(false)}
+        >
+          <CloseIcon width={14} height={14} />
+        </button>
       </div>
       <div className="saurio-tab-body">
         {tab === 'Archivos' && <FilesPanel projectId={projectId} />}
-        {tab === 'Diff' && <DiffPanel chatId={chatId} />}
+        {tab === 'Cambios' && <DiffPanel chatId={chatId} />}
         {tab === 'Terminal' && (
           <Suspense fallback={<p className="saurio-empty">Cargando terminal…</p>}>
             <TerminalPanel projectId={projectId} />
           </Suspense>
         )}
-        {tab === 'Modelos' && <ModelsPanel />}
-        {tab === 'Agentes' && (
-          <AgentsPanel
-            installedModels={installedModels}
-            providers={providers}
-            onChatWithAgent={(agent) => {
-              const targetProjectId = projectId ?? PERSONAL_PROJECT_ID;
-              const modelRef = agent.model ?? pickDefaultModelRef(installedModels);
-              if (!modelRef) return; // sin ningún modelo instalado, igual que Sidebar.tsx
-              void createChat(targetProjectId, agent.id, 'agent', modelRef).then((chat) => onSelectChat?.(chat.id));
-            }}
-          />
-        )}
-        {tab === 'Rendimiento' && <PerfPanel />}
-        {tab === 'Ajustes' && <SettingsPanel />}
       </div>
     </section>
   );

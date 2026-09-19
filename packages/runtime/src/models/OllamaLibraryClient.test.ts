@@ -1,6 +1,8 @@
 // Tests de OllamaLibraryClient: caché con TTL de 24h, fallback a caché vencida y a snapshot
-// empaquetado sin red, botón "Actualizar catálogo" (forceRefresh), y resolución perezosa de tamaño
-// exacto vía RegistryClient (incluida la capa projector/mmproj) — packages/runtime/src/models/
+// empaquetado sin red, botón "Actualizar catálogo" (forceRefresh), stale-while-revalidate (doc 16
+// §16.5: sin caché vigente, la caché vencida/el snapshot empaquetado se devuelven de inmediato y la
+// sincronización real corre en segundo plano) y resolución perezosa de tamaño exacto vía
+// RegistryClient (incluida la capa projector/mmproj) — packages/runtime/src/models/
 // OllamaLibraryClient.test.ts.
 import { describe, expect, it, vi } from 'vitest';
 import { OllamaLibraryClient, DEFAULT_LIBRARY_CACHE_TTL_MS, type LibraryCachePort } from './OllamaLibraryClient.js';
@@ -91,17 +93,101 @@ describe('OllamaLibraryClient.getCatalog (caché TTL 24h + fallback)', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2); // no volvió a pedir red
   });
 
-  it('TTL de 24h vencido: vuelve a pedir red', async () => {
+  it('TTL de 24h vencido: sirve la caché vencida DE INMEDIATO (stale-while-revalidate) y sincroniza en segundo plano', async () => {
     const fetchImpl = fakeFetch({ 'https://ollama.com/library': LIST_HTML, 'https://ollama.com/library/qwen3': TAGS_HTML });
     const cache = memoryCache();
     let now = 0;
     const client = new OllamaLibraryClient({ fetchImpl, cache, now: () => now });
 
-    await client.getCatalog();
+    await client.getCatalog(); // sin caché todavía: bloquea (sin cambios), deja la caché escrita
     now += DEFAULT_LIBRARY_CACHE_TTL_MS + 1;
+
+    const updated = new Promise<void>((resolve) => client.once('libraryUpdated', () => resolve()));
     const second = await client.getCatalog();
-    expect(second.source).toBe('network');
-    expect(fetchImpl).toHaveBeenCalledTimes(4); // listado+familia, dos veces
+    // Punto central del cambio (antes: `second.source === 'network'`, bloqueando ~13s contra
+    // ollama.com/library real): ahora la caché vencida se devuelve tal cual, sin esperar la red.
+    expect(second.source).toBe('cache');
+    expect(second.syncing).toBe(true);
+
+    await updated; // la sincronización en segundo plano ya terminó
+    expect(fetchImpl).toHaveBeenCalledTimes(4); // listado+familia, dos veces (la de arranque + la de fondo)
+    const third = await client.getCatalog();
+    expect(third.source).toBe('cache'); // la caché quedó fresca con lo que trajo la sincronización de fondo
+    expect(third.syncing).toBeUndefined();
+  });
+
+  it('stale-while-revalidate: la primera respuesta llega SIN esperar a que la red (lenta) termine, y la actualización llega después', async () => {
+    // Fetch deliberadamente lento: el listado de ollama.com/library no resuelve hasta que el test lo
+    // decide (`resolveList`) — simula los ~13s reales medidos contra el sitio (doc 16 §16.5).
+    let resolveList!: (value: Response) => void;
+    const listPromise = new Promise<Response>((resolve) => { resolveList = resolve; });
+    const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input);
+      if (url === 'https://ollama.com/library') return listPromise;
+      if (url === 'https://ollama.com/library/qwen3') return new Response(TAGS_HTML, { status: 200 });
+      throw new Error(`sin ruta fake para ${url}`);
+    }) as unknown as typeof fetch;
+
+    const bundledSnapshot: OllamaLibrarySnapshot = {
+      generatedAt: 'bundled', source: 'https://ollama.com/library', familyCount: 1, variantCount: 0, families: [],
+    };
+    const client = new OllamaLibraryClient({ fetchImpl, bundledSnapshot });
+
+    let resolved = false;
+    const first = client.getCatalog().then((r) => { resolved = true; return r; });
+    // Deja correr los microtasks pendientes SIN resolver `listPromise` — si la primera respuesta
+    // dependiera de la red lenta, `resolved` seguiría en `false` acá.
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    expect(resolved).toBe(true);
+
+    const firstResult = await first;
+    expect(firstResult.source).toBe('bundled');
+    expect(firstResult.snapshot).toBe(bundledSnapshot);
+    expect(firstResult.syncing).toBe(true);
+
+    // Recién ahora "termina" la red — la actualización en segundo plano llega después.
+    const updated = new Promise<{ snapshot: OllamaLibrarySnapshot; cachedAt: number }>((resolve) => client.once('libraryUpdated', resolve));
+    resolveList(new Response(LIST_HTML, { status: 200 }));
+    const updateResult = await updated;
+    expect(updateResult.snapshot.familyCount).toBe(1);
+    expect(updateResult.snapshot.variantCount).toBe(1);
+  });
+
+  it('dos pedidos mientras la caché está vencida no disparan dos sincronizaciones de fondo en paralelo', async () => {
+    const fetchImpl = fakeFetch({ 'https://ollama.com/library': LIST_HTML, 'https://ollama.com/library/qwen3': TAGS_HTML });
+    const cache = memoryCache();
+    await cache.write(
+      { generatedAt: 'x', source: 'https://ollama.com/library', familyCount: 0, variantCount: 0, families: [] },
+      0,
+    );
+    const client = new OllamaLibraryClient({ fetchImpl, cache, now: () => DEFAULT_LIBRARY_CACHE_TTL_MS * 100 });
+
+    const updated = new Promise<void>((resolve) => client.once('libraryUpdated', () => resolve()));
+    const [a, b] = await Promise.all([client.getCatalog(), client.getCatalog()]);
+    expect(a.source).toBe('cache');
+    expect(b.source).toBe('cache');
+
+    await updated;
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // una sola recorrida de fondo (listado + 1 familia), no dos
+  });
+
+  it('si la sincronización de fondo falla, emite "libraryUpdateFailed" (aviso no bloqueante) y no toca la caché ya mostrada', async () => {
+    const cache = memoryCache();
+    const staleSnapshot: OllamaLibrarySnapshot = {
+      generatedAt: 'x', source: 'https://ollama.com/library', familyCount: 0, variantCount: 0, families: [],
+    };
+    await cache.write(staleSnapshot, 0);
+    const failingFetch = vi.fn(async () => { throw new Error('sin red'); }) as unknown as typeof fetch;
+    const client = new OllamaLibraryClient({ fetchImpl: failingFetch, cache, now: () => DEFAULT_LIBRARY_CACHE_TTL_MS * 100 });
+
+    const failed = new Promise<Error>((resolve) => client.once('libraryUpdateFailed', resolve));
+    const result = await client.getCatalog();
+    expect(result.source).toBe('cache');
+    expect(result.snapshot).toBe(staleSnapshot); // sigue mostrando lo que ya tenía, sin cambios
+
+    const error = await failed;
+    expect(error.message).toMatch(/sin red/);
+    expect((await cache.read())?.snapshot).toBe(staleSnapshot); // la caché no se pisó con nada roto
   });
 
   it('"Actualizar catálogo" (forceRefresh) ignora una caché todavía vigente', async () => {

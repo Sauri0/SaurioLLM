@@ -94,3 +94,18 @@ export function SendIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
 export function UserIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
   return <Svg {...props}><circle cx="12" cy="8" r="4" /><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7" /></Svg>;
 }
+
+/** Rediseño de la barra de navegación izquierda (layout/NavRail.tsx): ítem "Inicio". */
+export function HomeIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
+  return <Svg {...props}><path d="m3 11 9-8 9 8" /><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10" /></Svg>;
+}
+
+/** Rediseño: botón para mostrar/ocultar el panel contextual de la vista Chats (layout/ChatsView.tsx). */
+export function PanelRightIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
+  return <Svg {...props}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></Svg>;
+}
+
+/** Rediseño: cerrar el panel contextual (layout/ChatsView.tsx). */
+export function CloseIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
+  return <Svg {...props}><path d="M18 6 6 18M6 6l12 12" /></Svg>;
+}

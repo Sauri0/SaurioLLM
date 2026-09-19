@@ -773,3 +773,209 @@ además de esta tarea), lint limpio, build genera `out/main`/`out/preload`/`out/
    (duplicación menor, ver §15.2) — no se tocó para no arriesgar una regresión fuera de esta tarea.
 5. `docs/capturas` no tiene una captura de `engineState: 'starting'` ni del banner de carga con un
    modelo real cargando (ver §15.5).
+
+## 16. Bugs reales reportados tras instalar v0.2.0 en una notebook Windows 11 sin NVIDIA (sesión 2026-09-18)
+
+Alcance del encargo: un usuario real instaló la v0.2.0 (Intel Core Ultra 9 288V, iGPU Arc 140V,
+Ollama instalado) y reportó cinco problemas. Zona: `apps/desktop/src/main/**`,
+`packages/runtime/src/{models,telemetry,gateway}`,
+`apps/desktop/src/renderer/src/features/models/**` y stores de modelos — con la excepción explícita
+del punto 2 del encargo ("auditá TODOS los child_process... git status; ripgrep; run_command"), que
+pidió tocar también `packages/runtime/src/{checkpoint,tools}` y `packages/repomap/src/files.ts`
+(fuera de la zona nombrada arriba, pero nombrados literalmente en ese punto). No se tocó
+`apps/desktop/src/renderer/src/{layout,App.tsx,theme.css}` (otro agente reorganizando el layout en
+paralelo en este mismo working tree).
+
+### 16.1 Causas
+
+1. **Crash al cerrar** (diálogo nativo "A JavaScript error occurred in the main process"): `main/
+   index.ts` registraba varios `app.on('before-quit', ...)` sueltos en el orden en que cada pieza se
+   construía durante el arranque, no en el orden en que había que apagarlas. `host.dispose()` (cierra
+   `saurio.db`) se registraba ANTES que `metricsTicker.dispose()` (que vuelca el minuto de métricas
+   en curso a esa misma base) — Electron invoca los listeners de un evento en el orden en que se
+   registraron, así que para cuando `metricsTicker.dispose()` corría, la base ya estaba cerrada y
+   `SqlMetricsMinuteRepository.flush()` (dentro de `BetterSqlite3Driver.prepare()`) reventaba con
+   `TypeError: The database connection is not open` sin capturar. Además, ese diálogo nativo lo
+   muestra un listener de `uncaughtException` que Electron registra por su cuenta al arrancar — nunca
+   se había reemplazado por uno propio.
+2. **Ventanas de consola parpadeando al iniciar**: tres `child_process` reales sin `windowsHide: true`
+   — `SystemSampler.sampleNvidiaSmi` (usaba `util.promisify(execFile)` invocado sin tercer argumento
+   de opciones, por lo que `windowsHide` nunca se aplicaba; corre cada 2s con el panel de rendimiento
+   abierto), `terminal/index.ts::commandExists` (`where`, en cada `terminal:create`) y
+   `run_command.ts::commandExists`/`killTree` (`where`/`taskkill`) y `repomap/files.ts::runRgFiles`
+   (`rg --files`, en cada apertura/reindexado de proyecto). Además, sin caché, `HardwareProbe.sample()`
+   y `SystemSampler.sample()` reintentaban `nvidia-smi` (y, en Windows sin él, PowerShell dos veces
+   más: registro + WMI) en CADA llamada — varias por minuto con el panel de rendimiento abierto, o una
+   por cada apertura de la pestaña Explorar (`models:catalog`/`libraryCatalog`/`resolveByName`/
+   `tierForSize`/`recommend`, que llaman `hardwareProbe.sample()` cada vez) — sabiendo de antemano que
+   iban a fallar en un equipo sin NVIDIA.
+3. **Modelo descargado que no aparece**: `ModelManager.listInstalled()` cachea la lista de modelos
+   instalados por provider (`installedCache`); nada invalidaba esa caché ni emitía el evento
+   `models:changed` (ya definido en el contrato IPC y ya escuchado por `modelsStore` del renderer, sin
+   que nada en `main` lo emitiera nunca) cuando una descarga terminaba. La UI se quedaba con la lista
+   vieja hasta reiniciar la app.
+4. **Modelos con "X" / sin poder descargar en Explorar**: `mergeSnapshotWithCuratedCatalog` descartaba
+   en silencio (`continue`) toda variante sin `sizeBytes` confirmado — dos casos reales confirmados
+   contra `ollama.com/library` en vivo: (a) variantes de NUBE (`gpt-oss:20b-cloud`,
+   `gpt-oss:120b-cloud`, etc. — 25 variantes reales en el snapshot de esta sesión), que ollama.com
+   nunca les publica un tamaño de descarga porque corren en sus servidores, no en la PC del usuario;
+   (b) variantes LOCALES cuyo tamaño falló al parsear el HTML. Las dos desaparecían del catálogo sin
+   ninguna explicación en vez de mostrarse con contexto.
+5. **Updater**: auditado, ya cumplía lo pedido antes de esta tarea (no verificado hasta ahora con una
+   corrida real) — `shouldStartAutoUpdater`/`startAutoUpdater` no bloquean el arranque (fire-and-forget,
+   se llama al final de `app.whenReady().then(...)`, después de crear la ventana), y `fileLogger`
+   escribe en `userData/logs/updater.log`.
+
+### 16.2 Hecho
+
+1. **Apagado único, ordenado e idempotente** (`apps/desktop/src/main/host/shutdown.ts`,
+   `createShutdown()`): para tickers/pollers (`metricsTicker.dispose()`, que incluye el flush del
+   minuto en curso) → limpieza sin dependencia de la base (terminales, watchers de archivos, batcher
+   de eventos, desuscripción de descargas) → cierra persistencia (`host.dispose()`, ahora idempotente
+   con un flag `disposed`) → detiene el Ollama propio. Un único `app.on('before-quit', createShutdown(...))`
+   al final de `main/index.ts`, reemplazando los `app.on('before-quit', ...)` sueltos. Guarda adicional
+   en `SqlMetricsMinuteRepository.flush()`/`pruneOlderThan30Days()`: si el driver ya está cerrado
+   (`TypeError: The database connection is not open`, mensaje verbatim de better-sqlite3), se
+   descarta con un `console.warn` en vez de propagar la excepción. Manejador global de
+   `uncaughtException` (`process.removeAllListeners('uncaughtException')` + uno propio): durante el
+   apagado (`isQuitting`) nunca muestra el diálogo nativo; fuera del apagado muestra un
+   `dialog.showErrorBox` propio en vez de depender del listener interno de Electron.
+2. **Auditoría de `child_process` completa** (main + runtime + repomap): wrapper único por paquete
+   (`spawnHidden`/`execFileHidden`/`execFileSyncHidden` — `apps/desktop/src/main/services/process/
+   spawnHidden.ts`, `packages/runtime/src/util/spawnHidden.ts`, `packages/repomap/src/spawnHidden.ts`;
+   duplicados a propósito, no hay una dependencia común entre los tres paquetes que no sea
+   `@saurio/shared`, que es pura por diseño y no debía ganar código Node). Corregidos:
+   `SystemSampler.sampleNvidiaSmi` (ahora `execFileHidden`), `terminal/index.ts::commandExists` y
+   `run_command.ts::commandExists`/`killTree` (ahora `execFileSyncHidden`), `repomap/
+   files.ts::runRgFiles` (ahora `spawnHidden`). Los call-sites que ya pasaban `windowsHide: true`
+   (`checkpoint/git.ts`, `models/CommandRunner.ts`, `tools/builtin/search_code.ts`,
+   `services/ollama-process/index.ts`) se dejaron como estaban. Test de grep sobre el código fuente en
+   los tres paquetes (`childProcessWindowsHide.test.ts`): falla si algún archivo importa
+   `spawn/exec/execFile/execSync/spawnSync/execFileSync` directo de `node:child_process` sin mencionar
+   `windowsHide` en ese archivo. Caché de detección de hardware: `HardwareProbe.sample()` cachea el
+   resultado del sondeo de GPU (nvidia-smi → log de inference compute de Ollama → registro/WMI →
+   memoria unificada) una única vez por instancia, con `refreshGpu()` como refresco manual;
+   `SystemSampler` agrega la misma bandera (`gpuProbeAttempted`) con `refreshGpuAvailability()`. El
+   `MetricsTicker` ya solo muestreaba con el panel abierto o actividad real del gateway (doc 14 §6/§8,
+   no era parte de este bug).
+3. **`models:changed` real**: `main/index.ts` ahora invalida la caché de `ModelManager`
+   (`listInstalled(true)`) y emite `models:changed` con la lista fresca al terminar una descarga
+   (`onDone` de `host.onDownloadEvent`), ANTES de reenviar `download:done` al renderer. `modelsStore`
+   ya escuchaba ese evento (sidebar, cabecera del chat vía `ChatCenter`/`ChatPanel`, pantalla de
+   inicio vía `HomeScreen`, `RightPanel`, `StatusBar` — todos leen `useModelsStore`) — con la emisión
+   real, se actualizan solos sin reiniciar. La pestaña "Instalados" (`ModelsPanel.tsx`) mantiene
+   estado local propio (no usa el store) — se le agregó su propio listener de `models:changed` para
+   refrescarse igual. "Usar este modelo" ya existía en Explorar tras una descarga (`ExploreTab.tsx`,
+   botón condicionado a `status !== 'not_installed'`); no hacía falta agregarlo.
+4. **Modelos de NUBE y variantes sin tamaño resuelto**: `ModelCatalogEntry` gana dos campos
+   opcionales (`cloud`, `sizeUnresolved` — `packages/shared/src/domain.ts` y `packages/runtime/src/
+   models/types.ts`). `mergeSnapshotWithCuratedCatalog` (`ollamaLibrarySnapshot.ts`) ya no descarta
+   variantes sin tamaño: detecta NUBE por el tag (`isCloudTag`: literalmente `"cloud"` o terminado en
+   `"-cloud"` — señal estable por-variante, confirmada en vivo contra `ollama.com/library/gpt-oss`) y
+   las marca `cloud: true`; las que no son cloud pero igual no tienen tamaño quedan `sizeUnresolved:
+   true`. `ipc/models.ts::buildCatalogItem` no calcula nivel de la escala para ninguna de las dos (el
+   `sizeBytes: 0` de placeholder daría un "Perfecto" engañoso). En el renderer (`ExploreTab.tsx`,
+   `exploreLogic.ts`): filtro `showCloud` (`false` por defecto — las variantes NUBE quedan ocultas
+   hasta que el usuario las pide con el checkbox "Mostrar modelos en la nube"), insignia NUBE (badge
+   `.saurio-badge.cloud`, ya existente en `layout/theme.css` para providers cloud) con texto explícito
+   ("se ejecuta en los servidores de Ollama, no en tu PC") y sin botón "Descargar"; la ficha lateral
+   (`VariantSidePanel`) resuelve `sizeUnresolved` contra el registry de Ollama al seleccionarse
+   (`models:resolveByName`, ya existente) y queda descargable con el tamaño real. Nunca aparece un
+   ícono sin explicación.
+
+### 16.3 Verificación real
+
+- `pnpm typecheck`: verde.
+- `pnpm test`: **861 tests en verde + 2 skipped** (repomap 14, runtime 655+2 skipped, desktop 192 —
+  incluye los tests nuevos de esta tarea: `shutdown.test.ts`, `SqlMetricsMinuteRepository.test.ts`,
+  `childProcessWindowsHide.test.ts` ×3, casos nuevos en `HardwareProbe.test.ts`/`system-sampler/
+  index.test.ts`/`ollamaLibrarySnapshot.test.ts`/`exploreLogic.test.ts`, y el e2e real de abajo).
+- `pnpm lint`: verde.
+- `pnpm build`: verde (`out/main`, `out/preload`, `out/renderer`).
+- `pnpm --filter @saurio/desktop run build:installer`: verde, genera `release/win-unpacked/
+  SaurioLLM.exe` y `release/SaurioLLM-Setup-0.2.0.exe` (firmados con `signtool.exe`, sin certificado
+  real — mismo comportamiento ya documentado en `docs/INSTALAR.md`).
+- **Smoke del exe empaquetado** (`SAURIO_USER_DATA=<temp>`, `SAURIO_SMOKE=1`): `ExitCode=0`, sin
+  diálogo nativo, sin procesos `SaurioLLM.exe` remanentes tras el cierre — reproduce el escenario
+  exacto del bug 1 (cierre limpio de la app empaquetada, no solo en `pnpm dev`).
+- **Smoke del exe empaquetado con `SAURIO_NO_UPDATE` sin setear** (para verificar el punto 5): el
+  updater arranca, loguea `arrancando (isPackaged=true, devFeedUrl=(ninguno))` en
+  `<userData>/logs/updater.log`, y la app sigue cerrando limpio (`ExitCode=0`) — no bloquea el
+  arranque ni el cierre.
+- **Smoke del exe empaquetado con `SAURIO_SMOKE_UI=1`**: `rootHtmlLength=8589` (> 0) — la UI (con los
+  cambios de Explorar/Instalados de este punto) sigue renderizando.
+- **Descarga real contra Ollama 0.34.1 en `127.0.0.1:11434`** (punto 3, verificado de verdad, no
+  simulado): test de integración nuevo `apps/desktop/src/main/host/
+  createRuntime.modelsChanged.e2e.test.ts` — descarga `all-minilm:latest` real, confirma que
+  `listInstalled(false)` (caché vieja, sin invalidar) sigue sin mostrarlo tras el `done` (reproduce el
+  bug), y que `listInstalled(true)` (lo que `broadcastModelsChanged` llama ahora) sí lo muestra sin
+  reiniciar nada, y borra el modelo al final (la máquina queda como estaba: `qwen2.5-coder:7b`,
+  `qwen3:8b`, `gemma4:31b`, `gemma4:26b`, verificado con `GET /api/tags` después de la corrida).
+
+### 16.4 Pendiente / limitaciones conocidas
+
+1. El scraper de `ollama.com/library` sigue sin manejar el caso de una variante NUBE cuyo tag no siga
+   el patrón `"cloud"`/`"*-cloud"` (no se encontró ningún caso así en el snapshot real de 858
+   variantes de esta sesión, pero el sitio podría cambiar el formato).
+2. La caché de GPU de `HardwareProbe`/`SystemSampler` es indefinida dentro del proceso (hasta
+   `refreshGpu()`/`refreshGpuAvailability()`, que ningún canal IPC llama todavía) — no hay un botón
+   "Actualizar hardware" en la UI; conectar/desconectar una GPU externa en caliente no se refleja
+   hasta reiniciar la app. Fuera de alcance de esta tarea (no reportado por el usuario).
+3. No se verificó con capturas de pantalla el checkbox "Mostrar modelos en la nube" ni la insignia
+   NUBE (verificado por lectura de código + tests unitarios/build/typecheck, no con una captura
+   propia — mismo límite que ya declara §15.5 para otros elementos de UI).
+4. `electron-updater` puede spawnear procesos propios (p. ej. `7za.exe` al aplicar un update
+   diferencial) — son internos de esa dependencia de terceros, fuera del código fuente auditado en el
+   punto 2 del encargo.
+
+### 16.5 Adenda (agregado del director): Explorar mostraba "Página 1 de 1 (0 modelos)" durante la carga
+
+Sobre `docs/capturas/smoke-models-explore.png` (tomada por el agente de layout contra Ollama real, en
+esta misma sesión, con el checkbox "Mostrar modelos en la nube" del punto 4 de arriba ya en pantalla —
+confirma que la captura es posterior a esos cambios): la pestaña Explorar > "Biblioteca de Ollama"
+mostraba "Página 1 de 1 (0 modelos)" sin ningún error visible.
+
+**Investigación** (script puntual contra `createGlobalRuntime`, no commiteado, y el test nuevo de
+abajo):
+- La resolución de recursos NO estaba rota: con `appPath`/`resourcesPath` de dev (`apps/desktop`,
+  `resourcesPath: undefined`) y con los reales del empaquetado (`release/win-unpacked/resources`),
+  `readResourceFile('model-catalog.snapshot.json', ...)` encuentra el archivo real y
+  `loadOllamaLibrarySnapshot` lo parsea sin error en los dos casos (`familyCount: 240`,
+  `variantCount: 858`, snapshot regenerado hoy).
+- Con `fetch('https://ollama.com/...')` forzado a fallar (simula "sin red"), `OllamaLibraryClient.
+  getCatalog()` cae al snapshot empaquetado real y devuelve `source: 'bundled'` con las 858 variantes
+  — el fallback funciona de punta a punta, no solo en el test unitario aislado de
+  `OllamaLibraryClient.test.ts` (que ya lo cubría con un snapshot fake en memoria).
+- **Causa real**: contra Ollama/red real (sin caché en `userData` todavía — primera vez que se abre
+  la app), `getCatalog()` sincroniza en vivo las ~240 familias de `ollama.com/library`
+  (concurrencia 6) — **medido en esta sesión: ~13 segundos** (`elapsedMs: 12988` para
+  `variantCount: 858`, `source: 'network'`). `ExploreTab.tsx` disparaba ese pedido al montar y, MIENTRAS
+  seguía en curso (`loading: true`), la condición que decidía entre "lista" y "estado vacío" no
+  distinguía "todavía cargando" de "0 resultados genuinos" — mostraba la MISMA paginación
+  "Página 1 de 1 (0 modelos)" en los dos casos. El smoke de captura de pantalla
+  (`SAURIO_SMOKE_SHOT`/`SAURIO_SMOKE_CLICK`) espera un margen fijo de ~1.5-2s, muy por debajo de los
+  ~13s reales — de ahí la captura con 0 modelos sin que hubiera ningún error ni el catálogo
+  empaquetado estuviera roto.
+
+**Arreglado** (`ExploreTab.tsx`): mientras `loading && items.length === 0`, se muestra un estado
+"Cargando catálogo…" explícito ("Puede tardar la primera vez... si tarda demasiado o falla, cae al
+catálogo incluido con la app") en vez de la paginación vacía; el banner de error suma un botón
+"Reintentar" (llama a `refresh(false)` de nuevo).
+
+**Verificación real** (packaged, `SAURIO_USER_DATA` limpio, red y Ollama reales, sin
+`SAURIO_NO_UPDATE` afectando esto):
+- Captura a ~2.4s de abrir Explorar (antes del fix hubiera mostrado "0 modelos"; con el fix muestra
+  "Cargando catálogo…" con la explicación): ver evidencia de esta sesión (script de captura, no
+  incluida como archivo commiteado — `docs/capturas/` es zona del agente de layout).
+- Captura a ~14s (clicks repetidos para dar tiempo): la sincronización real seguía en curso (>13s
+  medidos más arriba con margen); seguía mostrando "Cargando catálogo…" correctamente, nunca "0
+  modelos" de forma ambigua.
+- `apps/desktop/src/main/host/createRuntime.libraryCatalog.test.ts` (nuevo): con `userData` vacío y
+  `fetch` hacia `ollama.com` forzado a fallar, verifica que `getCatalog()` cae al snapshot empaquetado
+  real (no un fake) con `variantCount > 500`, contra las dos combinaciones reales de
+  `appPath`/`resourcesPath` (dev y el `release/win-unpacked/resources` de un build empaquetado si
+  existe en el checkout).
+
+**Conteo real de modelos listados** (evidencia pedida): dev, contra red real, `source: 'network'`,
+**858 variantes** en **240 familias**, ~13s. Empaquetado, con red simulada caída, `source: 'bundled'`,
+**858 variantes** (mismo snapshot, `release/win-unpacked/resources/model-catalog.snapshot.json`).

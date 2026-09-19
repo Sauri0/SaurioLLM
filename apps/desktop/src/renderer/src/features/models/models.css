@@ -68,6 +68,11 @@
 .saurio-models-title-icon { margin-right: 6px; }
 .saurio-models-folder-row { margin-bottom: var(--space-2); }
 
+/* Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar"): checkbox
+   "Mostrar modelos en la nube" — mismo look de `.saurio-filter-chip`, con la casilla alineada. */
+.saurio-explore__cloud-toggle { display: inline-flex; align-items: center; gap: 4px; }
+.saurio-explore__cloud-toggle input { margin: 0; }
+
 /* Escala de seis niveles (TierClassifier, punto 3 del encargo "cobertura máxima del catálogo"):
    tokens propios porque el set de `--success/--warning/--danger` de layout/theme.css solo cubre tres
    colores y acá hacen falta seis, uno por nivel. `teal`/`orange`/`gray` son nuevos; `green`/`yellow`/

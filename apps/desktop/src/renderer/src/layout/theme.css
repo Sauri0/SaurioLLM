@@ -38,15 +38,17 @@
   --danger-subtle: rgba(229, 100, 92, 0.14);
   --info: #5b9dff;
 
-  /* Tipografía */
+  /* Tipografía — pasada de rediseño de arquitectura de información (punto 3, "densidad": subir
+     tamaños de fuente respecto de la pasada visual anterior; --text-xs queda igual a propósito, la
+     usan badges/pills chicos que no son texto de lectura). */
   --font-sans: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
   --font-mono: 'Cascadia Code', 'JetBrains Mono', ui-monospace, 'Consolas', monospace;
   --text-xs: 11px;
-  --text-sm: 12px;
-  --text-base: 13px;
-  --text-md: 14px;
-  --text-lg: 16px;
-  --text-xl: 20px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 21px;
   --leading-tight: 1.3;
   --leading-normal: 1.55;
 
@@ -73,10 +75,13 @@
   /* Foco accesible (AA): anillo de 2px, siempre visible con teclado */
   --focus-ring: 0 0 0 2px var(--bg-1), 0 0 0 4px var(--accent);
 
-  /* Layout */
-  --sidebar-width: 232px;
-  --right-panel-width: 380px;
-  --statusbar-height: 28px;
+  /* Layout — rediseño de arquitectura de información: barra de navegación izquierda (angosta, ícono +
+     etiqueta) + secciones a pantalla completa, en vez del trío sidebar/centro/panel-de-7-pestañas de
+     antes. El panel contextual de la vista Chats (Archivos/Cambios/Terminal) ya no tiene un ancho
+     fijo acá: es arrastrable (`stores/uiNavStore.ts` guarda `contextWidth` y lo aplica inline). */
+  --nav-rail-width: 96px;
+  --chats-sidebar-width: 264px;
+  --statusbar-height: 32px;
 
   /* Alias retrocompatibles (features todavía no migradas del todo) */
   --saurio-bg: var(--bg-0);
@@ -170,19 +175,89 @@ kbd {
   color: var(--text-secondary);
 }
 
-/* ── Shell de la app: sidebar + centro + panel derecho + barra de estado ─────────────────── */
+/* ── Shell de la app: barra de navegación + sección activa + barra de estado ─────────────────
+   Rediseño de arquitectura de información: antes esto era una grilla de TRES columnas fijas
+   (sidebar/chat/panel-de-7-pestañas, siempre las tres a la vez). Ahora son dos: la barra de
+   navegación angosta (`NavRail.tsx`, siempre la misma) y la sección activa a pantalla completa
+   (`saurio-view-root`) — Inicio, Chats (que adentro arma sus propias tres columnas, `ChatsView.tsx`),
+   Modelos, Agentes, Rendimiento o Ajustes. */
 
 .saurio-app {
   display: grid;
-  grid-template-columns: var(--sidebar-width) 1fr var(--right-panel-width);
+  grid-template-columns: var(--nav-rail-width) 1fr;
   grid-template-rows: 1fr var(--statusbar-height);
   height: 100vh;
   width: 100vw;
   overflow: hidden;
 }
 
-.saurio-sidebar {
+.saurio-view-root {
   grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* ── Barra de navegación izquierda (NavRail.tsx) ─────────────────────────────────────────────
+   Angosta pero SIEMPRE ícono + etiqueta (punto 1 del encargo: "nunca solo ícono") — a diferencia de
+   las pestañas de 380px de antes, acá hay lugar de sobra para las seis sin abreviar nada. */
+.saurio-nav-rail {
+  grid-row: 1;
+  width: var(--nav-rail-width);
+  background: var(--bg-1);
+  border-right: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: var(--space-3) var(--space-2);
+  overflow-y: auto;
+}
+.saurio-nav-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px 2px;
+  border-radius: var(--radius-md);
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  line-height: 1.2;
+  cursor: pointer;
+  min-height: 58px;
+}
+/* Ninguna etiqueta se abrevia (punto 3 del encargo: "nada de texto abreviado tipo 'Mod.'/'Ag.'") —
+   "Rendimiento" es la más larga; en vez de recortarla con ellipsis, se deja envolver en dos líneas. */
+.saurio-nav-item span.saurio-nav-item__label {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  max-width: 100%;
+  text-align: center;
+}
+.saurio-nav-item:hover:not(.active) { background: var(--bg-3); color: var(--text-primary); }
+.saurio-nav-item.active {
+  background: var(--accent-subtle);
+  color: var(--accent-hover);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+/* ── Vista Chats (ChatsView.tsx): columna de proyecto/chats + centro + panel contextual ────── */
+
+.saurio-chats-view {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.saurio-sidebar {
+  flex: 0 0 var(--chats-sidebar-width);
   background: var(--bg-1);
   border-right: 1px solid var(--border-subtle);
   display: flex;
@@ -194,29 +269,31 @@ kbd {
 }
 
 .saurio-sidebar h2 {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-muted);
-  padding: var(--space-4) var(--space-3) var(--space-1);
+  padding: var(--space-4) var(--space-3) var(--space-2);
   margin: 0;
 }
 
 .saurio-sidebar-section {
-  padding: 0 var(--space-2);
+  padding: 0 var(--space-3);
 }
 
 .saurio-sidebar-item {
-  padding: 6px 10px;
+  padding: 9px 12px;
   border-radius: var(--radius-md);
   cursor: pointer;
   color: var(--text-secondary);
-  margin: 1px 0;
+  margin: 2px 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
   min-width: 0;
+  min-height: 34px;
+  justify-content: center;
 }
 .saurio-sidebar-item:hover { background: var(--bg-3); color: var(--text-primary); }
 .saurio-sidebar-item.active { background: var(--accent-subtle); color: var(--text-primary); font-weight: 500; }
@@ -224,33 +301,18 @@ kbd {
 .saurio-sidebar-item__badges { display: flex; gap: 4px; overflow: hidden; }
 .saurio-sidebar-item__badges .saurio-badge { margin-left: 0; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
 
-.saurio-sidebar-new-chat { width: 100%; }
+.saurio-sidebar-new-chat { width: 100%; min-height: 34px; }
 
-/* Punto 7 del encargo: reemplazan los `style={{...}}` inline que quedaban en Sidebar.tsx. */
-.saurio-sidebar-open-project-btn { width: 100%; margin-bottom: var(--space-2); }
-.saurio-sidebar-error { margin: 0 var(--space-2); }
+/* Punto 7 del encargo original: reemplazan los `style={{...}}` inline que quedaban en Sidebar.tsx. */
+.saurio-sidebar-open-project-btn { width: 100%; margin-bottom: var(--space-2); min-height: 34px; }
+.saurio-sidebar-error { margin: 0 var(--space-3); }
 .saurio-sidebar-empty-state { padding: 24px var(--space-3); }
 
 .saurio-sidebar-chats {
   flex: 1;
   overflow-y: auto;
   min-height: 60px;
-}
-
-/* Accesos directos a Modelos/Ajustes (punto 3 de la tarea "Cerrá lo que falta"). */
-.saurio-sidebar-quicklinks {
-  flex: 0 0 auto;
-  display: flex;
-  gap: var(--space-2);
-  padding-top: var(--space-2);
-}
-.saurio-sidebar-quicklinks button {
-  flex: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-1);
-  font-size: var(--text-xs);
+  padding: 0 var(--space-1);
 }
 
 /* Bloque "próximo chat": fijo abajo de la barra lateral (no scrollea con la lista de chats),
@@ -278,13 +340,14 @@ kbd {
   color: var(--text-primary);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  padding: 6px;
+  padding: 7px;
+  min-height: 34px;
   font-size: var(--text-sm);
 }
 
 .saurio-project-card {
-  margin: 0 var(--space-2) var(--space-2);
-  padding: var(--space-2) var(--space-2);
+  margin: 0 var(--space-3) var(--space-2);
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-md);
   background: var(--bg-3);
   border: 1px solid var(--border-subtle);
@@ -299,12 +362,11 @@ kbd {
 .saurio-project-card__path { font-size: var(--text-xs); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .saurio-main {
-  grid-row: 1;
+  flex: 1;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   background: var(--bg-2);
-  border-right: 1px solid var(--border-subtle);
   min-width: 0;
 }
 
@@ -322,51 +384,70 @@ kbd {
   min-height: 0;
 }
 
+/* ── Panel contextual de la vista Chats: Archivos / Cambios / Terminal (punto 2 del encargo) ──
+   Ya no es un panel de ancho fijo con 7 pestañas abreviadas: son 3, con nombre completo, y el panel
+   se puede ocultar (`.saurio-context-rail`) o arrastrar más ancho/angosto (`.saurio-context-resize-handle`,
+   `stores/uiNavStore.ts`). */
 .saurio-right-panel {
-  grid-row: 1;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   background: var(--bg-1);
+  border-left: 1px solid var(--border-subtle);
   min-width: 0;
 }
 
-/* Pasada de diseño #3: nunca scroll horizontal acá — cada pestaña es flex:1 (se reparten el ancho
-   disponible) con ícono + etiqueta corta que se recorta con ellipsis antes de desbordar; el `title`
-   de cada pestaña conserva el nombre completo para el tooltip. */
+.saurio-context-resize-handle {
+  flex: 0 0 4px;
+  cursor: col-resize;
+  background: transparent;
+}
+.saurio-context-resize-handle:hover,
+body.saurio-resizing .saurio-context-resize-handle { background: var(--accent-subtle); }
+body.saurio-resizing { cursor: col-resize; user-select: none; }
+
+/* Franja angosta que reemplaza al panel contextual cuando está oculto — un botón siempre visible
+   para volver a mostrarlo, para que "ocultar" nunca se sienta como "perder" el panel. */
+.saurio-context-rail {
+  flex: 0 0 40px;
+  border: none;
+  border-left: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: var(--bg-1);
+  color: var(--text-muted);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: var(--space-3);
+}
+.saurio-context-rail:hover { background: var(--bg-3); color: var(--text-primary); }
+
 .saurio-tabs {
   display: flex;
+  align-items: stretch;
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
-  overflow: hidden;
   padding: 0 var(--space-1);
 }
 
-/* 6 pestañas en 380px no entran como texto completo sin recortarse feo ("Arc…", "Ren…"). En vez de
-   eso: ícono siempre visible (nunca se corta) + etiqueta corta que solo se muestra en la pestaña
-   activa (con `title` en todas para el nombre completo al pasar el mouse) — ninguna pestaña queda
-   nunca con texto truncado a la mitad, y las 6 siguen entrando sin scroll horizontal. */
+/* Con solo 3 pestañas (antes 7) sobra espacio de sobra para el nombre completo, siempre visible —
+   nunca más "Arch."/"Term." abreviado (feedback real de un usuario de la v0.2.0). */
 .saurio-tab {
   flex: 1 1 0;
   min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  padding: 9px 4px;
+  gap: 6px;
+  padding: 11px 6px;
+  min-height: 40px;
   cursor: pointer;
-  font-size: 10px;
+  font-size: var(--text-sm);
   color: var(--text-muted);
   border-bottom: 2px solid transparent;
 }
 .saurio-tab svg { flex: 0 0 auto; }
-/* PRIORIDAD CERO punto 4 (bloqueo real reportado tras instalar v0.1: "las pestañas del panel
-   derecho son iconos sin texto" — la app se sentía "solo chat"). Antes esto era `display: none` por
-   defecto y solo `.saurio-tab.active .saurio-tab__label` lo mostraba: CADA pestaña YA traía su
-   `label` en el JSX (`layout/RightPanel.tsx`, "Arch.", "Diff", "Term.", "Mod.", "Rend.", "Ajus."),
-   pero el CSS los escondía para las 5 que no estaban activas — confirmado con una captura real
-   (SAURIO_SMOKE_SHOT) antes de este cambio. Ahora el texto se ve siempre, no solo en la pestaña
-   activa. */
 .saurio-tab__label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -374,6 +455,17 @@ kbd {
 }
 .saurio-tab:hover { color: var(--text-primary); }
 .saurio-tab.active { color: var(--text-primary); border-bottom-color: var(--accent); font-weight: 500; }
+
+.saurio-context-panel__close {
+  flex: 0 0 auto;
+  align-self: center;
+  margin: 0 var(--space-2) 0 0;
+  padding: 5px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+.saurio-context-panel__close:hover { color: var(--text-primary); background: var(--bg-3); }
 
 .saurio-tab-body {
   flex: 1;
@@ -540,6 +632,56 @@ kbd {
 .saurio-row__line { font-size: var(--text-xs); color: var(--text-secondary); margin-top: 3px; }
 
 .saurio-metric-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); margin-bottom: var(--space-3); }
-.saurio-metric-table td { padding: 5px 0; border-bottom: 1px solid var(--border-subtle); }
+.saurio-metric-table td { padding: 6px 0; border-bottom: 1px solid var(--border-subtle); }
 .saurio-metric-table td:first-child { color: var(--text-secondary); width: 45%; }
 .saurio-metric-table tr:last-child td { border-bottom: none; }
+
+/* ── Secciones a pantalla completa (Modelos / Agentes / Rendimiento / Ajustes, WideView.tsx) ──
+   Punto 1 del encargo de rediseño: "usan todo el ancho... tarjetas/listas amplias, tipografía base
+   14-15px, espaciado generoso, máximo de ancho de lectura". Los paneles en sí no cambiaron (siguen
+   siendo `.saurio-panel__header`/`.saurio-row-list`/`.saurio-metric-table`, definidos arriba) — acá
+   solo se les da más aire cuando viven dentro de esta envoltura ancha, así no hace falta tocar
+   features/models/**, features/agents/**, features/perf/** ni features/settings/**. */
+.saurio-view {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--bg-2);
+}
+.saurio-view--wide {
+  padding: var(--space-8) var(--space-6);
+}
+.saurio-view__inner {
+  max-width: 1040px;
+  margin: 0 auto;
+  width: 100%;
+}
+.saurio-view--wide .saurio-panel__header,
+.saurio-view--wide .agents-panel__header {
+  margin-bottom: var(--space-5);
+}
+.saurio-view--wide .saurio-panel__title,
+.saurio-view--wide .agents-panel__header h2 {
+  font-size: var(--text-xl);
+}
+.saurio-view--wide h3 {
+  font-size: var(--text-md);
+  margin: var(--space-6) 0 var(--space-3);
+}
+.saurio-view--wide .saurio-row-list { gap: var(--space-3); }
+.saurio-view--wide .saurio-row { padding: var(--space-3) var(--space-4); }
+.saurio-view--wide .saurio-empty-state { padding: var(--space-8) var(--space-6); }
+
+/* ── Ajustes de densidad (punto 3 del encargo de rediseño): más aire y controles de al menos
+   32-36px de alto que la pasada de diseño visual anterior, sin tocar los controles chicos a
+   propósito (chips de filtro, subpestañas) que siguen siendo compactos por diseño. */
+button.saurio-btn-primary,
+button.saurio-btn-ghost,
+button.saurio-btn-danger {
+  min-height: 34px;
+  padding: 7px 14px;
+}
+input[type="text"], input[type="number"], select, textarea {
+  min-height: 34px;
+  padding: 7px 10px;
+}

@@ -124,4 +124,39 @@ describe('HardwareProbe', () => {
     expect(a.fingerprint).toBe(b.fingerprint);
     expect(a.fingerprint).toHaveLength(64); // sha256 hex
   });
+
+  // Bug real v0.2.0 ("cachear la detección de hardware... no reintentar en bucle fuentes que no
+  // existen"): en un equipo sin NVIDIA, cada canal IPC que llama sample() (models:catalog,
+  // libraryCatalog, resolveByName, tierForSize, recommend) NO debería volver a spawnear nvidia-smi/
+  // PowerShell — la detección de GPU se cachea una vez por arranque.
+  it('sample() cachea la detección de GPU: llamarlo varias veces no vuelve a invocar el runner', async () => {
+    const runner: CommandRunner = vi.fn().mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'nvidia-smi') throw new Error('not found');
+      if (args.some((a) => a.includes('qwMemorySize'))) return { stdout: '8589934592\n', stderr: '' };
+      throw new Error('unexpected command');
+    });
+    const probe = new HardwareProbe({ runner, now: () => 1000, platformOverride: 'win32' });
+
+    await probe.sample();
+    await probe.sample();
+    await probe.sample();
+
+    // nvidia-smi + registro qwMemorySize: 2 invocaciones en la PRIMERA sample() y ninguna más.
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshGpu() fuerza a volver a sondear todas las fuentes de GPU', async () => {
+    const runner: CommandRunner = vi.fn().mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'nvidia-smi') throw new Error('not found');
+      if (args.some((a) => a.includes('qwMemorySize'))) return { stdout: '8589934592\n', stderr: '' };
+      throw new Error('unexpected command');
+    });
+    const probe = new HardwareProbe({ runner, now: () => 1000, platformOverride: 'win32' });
+
+    await probe.sample();
+    probe.refreshGpu();
+    await probe.sample();
+
+    expect(runner).toHaveBeenCalledTimes(4);
+  });
 });

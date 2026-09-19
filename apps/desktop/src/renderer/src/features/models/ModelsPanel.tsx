@@ -11,7 +11,7 @@
 // panel sin depender de que Ollama esté corriendo en la máquina que toma la captura.
 import { useCallback, useEffect, useState } from 'react';
 import type { LoadedModel, MemoryEstimate, ModelInfo, ModelRef, ModelsFolderInfo, ProviderHealth } from '@saurio/shared';
-import { invoke } from '../../ipc/client.js';
+import { invoke, onEvent } from '../../ipc/client.js';
 import { useModelsStore } from '../../stores/modelsStore.js';
 import { useChatStore } from '../../stores/chatStore.js';
 import { isDemoMode } from '../../demo/demoState.js';
@@ -128,6 +128,17 @@ function InstalledTab(): React.JSX.Element {
   useEffect(() => {
     void refresh(false);
   }, [refresh]);
+
+  // Punto 3 del encargo ("modelo descargado que no aparece"): esta pestaña, a diferencia de la
+  // barra lateral/cabecera/pantalla de inicio (que leen `useModelsStore`, ya suscripto a
+  // `models:changed` desde `layout/Sidebar.tsx`), pide `models:list`/`models:loaded` con estado LOCAL
+  // propio — sin este listener se quedaba con la lista vieja hasta reiniciar la app, aunque el modelo
+  // ya hubiera terminado de descargarse (main/index.ts ahora invalida la caché de `ModelManager` y
+  // emite `models:changed` apenas termina una descarga, ver ese archivo).
+  useEffect(() => {
+    if (demo) return;
+    return onEvent('models:changed', () => void refresh(false));
+  }, [demo, refresh]);
 
   const shownModels = demo ? demoInstalled : models;
   const shownLoaded = demo ? demoLoaded : loaded;

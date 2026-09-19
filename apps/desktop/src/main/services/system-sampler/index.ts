@@ -3,12 +3,11 @@
 // — doc 02, doc 14 §"SystemSampler"). Responsable exclusivo del muestreo de sistema (CPU/RAM/GPU) y
 // de la RSS del propio proceso Electron; Telemetry (packages/runtime/src/telemetry/, v0.2/MVP-parcial)
 // consume estas muestras por inyección (HostAdapter), nunca llama nvidia-smi ni os.* directamente.
-import { execFile } from 'node:child_process';
 import os from 'node:os';
-import { promisify } from 'node:util';
 import type { SystemSample } from '@saurio/shared';
+import { execFileHidden, type ExecHiddenResult } from '../process/spawnHidden.js';
 
-const execFileAsync = promisify(execFile);
+export type ExecNvidiaSmiFn = (command: string, args: readonly string[]) => Promise<ExecHiddenResult>;
 
 export interface GpuSample {
   utilPct: number;
@@ -19,9 +18,15 @@ export interface GpuSample {
 
 /** Ejecuta `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` bajo demanda (MVP: sin loop
  *  continuo, eso es `-lms` en v0.2 — doc 02 §1). Devuelve null si el binario no está en PATH o si
- *  la GPU no es NVIDIA; nunca lanza, para que metrics:snapshot siga funcionando sin GPU. */
+ *  la GPU no es NVIDIA; nunca lanza, para que metrics:snapshot siga funcionando sin GPU.
+ *
+ *  BUG REAL v0.2.0 ("ventanas de consola parpadeando al iniciar"): este `exec` usaba antes
+ *  `util.promisify(child_process.execFile)` invocado como `exec(file, args)` — SIN un tercer
+ *  argumento de opciones, por lo que `windowsHide` nunca se aplicaba. Cada muestra (cada 2s con el
+ *  panel de rendimiento abierto, doc 14 §6) abría y cerraba una ventana de consola en Windows. Ahora
+ *  usa `execFileHidden`, que fuerza `windowsHide: true` siempre. */
 export async function sampleNvidiaSmi(
-  exec: typeof execFileAsync = execFileAsync,
+  exec: ExecNvidiaSmiFn = execFileHidden,
 ): Promise<GpuSample | null> {
   try {
     const { stdout } = await exec('nvidia-smi', [
@@ -74,7 +79,7 @@ export interface SystemSamplerDeps {
   cpus?: () => os.CpuInfo[];
   totalmem?: () => number;
   freemem?: () => number;
-  execNvidiaSmi?: typeof execFileAsync;
+  execNvidiaSmi?: ExecNvidiaSmiFn;
   /** RSS del proceso Electron (`app.getAppMetrics()`); inyectado porque `electron` no se importa
    *  fuera de apps/desktop y este módulo se testea sin Electron levantado. */
   appRssBytes?: () => number;
@@ -84,15 +89,22 @@ export class SystemSampler {
   private readonly cpus: () => os.CpuInfo[];
   private readonly totalmem: () => number;
   private readonly freemem: () => number;
-  private readonly execNvidiaSmi: typeof execFileAsync;
+  private readonly execNvidiaSmi: ExecNvidiaSmiFn;
   private readonly appRssBytes: () => number;
   private gpuAvailable: boolean | undefined;
+  /** Bug real v0.2.0 ("no reintentar en bucle fuentes que no existen"): en un equipo sin NVIDIA
+   *  (p. ej. el reportado, Intel Core Ultra 9 288V + iGPU Arc) `sample()` se llama cada 2s mientras el
+   *  panel de rendimiento está abierto (doc 14 §6) — sin esta bandera, cada tick volvía a spawnear
+   *  `nvidia-smi` sabiendo de antemano que iba a fallar. Una vez que la PRIMERA muestra confirma que
+   *  `nvidia-smi` no está disponible, se deja de invocar hasta un refresco manual explícito
+   *  (`refreshGpuAvailability()`, p. ej. si el usuario conecta una GPU externa en caliente). */
+  private gpuProbeAttempted = false;
 
   constructor(deps: SystemSamplerDeps = {}) {
     this.cpus = deps.cpus ?? os.cpus;
     this.totalmem = deps.totalmem ?? os.totalmem;
     this.freemem = deps.freemem ?? os.freemem;
-    this.execNvidiaSmi = deps.execNvidiaSmi ?? execFileAsync;
+    this.execNvidiaSmi = deps.execNvidiaSmi ?? execFileHidden;
     this.appRssBytes = deps.appRssBytes ?? (() => process.memoryUsage().rss);
   }
 
@@ -102,11 +114,20 @@ export class SystemSampler {
     return this.gpuAvailable;
   }
 
+  /** Refresco manual (encargo, punto 2: "no reintentar en bucle... backoff"): vuelve a intentar
+   *  `nvidia-smi` en el próximo `sample()` aunque ya se haya confirmado ausente antes. */
+  refreshGpuAvailability(): void {
+    this.gpuProbeAttempted = false;
+  }
+
   async sample(): Promise<SystemSample> {
     const sampledAt = Date.now();
     const cpuPct = await sampleCpuPct(100, this.cpus);
     const ramUsedBytes = this.totalmem() - this.freemem();
-    const gpu = await sampleNvidiaSmi(this.execNvidiaSmi);
+    const gpu = this.gpuProbeAttempted && this.gpuAvailable === false
+      ? null
+      : await sampleNvidiaSmi(this.execNvidiaSmi);
+    this.gpuProbeAttempted = true;
     this.gpuAvailable = gpu !== null;
 
     const result: SystemSample = {

@@ -10,6 +10,23 @@
 // inyecta el host (apps/desktop), mismo patrón que `ManifestFetcher`/`BlobStoreProbe` de
 // `DownloadManager` (packages/runtime no toca `fs`/rutas de `userData` directamente para esto, así se
 // puede testear con fakes sin disco ni red real).
+//
+// Bug real (doc 16 §16.5, "Explorar mostraba 'Página 1 de 1 (0 modelos)' durante la carga"): sin
+// caché en `userData` (primera vez que se abre la app), `getCatalog()` sincronizaba en vivo las ~240
+// familias de ollama.com/library ANTES de devolver nada — medido en esa sesión, ~13 s
+// (`elapsedMs: 12988` para 858 variantes). El fix de esa sesión solo cubrió el síntoma en la UI
+// ("Cargando catálogo…" en vez de la paginación vacía); este cambio ataca la causa: `getCatalog()`
+// pasa a "stale-while-revalidate" — sin caché vigente, devuelve DE INMEDIATO la caché vencida (si hay)
+// o el snapshot empaquetado (si no hay caché todavía), y dispara la sincronización real en SEGUNDO
+// PLANO (`triggerBackgroundSync`, con at-most-una-en-vuelo). Al terminar esa sincronización, guarda la
+// caché y emite `'libraryUpdated'` (o `'libraryUpdateFailed'` si la red falla) para que el host
+// (`apps/desktop/src/main/ipc/models.ts`) arme el catálogo fusionado de nuevo y avise al renderer sin
+// que el usuario tenga que esperar ni pedir nada. Solo cuando NO hay absolutamente nada para mostrar
+// de inmediato (primera vez, sin red todavía, sin snapshot empaquetado) se sigue bloqueando en la
+// sincronización en vivo — no hay otra opción, y es exactamente el último caso que ya cubrían los
+// tests de fallback de abajo. `forceRefresh` (botón "Actualizar catálogo") tampoco cambia: sigue
+// bloqueante, porque ahí el usuario mismo pidió esperar el resultado fresco.
+import { EventEmitter } from 'node:events';
 import { parseLibraryListHtml, parseTagsPageHtml } from './ollamaLibraryParser.js';
 import type { OllamaLibrarySnapshot, OllamaLibrarySnapshotFamily } from './ollamaLibrarySnapshot.js';
 import type { ManifestFetcher } from './types.js';
@@ -45,6 +62,11 @@ export interface LibraryCatalogResult {
   /** `cachedAt`/`generatedAt` del snapshot devuelto — la UI lo muestra ("Catálogo actualizado hace
    *  X"/"catálogo incluido con la app, sin conexión") en vez de fingir que siempre está fresco. */
   cachedAt?: number;
+  /** `true` cuando lo que se devolvió es una caché vencida o el snapshot empaquetado Y ya se disparó
+   *  una sincronización real en segundo plano (`triggerBackgroundSync`) que todavía no terminó — la UI
+   *  lo usa para el aviso discreto "actualizando…" en vez de fingir que este catálogo ya es el final.
+   *  Ausente/`false` en cualquier otro caso (caché vigente, resultado de red, o forceRefresh). */
+  syncing?: boolean;
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -62,15 +84,41 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
   return results;
 }
 
+// Idioma estándar de TS para tipar los eventos de un `EventEmitter` (doc de Node/@types/node, mismo
+// patrón que `DownloadManager` en este mismo paquete): la interfaz se fusiona con la clase de abajo
+// para sobrecargar `on`/`emit` con la forma real de los eventos que emite, sin reimplementar
+// `EventEmitter`. `@typescript-eslint/no-unsafe-declaration-merging` no distingue este caso (aditivo,
+// sin miembros nuevos) del genuinamente riesgoso, así que se deshabilita puntualmente acá.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export declare interface OllamaLibraryClient {
+  on(event: 'libraryUpdated', listener: (result: { snapshot: OllamaLibrarySnapshot; cachedAt: number }) => void): this;
+  on(event: 'libraryUpdateFailed', listener: (error: Error) => void): this;
+  once(event: 'libraryUpdated', listener: (result: { snapshot: OllamaLibrarySnapshot; cachedAt: number }) => void): this;
+  once(event: 'libraryUpdateFailed', listener: (error: Error) => void): this;
+  off(event: 'libraryUpdated', listener: (result: { snapshot: OllamaLibrarySnapshot; cachedAt: number }) => void): this;
+  off(event: 'libraryUpdateFailed', listener: (error: Error) => void): this;
+  emit(event: 'libraryUpdated', result: { snapshot: OllamaLibrarySnapshot; cachedAt: number }): boolean;
+  emit(event: 'libraryUpdateFailed', error: Error): boolean;
+}
+
 /** Cliente de la biblioteca completa de Ollama: sincroniza en vivo (`getCatalog`), cachea con TTL de
- *  24 h y cae al snapshot empaquetado sin red — nunca deja el Centro de modelos sin catálogo alguno. */
-export class OllamaLibraryClient {
+ *  24 h y cae al snapshot empaquetado sin red — nunca deja el Centro de modelos sin catálogo alguno.
+ *  Extiende `EventEmitter` (mismo patrón que `DownloadManager`) para avisar cuándo termina una
+ *  sincronización disparada en segundo plano (`'libraryUpdated'`/`'libraryUpdateFailed'`) — el host
+ *  se suscribe recién cuando existe la `BrowserWindow` a la que reenviar `models:libraryUpdated`. */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class OllamaLibraryClient extends EventEmitter {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly ttlMs: number;
   private readonly concurrency: number;
+  /** Sincronización de fondo en curso (`triggerBackgroundSync`), si hay una — evita disparar dos
+   *  recorridas completas de ~240 páginas en paralelo si `getCatalog()` se llama varias veces mientras
+   *  la caché sigue vencida (p. ej. varias pestañas/paneles pidiendo el catálogo casi al mismo tiempo). */
+  private syncInFlight: Promise<void> | undefined;
 
   constructor(private readonly opts: OllamaLibraryClientOptions = {}) {
+    super();
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? Date.now;
     this.ttlMs = opts.ttlMs ?? DEFAULT_LIBRARY_CACHE_TTL_MS;
@@ -119,27 +167,67 @@ export class OllamaLibraryClient {
   }
 
   /** Punto 2 del encargo: caché en `userData` con TTL de 24 h, "Actualizar catálogo" fuerza el
-   *  refresco (`forceRefresh: true`, salteando la caché aunque no haya vencido), y si la red falla se
-   *  cae primero a la caché (aunque esté vencida — "algo" es mejor que nada) y por último al snapshot
-   *  empaquetado si no hay ninguna caché todavía (primera vez que se abre la app sin red). */
+   *  refresco (`forceRefresh: true`, salteando la caché aunque no haya vencido, bloqueante porque el
+   *  usuario mismo pidió esperar el resultado fresco).
+   *
+   *  Stale-while-revalidate (doc 16 §16.5, ver comentario de arriba del archivo): sin `forceRefresh`,
+   *  si la caché sigue vigente se devuelve tal cual (sin red, como antes). Si no hay caché vigente
+   *  (venció o nunca existió) PERO hay algo para mostrar YA MISMO — la caché vencida, o si no hay
+   *  ninguna caché el snapshot empaquetado — se devuelve ESO de inmediato (marcando `source`/
+   *  `cachedAt`/`syncing: true`) y se dispara `triggerBackgroundSync()` sin esperarla. Recién cuando no
+   *  hay absolutamente nada que devolver de inmediato (primera vez que se abre la app, sin red
+   *  todavía, sin snapshot empaquetado) se bloquea en la sincronización en vivo — último recurso, sin
+   *  cambios respecto de antes — y si esa falla, se cae a la caché (aunque esté vencida) o al
+   *  snapshot empaquetado igual que siempre. */
   async getCatalog(opts: { forceRefresh?: boolean } = {}): Promise<LibraryCatalogResult> {
     const now = this.now();
-    if (!opts.forceRefresh && this.opts.cache) {
-      const cached = await this.opts.cache.read();
+    const cached = this.opts.cache ? await this.opts.cache.read() : undefined;
+
+    if (!opts.forceRefresh) {
       if (cached && now - cached.cachedAt < this.ttlMs) {
         return { snapshot: cached.snapshot, source: 'cache', cachedAt: cached.cachedAt };
       }
+      const immediate: LibraryCatalogResult | undefined = cached
+        ? { snapshot: cached.snapshot, source: 'cache', cachedAt: cached.cachedAt, syncing: true }
+        : this.opts.bundledSnapshot
+          ? { snapshot: this.opts.bundledSnapshot, source: 'bundled', syncing: true }
+          : undefined;
+      if (immediate) {
+        this.triggerBackgroundSync();
+        return immediate;
+      }
     }
+
     try {
       const snapshot = await this.fetchFullCatalog();
       await this.opts.cache?.write(snapshot, now);
       return { snapshot, source: 'network', cachedAt: now };
     } catch (networkError) {
-      const cached = await this.opts.cache?.read();
       if (cached) return { snapshot: cached.snapshot, source: 'cache', cachedAt: cached.cachedAt };
       if (this.opts.bundledSnapshot) return { snapshot: this.opts.bundledSnapshot, source: 'bundled' };
       throw networkError;
     }
+  }
+
+  /** Dispara la sincronización real contra ollama.com/library en segundo plano, sin bloquear a quien
+   *  llamó a `getCatalog()`. `syncInFlight` asegura como mucho una recorrida completa a la vez — si ya
+   *  hay una en curso, esta llamada es un no-op (la que ya está en vuelo va a terminar de todos modos y
+   *  va a emitir el evento). Nunca propaga el error de red: lo emite como `'libraryUpdateFailed'` para
+   *  que el host muestre un aviso no bloqueante, dejando en pantalla lo que ya se estaba mostrando. */
+  private triggerBackgroundSync(): void {
+    if (this.syncInFlight) return;
+    const startedAt = this.now();
+    this.syncInFlight = this.fetchFullCatalog()
+      .then(async (snapshot) => {
+        await this.opts.cache?.write(snapshot, startedAt);
+        this.emit('libraryUpdated', { snapshot, cachedAt: startedAt });
+      })
+      .catch((error: unknown) => {
+        this.emit('libraryUpdateFailed', error instanceof Error ? error : new Error(String(error)));
+      })
+      .finally(() => {
+        this.syncInFlight = undefined;
+      });
   }
 
   /** Punto 2 del encargo: "tamaños exactos por tag resueltos de forma perezosa con RegistryClient al

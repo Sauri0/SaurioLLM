@@ -157,6 +157,10 @@ export interface ModelCatalogEntry {                     // resources/model-cata
   // catálogo curado. `loadModelCatalog` ya lo devolvía en la práctica (zod-inferido), esta interfaz
   // solo estaba desactualizada respecto de su propio schema.
   quantization?: string;
+  /** Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar") — ver el
+   *  comentario del mismo campo en packages/shared/src/domain.ts (espejo zod de esta interfaz). */
+  cloud?: boolean;
+  sizeUnresolved?: boolean;
 }
 
 /** Salida del RecommendationEngine (v0.3); función pura sobre inventario x catálogo x ModelCompat.

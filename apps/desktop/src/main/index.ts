@@ -13,7 +13,7 @@ import { registerChatHandlers } from './ipc/chat.js';
 import { registerRunHandlers } from './ipc/run.js';
 import { registerPermissionHandlers } from './ipc/permission.js';
 import { registerCheckpointHandlers } from './ipc/checkpoint.js';
-import { registerModelsHandlers } from './ipc/models.js';
+import { registerModelsHandlers, type LibraryUpdateEmitter } from './ipc/models.js';
 import { registerProvidersHandlers } from './ipc/providers.js';
 import { registerMetricsHandlers } from './ipc/metrics.js';
 import { registerSettingsHandlers } from './ipc/settings.js';
@@ -33,8 +33,40 @@ import { SqlMetricsMinuteRepository } from './services/metrics/SqlMetricsMinuteR
 import { MetricsTicker } from './services/metrics/MetricsTicker.js';
 import { createSmokeRecorder, isSmokeRun } from './smoke.js';
 import { startAutoUpdater } from './services/updater/index.js';
+import { createShutdown } from './host/shutdown.js';
 
 app.setName('SaurioLLM');
+
+/**
+ * BUG REAL (usuario real, notebook Windows 11 sin NVIDIA, v0.2.0): al cerrar la app aparecía el
+ * diálogo nativo de Electron "A JavaScript error occurred in the main process" con el `TypeError`
+ * real de abajo (ver ./host/shutdown.ts para la causa raíz de orden de apagado). Ese diálogo lo
+ * muestra el listener de `uncaughtException` que Electron registra POR SU CUENTA al arrancar
+ * (`@electron/internal/browser/init`); para poder decidir nosotros qué pasa con un error durante el
+ * cierre hay que reemplazar ese listener por uno propio (si solo agregáramos el nuestro, el de
+ * Electron seguiría corriendo también y el diálogo aparecería igual).
+ *
+ * Con el orden de apagado ya arreglado (./host/shutdown.ts) este handler no debería tener nada que
+ * atrapar durante un cierre normal — queda como red de seguridad ("nunca mostrar el diálogo nativo al
+ * cerrar", punto 1 del encargo) para cualquier otro error inesperado que aparezca en ese momento.
+ * Fuera del cierre, se seguía necesitando alguna señal de que algo salió mal: se muestra el mismo
+ * diálogo pero armado por nosotros (mismo criterio que Electron, sin depender de su listener interno).
+ */
+let isQuitting = false;
+app.on('before-quit', () => { isQuitting = true; });
+
+process.removeAllListeners('uncaughtException');
+process.on('uncaughtException', (error) => {
+  console.error('[main] uncaughtException', error);
+  if (isQuitting) {
+    return; // apagado en curso: nunca el diálogo nativo — ya quedó logueado arriba.
+  }
+  try {
+    dialog.showErrorBox('SaurioLLM: error interno', `Ocurrió un error inesperado.\n\n${error.stack ?? error.message}`);
+  } catch {
+    // dialog puede no estar disponible todavía (antes de app.whenReady()); ya se logueó arriba.
+  }
+});
 
 /**
  * SAURIO_USER_DATA=<carpeta>: fuerza `userData` a una carpeta aislada, ANTES de cualquier
@@ -423,7 +455,6 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.error('[main] falló la inicialización del runtime (migraciones/recover)', error);
   }
-  app.on('before-quit', () => host.dispose());
   if (recovered && (recovered.orphaned.length > 0 || recovered.abandoned.length > 0)) {
     console.log(
       `[main] recover(): ${recovered.orphaned.length} tool call(s) huérfanas, ${recovered.abandoned.length} abandonadas`,
@@ -436,7 +467,6 @@ app.whenReady().then(async () => {
   registerRunHandlers(host);
   registerPermissionHandlers(host);
   registerCheckpointHandlers(host);
-  registerModelsHandlers(host);
   registerProvidersHandlers(host);
   registerSettingsHandlers(host);
   registerBenchHandlers(host);
@@ -464,12 +494,7 @@ app.whenReady().then(async () => {
       (error) => console.error('[main] ollama:ensureRunning (automático al arrancar) falló', error),
     );
   }
-  // Punto 4: "al cerrar la app, detené SOLO el Ollama que la app inició" — no hace nada si esta
-  // clase nunca llegó a arrancar un proceso propio (Ollama ya corría, o lo arrancó otra cosa).
-  app.on('before-quit', () => ollamaProcessManager.stop());
-
   const terminalService = new TerminalService();
-  app.on('before-quit', () => terminalService.closeAll());
 
   const win = createMainWindow();
   installUiSmokeCheck(win);
@@ -482,7 +507,6 @@ app.whenReady().then(async () => {
     if (!win.isDestroyed()) win.webContents.send('metrics:tick', snapshot);
   });
   registerMetricsHandlers(host, systemSampler, metricsTicker);
-  app.on('before-quit', () => metricsTicker.dispose());
   const eventBatcher = new RunEventBatcher((events) => {
     if (!win.isDestroyed()) win.webContents.send('runtime:event', events);
   });
@@ -499,14 +523,50 @@ app.whenReady().then(async () => {
     },
   };
   registerFilesHandlers(host, filesEmitter);
-  app.on('before-quit', () => closeAllFileWatchers());
+
+  // Stale-while-revalidate de "Explorar" (doc 16 §16.5): `OllamaLibraryClient` es Node puro
+  // (packages/runtime) y no conoce `BrowserWindow`; recién acá, con `win` ya creada, se reenvía al
+  // renderer la sincronización que terminó en segundo plano (mismo patrón que `filesEmitter` arriba).
+  // `registerModelsHandlers` se llama recién acá (no en el bloque de arriba junto al resto de los
+  // `register*Handlers`) precisamente porque necesita `win` para poder pasarle este emitter.
+  const libraryUpdateEmitter: LibraryUpdateEmitter = {
+    emitUpdated(result) {
+      if (!win.isDestroyed()) win.webContents.send('models:libraryUpdated', result);
+    },
+    emitFailed(message) {
+      if (!win.isDestroyed()) win.webContents.send('models:libraryUpdateFailed', { error: message });
+    },
+  };
+  registerModelsHandlers(host, libraryUpdateEmitter);
+
+  // Punto 3 del encargo ("modelo descargado que no aparece"): al terminar una descarga (evento
+  // 'done') hay que invalidar la caché de `ModelManager.listInstalled()` (compartida por
+  // models:list/catalog/libraryCatalog — ver ipc/models.ts) y avisarle al renderer con
+  // `models:changed`, para que `modelsStore` (sidebar, cabecera del chat, pantalla de inicio) y la
+  // pestaña "Instalados" (que además escucha este mismo evento, ver ModelsPanel.tsx) se actualicen
+  // solos, sin reiniciar la app. Se resuelve ANTES de reenviar 'download:done' al renderer para que,
+  // si algún panel vuelve a pedir el catálogo en reacción a ese evento, la caché ya esté fresca.
+  async function broadcastModelsChanged(): Promise<void> {
+    if (!runtime) return;
+    try {
+      const installed = await runtime.modelManager.listInstalled(true);
+      const loaded = await runtime.modelManager.listLoaded().catch(() => []);
+      if (!win.isDestroyed()) win.webContents.send('models:changed', { installed, loaded });
+    } catch (error) {
+      console.error('[main] no se pudo refrescar models:list tras una descarga', error);
+    }
+  }
 
   // download:progress/done/failed (doc 13 §5, punto 1 del encargo): DownloadManager es Node puro
   // (packages/runtime) y no conoce BrowserWindow; recién acá, con `win` ya creada, se reenvían sus
   // eventos al renderer (mismo patrón que `filesEmitter` arriba).
   const unsubscribeDownloads = host.onDownloadEvent({
     onProgress: (job) => { if (!win.isDestroyed()) win.webContents.send('download:progress', job); },
-    onDone: (job) => { if (!win.isDestroyed()) win.webContents.send('download:done', job); },
+    onDone: (job) => {
+      void broadcastModelsChanged().finally(() => {
+        if (!win.isDestroyed()) win.webContents.send('download:done', job);
+      });
+    },
     onFailed: (job, error) => { if (!win.isDestroyed()) win.webContents.send('download:failed', { downloadId: job.id, error }); },
   });
   win.on('closed', () => unsubscribeDownloads());
@@ -516,6 +576,22 @@ app.whenReady().then(async () => {
   });
 
   startAutoUpdater({ host });
+
+  // Apagado único, ordenado e idempotente (bug real v0.2.0: diálogo nativo "The database connection
+  // is not open" al cerrar — ver ./host/shutdown.ts para la causa raíz y el orden correcto). Se
+  // registra acá, al final del arranque, porque recién acá existen todas las piezas a apagar — pero
+  // el ORDEN de apagado real lo decide `createShutdown`, no el orden de estas líneas.
+  app.on('before-quit', createShutdown({
+    stopTickers: () => metricsTicker.dispose(),
+    cleanupExtras: () => {
+      terminalService.closeAll();
+      closeAllFileWatchers();
+      eventBatcher.dispose();
+      unsubscribeDownloads();
+    },
+    closePersistence: () => host.dispose(),
+    stopOwnOllama: () => ollamaProcessManager.stop(),
+  }));
 });
 
 app.on('window-all-closed', () => {

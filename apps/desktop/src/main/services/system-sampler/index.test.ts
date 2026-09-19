@@ -82,4 +82,41 @@ describe('SystemSampler', () => {
     expect(sample.vramUsedBytes?.value).toBe(4096 * 1024 * 1024);
     expect(sampler.supportsGpuSampling()).toBe(true);
   });
+
+  // Bug real v0.2.0 (equipo sin NVIDIA): "no reintentar en bucle fuentes que no existen" — una vez
+  // que nvidia-smi confirmó ausencia, sample() no debe volver a spawnearlo en cada tick.
+  it('no vuelve a invocar nvidia-smi una vez confirmado que no está disponible', async () => {
+    const execNvidiaSmi = vi.fn().mockRejectedValue(new Error('ENOENT'));
+    const sampler = new SystemSampler({
+      cpus: () => [cpuInfo(0, 0, 100)],
+      totalmem: () => 16_000_000_000,
+      freemem: () => 8_000_000_000,
+      execNvidiaSmi: execNvidiaSmi as never,
+      appRssBytes: () => 123,
+    });
+
+    await sampler.sample();
+    await sampler.sample();
+    await sampler.sample();
+
+    expect(execNvidiaSmi).toHaveBeenCalledTimes(1);
+    expect(sampler.supportsGpuSampling()).toBe(false);
+  });
+
+  it('refreshGpuAvailability() permite volver a intentar nvidia-smi tras un refresco manual', async () => {
+    const execNvidiaSmi = vi.fn().mockRejectedValue(new Error('ENOENT'));
+    const sampler = new SystemSampler({
+      cpus: () => [cpuInfo(0, 0, 100)],
+      totalmem: () => 16_000_000_000,
+      freemem: () => 8_000_000_000,
+      execNvidiaSmi: execNvidiaSmi as never,
+      appRssBytes: () => 123,
+    });
+
+    await sampler.sample();
+    sampler.refreshGpuAvailability();
+    await sampler.sample();
+
+    expect(execNvidiaSmi).toHaveBeenCalledTimes(2);
+  });
 });

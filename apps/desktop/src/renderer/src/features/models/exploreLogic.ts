@@ -36,9 +36,14 @@ export interface ExploreFilters {
   use: ExploreUseFilter;
   tierLevel: ExploreTierFilter;
   sizeBucket: ExploreSizeBucket;
+  /** Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar"): las variantes
+   *  de NUBE de Ollama (`entry.cloud`) van ocultas por defecto — corren en los servidores de Ollama,
+   *  no se pueden descargar, y mezcladas sin avisar con las variantes locales confundían más de lo
+   *  que ayudaban. `false` por defecto; el usuario las muestra a propósito con un filtro explícito. */
+  showCloud: boolean;
 }
 
-export const DEFAULT_EXPLORE_FILTERS: ExploreFilters = { search: '', use: 'all', tierLevel: 'all', sizeBucket: 'all' };
+export const DEFAULT_EXPLORE_FILTERS: ExploreFilters = { search: '', use: 'all', tierLevel: 'all', sizeBucket: 'all', showCloud: false };
 
 function fullName(item: CatalogItem): string {
   return `${item.entry.name}:${item.entry.tag}`;
@@ -54,10 +59,13 @@ export function matchesSearch(item: CatalogItem, search: string): boolean {
 
 export function filterCatalogItems(items: CatalogItem[], filters: ExploreFilters): CatalogItem[] {
   return items.filter((item) => (
-    matchesSearch(item, filters.search)
+    (filters.showCloud || !item.entry.cloud)
+    && matchesSearch(item, filters.search)
     && (filters.use === 'all' || item.entry.suggestedUse.includes(filters.use))
     && (filters.tierLevel === 'all' || item.tier?.level === filters.tierLevel)
-    && (filters.sizeBucket === 'all' || sizeBucketOf(item.entry.sizeBytes) === filters.sizeBucket)
+    // Bucket de tamaño no aplica a una entrada cloud (sizeBytes es un placeholder en 0) — se
+    // muestra igual con el filtro de tamaño en 'all' cuando showCloud la dejó pasar arriba.
+    && (filters.sizeBucket === 'all' || item.entry.cloud || sizeBucketOf(item.entry.sizeBytes) === filters.sizeBucket)
   ));
 }
 
