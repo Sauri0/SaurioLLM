@@ -11,7 +11,7 @@
 //   3) el diagnóstico por hash de tool calls `orphaned` (doc 10 §5.4), que depende de WorkspaceFs y
 //      del BlobStore — ambos viven en otros módulos (tools/checkpoint) fuera del alcance de esta tarea.
 import type {
-  Mode, ModelRef, RunState, AgentCreateInput, AgentOwnerKind, AgentProfile,
+  Mode, ModelRef, RunState, AgentCreateInput, AgentOwnerKind, AgentProfile, AgentMemory,
 } from '@saurio/shared';
 import type { AgentConfig, EffectiveConfig, RunError, ToolCallRecord } from './types.js';
 import type { Checkpoint } from '@saurio/shared';
@@ -137,6 +137,19 @@ export interface LastReadHashes {
  *  `ToolResult` de error explícito en vez de romper el run (ver deviations). */
 export interface AgentProfilePort {
   createProfile(input: AgentCreateInput, ownerKind?: AgentOwnerKind): Promise<AgentProfile>;
+}
+
+/** Adaptador autorizado de memorias para un run. Implementa el filtro de alcance en el host:
+ * sólo devuelve filas que ese `agentId` puede consumir dentro del `projectId` activo. */
+export interface AgentMemoryPort {
+  listForRun(agentId: string, projectId: string): Promise<AgentMemory[]>;
+}
+
+/** Colaboradores personales habilitados explícitamente para un chat de Director. El adaptador del
+ * host puede persistir la selección en settings por chat; el runtime sólo consume perfiles ya
+ * validados y activos. */
+export interface ChatCollaboratorPort {
+  listEnabled(chatId: string): Promise<AgentConfig[]>;
 }
 
 export interface Clock { now(): number }

@@ -1,12 +1,16 @@
 // Tests de RunController (doc 05 flujo completo, doc 10 fallos y recuperación) con fakes de todas
 // las dependencias inyectadas (gateway, tools, permisos, checkpoint, contexto, persistencia).
 import { describe, expect, it } from 'vitest';
-import { RunController, type RunControllerDeps } from './RunController.js';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { formatAgentMemoryForContext, RunController, type RunControllerDeps } from './RunController.js';
 import type { ChatChunk, ChatRequest, ModelGateway } from '../gateway/types.js';
-import type { AgentCreateInput, AgentOwnerKind, AgentProfile, ChatMessage, RunEvent } from '@saurio/shared';
+import type { AgentCreateInput, AgentMemory, AgentOwnerKind, AgentProfile, ChatMessage, RunEvent } from '@saurio/shared';
+import { DelegationResultSchema } from '@saurio/shared';
 import type { PermissionDecision, PermissionEngine } from '../permissions/types.js';
 import type { ContextBuilder } from '../context/types.js';
-import type { ToolDefinition } from '../tools/types.js';
+import type { ToolDefinition, ToolProtocol } from '../tools/types.js';
 import type { AgentConfigResolver, AgentProfilePort } from './ports.js';
 import {
   makeFakeClock, makeFakeIds, makeFakeEventStore, makeFakeRunRepository, makeFakeChatRepository,
@@ -17,6 +21,12 @@ import {
   makeTestAgentConfig, makeFakeAgentConfigResolver, makeTestChat, waitUntil,
 } from './testSupport.js';
 import { DefaultTaskManager } from '../tasks/TaskManager.js';
+import { createContextBuilder, createTokenEstimator } from '../context/index.js';
+import { contextPolicyForNumCtx } from './defaults.js';
+import { WorkspaceFsImpl } from '../tools/WorkspaceFs.js';
+import { createTextToolProtocol } from '../tools/protocols/text.js';
+import { ModelGatewayImpl } from '../gateway/ModelGateway.js';
+import type { Provider } from '../gateway/Provider.js';
 
 function baseDeps(overrides: Partial<RunControllerDeps> = {}): { deps: RunControllerDeps; runs: ReturnType<typeof makeFakeRunRepository> } {
   const clock = makeFakeClock();
@@ -42,6 +52,7 @@ function baseDeps(overrides: Partial<RunControllerDeps> = {}): { deps: RunContro
     clock, ids,
     delay: async () => {}, // sin backoff real en tests
     projectRoot: '/workspace',
+    projectId: 'project_1',
     ...overrides,
   };
   return { deps, runs };
@@ -51,6 +62,184 @@ async function waitTerminal(runs: ReturnType<typeof makeFakeRunRepository>, runI
   const terminal = new Set(['completed', 'cancelled', 'failed', 'interrupted']);
   await waitUntil(async () => terminal.has((await runs.get(runId))?.state ?? ''));
 }
+
+describe('RunController — memorias de agente autorizadas', () => {
+  it('serializa procedencia y confianza como datos delimitados', () => {
+    const memory: AgentMemory = {
+      id: 'memory_1', agentId: 'agent_1', projectId: 'project_1', content: 'La API usa UTC.',
+      sourceKind: 'inferred', confidence: 'hypothesis', originRef: 'docs/api.md', createdAt: 1, updatedAt: 1,
+    };
+    expect(formatAgentMemoryForContext([memory])).toContain('hipótesis; inferida; alcance: proyecto actual; origen: docs/api.md');
+    expect(formatAgentMemoryForContext([memory])).toContain('--- inicio memoria');
+    expect(formatAgentMemoryForContext([])).toBeUndefined();
+  });
+
+  it('consulta el puerto sólo cuando el agente permite memoria y entrega el bloque a ContextBuilder', async () => {
+    let receivedMemory: string | undefined;
+    const context = makeFakeContextBuilder();
+    const originalBuild = context.build;
+    context.build = async (input) => {
+      receivedMemory = input.agentMemory;
+      return originalBuild(input);
+    };
+    const listForRun = async (agentId: string, projectId: string): Promise<AgentMemory[]> => {
+      expect(agentId).toBe('agent_1');
+      expect(projectId).toBe('project_1');
+      return [{
+        id: 'memory_1', agentId, projectId, content: 'Preferís pruebas focales.',
+        sourceKind: 'user_stated', confidence: 'confirmed', createdAt: 1, updatedAt: 1,
+      }];
+    };
+    const agent = makeTestAgentConfig({ memory: { readProjectMemory: true, writeProjectMemory: false } });
+    const { deps, runs } = baseDeps({
+      context,
+      agents: makeFakeAgentConfigResolver(agent),
+      agentMemories: { listForRun },
+      gateway: makeScriptedGateway([[
+        { type: 'content', text: 'Listo.' },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ]]),
+    });
+    const { runId } = await new RunController(deps).start('chat_1', 'Hola', 'agent');
+    await waitTerminal(runs, runId);
+    expect(receivedMemory).toContain('Preferís pruebas focales.');
+    expect(receivedMemory).toContain('confirmada; dicho por la persona usuaria');
+  });
+
+  it('no consulta memorias cuando el perfil las deshabilita', async () => {
+    let calls = 0;
+    const { deps, runs } = baseDeps({
+      agentMemories: { listForRun: async () => { calls += 1; return []; } },
+      gateway: makeScriptedGateway([[
+        { type: 'content', text: 'Listo.' },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ]]),
+    });
+    const { runId } = await new RunController(deps).start('chat_1', 'Hola', 'agent');
+    await waitTerminal(runs, runId);
+    expect(calls).toBe(0);
+  });
+
+  it('persiste una inspección segura del contexto real, incluidas raíz, SAURIO.md, mapa, memoria y adjuntos', async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'saurio-context-inspection-'));
+    writeFileSync(join(projectRoot, 'SAURIO.md'), 'REGLA SENSIBLE DEL PROYECTO', 'utf8');
+    const agent = makeTestAgentConfig({
+      systemPrompt: 'PROMPT PRIVADO DEL AGENTE',
+      memory: { readProjectMemory: true, writeProjectMemory: false },
+    });
+    const memoryContent = 'MEMORIA PRIVADA RECUPERADA';
+    try {
+      const messages = makeFakeMessageRepository();
+      const events = makeFakeEventStore();
+      const appendEvent = events.append.bind(events);
+      events.append = (event) => {
+        const persisted = appendEvent(event);
+        if (persisted.type === 'message.done') {
+          const chatMessages = messages.byChat.get(persisted.chatId) ?? [];
+          chatMessages.push(persisted.message);
+          messages.byChat.set(persisted.chatId, chatMessages);
+        }
+        return persisted;
+      };
+      const { deps, runs } = baseDeps({
+        events,
+        messages,
+        projectRoot,
+        workspaceFs: new WorkspaceFsImpl(projectRoot),
+        agents: makeFakeAgentConfigResolver(agent),
+        context: createContextBuilder(createTokenEstimator(agent.model)),
+        repoMap: {
+          build: async (root) => {
+            expect(root).toBe(projectRoot);
+            return { text: 'src/index.ts', tokens: 4 };
+          },
+          invalidate: () => {},
+        },
+        agentMemories: {
+          listForRun: async () => [{
+            id: 'memory_inspection', agentId: agent.id, projectId: 'project_1', content: memoryContent,
+            sourceKind: 'user_stated', confidence: 'confirmed', createdAt: 1, updatedAt: 1,
+          }],
+        },
+        modelContextProbe: { getContextMax: async () => 8_192 },
+        gateway: makeScriptedGateway([[
+          { type: 'tool_call', call: { id: 'finish_inspection', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+          { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+        ]]),
+      });
+
+      const { runId } = await new RunController(deps).start('chat_1', 'revisá', 'agent', [{
+        kind: 'file', name: 'notas.txt', mime: 'text/plain',
+        dataBase64: Buffer.from('contenido privado del adjunto').toString('base64'),
+      }]);
+      await waitTerminal(runs, runId);
+
+      const event = (deps.events as ReturnType<typeof makeFakeEventStore>).all.find((candidate) => candidate.type === 'context.built');
+      expect(event?.type).toBe('context.built');
+      if (!event || event.type !== 'context.built') throw new Error('faltó context.built');
+      expect(event.budget.inspection).toMatchObject({
+        projectRoot,
+        tokenUsageQuality: 'estimated',
+        limitSource: 'reported',
+        attachmentsKnown: true,
+        attachments: [{ name: 'notas.txt', kind: 'file', status: 'included', truncated: false }],
+      });
+      expect(event.budget.inspection?.sources.find((source) => source.kind === 'project_instructions')).toMatchObject({
+        status: 'included', provenance: 'SAURIO.md', itemCount: 1,
+      });
+      expect(event.budget.inspection?.sources.find((source) => source.kind === 'repo_map')).toMatchObject({
+        status: 'included', provenance: 'project_index', itemCount: 1,
+      });
+      expect(event.budget.inspection?.sources.find((source) => source.kind === 'agent_memory')).toMatchObject({
+        status: 'included', provenance: `agent_memory:${agent.id}`, itemCount: 1,
+      });
+      const serialized = JSON.stringify(event.budget.inspection);
+      expect(serialized).not.toContain('PROMPT PRIVADO');
+      expect(serialized).not.toContain('REGLA SENSIBLE');
+      expect(serialized).not.toContain(memoryContent);
+      expect(serialized).not.toContain('contenido privado');
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rechaza un SAURIO.md que sea symlink fuera de la raíz y no entrega su contenido al modelo', async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'saurio-context-root-'));
+    const outsideRoot = mkdtempSync(join(tmpdir(), 'saurio-context-outside-'));
+    const outsideInstructions = join(outsideRoot, 'instrucciones.md');
+    const secret = 'NO FILTRAR ESTA INSTRUCCIÓN EXTERNA';
+    writeFileSync(outsideInstructions, secret, 'utf8');
+    symlinkSync(outsideInstructions, join(projectRoot, 'SAURIO.md'), 'file');
+    try {
+      const agent = makeTestAgentConfig();
+      const gateway = makeScriptedGateway([[
+        { type: 'tool_call', call: { id: 'finish_external_instructions', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ]]);
+      const { deps, runs } = baseDeps({
+        projectRoot,
+        workspaceFs: new WorkspaceFsImpl(projectRoot),
+        agents: makeFakeAgentConfigResolver(agent),
+        context: createContextBuilder(createTokenEstimator(agent.model)),
+        gateway,
+      });
+
+      const { runId } = await new RunController(deps).start('chat_1', 'hola', 'agent');
+      await waitTerminal(runs, runId);
+
+      expect(JSON.stringify(gateway.requests[0]?.messages)).not.toContain(secret);
+      const event = (deps.events as ReturnType<typeof makeFakeEventStore>).all.find((candidate) => candidate.type === 'context.built');
+      expect(event?.type).toBe('context.built');
+      if (!event || event.type !== 'context.built') throw new Error('faltó context.built');
+      expect(event.budget.inspection?.sources.find((source) => source.kind === 'project_instructions')).toMatchObject({
+        status: 'unavailable', reason: 'build_failed', provenance: 'SAURIO.md',
+      });
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+      rmSync(outsideRoot, { recursive: true, force: true });
+    }
+  });
+});
 
 /** Tool de test que siempre devuelve el mismo texto de error, sin importar los args — para ejercitar
  *  la pista de "error idéntico repetido" (doc 16 §4, RunController.runHandler) sin depender de que
@@ -63,6 +252,76 @@ function makeAlwaysFailingTool(errorText: string): ToolDefinition {
     handler: async () => ({ content: [{ type: 'text', text: errorText }], isError: true }),
   };
 }
+
+function makeReadFileTool(): ToolDefinition {
+  return {
+    name: 'read_file', description: 'lee un archivo del proyecto',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    category: 'read', mutating: false, idempotent: true,
+    allowedInModes: ['plan', 'ask', 'edit', 'agent'], source: { kind: 'builtin' },
+    handler: async () => ({ content: [{ type: 'text', text: 'export const doble = (n: number) => n;' }], isError: false }),
+  };
+}
+
+describe('RunController — corrección conservadora de TextToolProtocol', () => {
+  it('reintenta una sola vez con un mensaje system honesto y después acepta el segundo no-tool', async () => {
+    const refusal = 'Para arreglar el bug de la función `doble` en `src/coder.ts`, necesito leer el contenido de ese archivo.';
+    const scripts: ChatChunk[][] = [
+      [{ type: 'content', text: refusal }, { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } }],
+      [{ type: 'content', text: refusal }, { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } }],
+    ];
+    const gateway = makeScriptedGateway(scripts);
+    const agent = makeTestAgentConfig({
+      toolTransport: 'text',
+      allowedTools: ['read_file', 'finish'],
+    });
+    const { deps, runs } = baseDeps({
+      gateway,
+      agents: makeFakeAgentConfigResolver(agent),
+      tools: makeFakeToolRegistry([makeReadFileTool(), makeFinishTool()]),
+      toolProtocols: { native: makeNativeToolProtocol(), text: createTextToolProtocol() },
+    });
+    const controller = new RunController(deps);
+    await deps.messages.append('chat_1', {
+      id: 'current_user', role: 'user',
+      content: 'Arreglá el bug de la función doble en src/coder.ts: tiene que devolver n * 2.',
+    });
+    const { runId } = await controller.start(
+      'chat_1',
+      'Arreglá el bug de la función doble en src/coder.ts: tiene que devolver n * 2.',
+      'agent',
+    );
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.state).toBe('completed');
+    expect(gateway.calls).toBe(2);
+    const correction = gateway.requests[1]?.messages.find((message) => (
+      message.role === 'system' && message.content.includes('Corrección interna del runtime')
+    ));
+    expect(correction?.content).toContain('no concede permisos');
+    expect(correction?.content).toContain('read_file');
+  });
+
+  it('no reintenta una conversación normal aunque use transporte text', async () => {
+    const gateway = makeScriptedGateway([[
+      { type: 'content', text: '¡Hola! ¿En qué te ayudo?' },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]]);
+    const agent = makeTestAgentConfig({ toolTransport: 'text', allowedTools: ['read_file', 'finish'] });
+    const { deps, runs } = baseDeps({
+      gateway,
+      agents: makeFakeAgentConfigResolver(agent),
+      tools: makeFakeToolRegistry([makeReadFileTool(), makeFinishTool()]),
+      toolProtocols: { native: makeNativeToolProtocol(), text: createTextToolProtocol() },
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'Hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.state).toBe('completed');
+    expect(gateway.calls).toBe(1);
+  });
+});
 
 // Punto 1d del encargo (feedback real v0.2.1): línea de estado simple (run.activity).
 describe('RunController — run.activity', () => {
@@ -253,6 +512,7 @@ describe('RunController — pista tras el segundo error idéntico de una tool (d
     const { deps, runs } = baseDeps({
       gateway: makeScriptedGateway(scripts),
       tools: makeFakeToolRegistry([makeFinishTool(), makeAlwaysFailingTool(errorText), makeListFilesTool()]),
+      agents: makeFakeAgentConfigResolver(makeTestAgentConfig({ allowedTools: ['finish', 'flaky_tool'] })),
     });
     const controller = new RunController(deps);
     const { runId } = await controller.start('chat_1', 'probá algo que falla', 'agent');
@@ -280,6 +540,7 @@ describe('RunController — pista tras el segundo error idéntico de una tool (d
     const { deps, runs } = baseDeps({
       gateway: makeScriptedGateway(scripts),
       tools: makeFakeToolRegistry([makeFinishTool(), makeAlwaysFailingTool('error único'), makeListFilesTool()]),
+      agents: makeFakeAgentConfigResolver(makeTestAgentConfig({ allowedTools: ['finish', 'flaky_tool'] })),
     });
     const controller = new RunController(deps);
     const { runId } = await controller.start('chat_1', 'probá algo que falla una vez', 'agent');
@@ -292,6 +553,27 @@ describe('RunController — pista tras el segundo error idéntico de una tool (d
 });
 
 describe('RunController — permiso ask y respuesta', () => {
+  it('ejecuta dos herramientas con permisos sucesivos y completa tras aprobar ambas', async () => {
+    const applied: unknown[] = [];
+    const scripts: ChatChunk[][] = ['first', 'second'].map((id) => [
+      { type: 'tool_call', call: { id, name: 'edit_file', args: { path: `${id}.ts` }, transport: 'native' } },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]);
+    scripts.push([{ type: 'content', text: 'Listo' }, { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } }]);
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts), permissions: makeAskThenRecordPermissionEngine(),
+      tools: makeFakeToolRegistry([makeEditFileTool((args) => applied.push(args))]),
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'Editá ambos archivos', 'agent');
+    for (const id of ['first', 'second']) {
+      await waitUntil(async () => (await deps.toolCalls.get(id))?.status === 'awaiting_permission');
+      await controller.answerPermission(id, { toolCallId: id, answer: 'allow_once' });
+    }
+    await waitTerminal(runs, runId);
+    expect(applied).toEqual([{ path: 'first.ts' }, { path: 'second.ts' }]);
+    expect((await runs.get(runId))?.state).toBe('completed');
+  });
   it('edit_file en ask espera answerPermission y continúa tras allow_once', async () => {
     const scripts: ChatChunk[][] = [
       [
@@ -348,6 +630,460 @@ describe('RunController — permiso ask y respuesta', () => {
     expect(applied).toHaveLength(0);
     expect((await runs.get(runId))?.state).toBe('completed');
     expect((await deps.toolCalls.get('call_1'))?.status).toBe('denied');
+  });
+});
+
+describe('RunController — proyecto y plan de texto', () => {
+  it('rechaza chats y runs de otro proyecto antes de generar o crear un run nuevo', async () => {
+    const chatA = makeTestChat({ id: 'chat_a', projectId: 'project_a' });
+    const chatB = makeTestChat({ id: 'chat_b', projectId: 'project_b' });
+    const chats = makeFakeChatRepository([chatA, chatB]);
+    const gateway = makeScriptedGateway([]);
+    const { deps, runs } = baseDeps({ chats, gateway, projectId: 'project_b', projectRoot: '/project-b' });
+    const controllerB = new RunController(deps);
+
+    await expect(controllerB.start(chatA.id, 'tocá un archivo', 'agent'))
+      .rejects.toThrow(/chat_a pertenece al proyecto project_a/);
+    await runs.create({
+      id: 'run_a', chatId: chatA.id, agentId: 'agent_1', mode: 'agent', state: 'completed',
+      iteration: 1, lastEventSeq: 0, createdAt: 0,
+    });
+    await expect(controllerB.continueRun('run_a'))
+      .rejects.toThrow(/chat_a pertenece al proyecto project_a/);
+
+    expect(gateway.calls).toBe(0);
+    expect((await runs.listActive()).map((run) => run.id)).toEqual([]);
+  });
+
+  it('filtra y rechaza permisos pendientes de otro proyecto, incluido answerPermission', async () => {
+    const chatA = makeTestChat({ id: 'chat_a', projectId: 'project_a' });
+    const chatB = makeTestChat({ id: 'chat_b', projectId: 'project_b' });
+    const chats = makeFakeChatRepository([chatA, chatB]);
+    const { deps, runs } = baseDeps({ chats, projectId: 'project_b', projectRoot: '/project-b' });
+    await runs.create({
+      id: 'run_a', chatId: chatA.id, agentId: 'agent_1', mode: 'agent', state: 'awaiting_permission',
+      iteration: 0, lastEventSeq: 0, createdAt: 0,
+    });
+    await deps.toolCalls.upsert({
+      id: 'call_a', runId: 'run_a', iteration: 0, toolName: 'edit_file', args: { path: 'same-name.ts' },
+      argsHash: 'hash', category: 'write', risk: 'medium', transport: 'native', status: 'awaiting_permission',
+    });
+    const controllerB = new RunController(deps);
+
+    await expect(controllerB.pendingPermissionRequests()).resolves.toEqual([]);
+    await expect(controllerB.resumeAfterRestart('run_a'))
+      .rejects.toThrow(/chat_a pertenece al proyecto project_a/);
+    await expect(controllerB.answerPermission('call_a', { toolCallId: 'call_a', answer: 'allow_once' }))
+      .rejects.toThrow(/chat_a pertenece al proyecto project_a/);
+    expect((await deps.toolCalls.get('call_a'))?.status).toBe('awaiting_permission');
+
+    const controllerA = new RunController({ ...deps, projectId: 'project_a', projectRoot: '/project-a' });
+    await expect(controllerA.pendingPermissionRequests()).resolves.toHaveLength(1);
+  });
+
+  it('usa la raíz del proyecto en el prompt al iniciar y continuar sin mutar el agente global', async () => {
+    const agent = { ...makeTestAgentConfig({ role: 'lead' }), workingDir: 'C:\\Users\\example\\AppData\\SaurioLLM' };
+    const collaborator = makeTestAgentConfig({ id: 'agent_tester', name: 'Tester Persistente', role: 'custom' });
+    const gateway = makeScriptedGateway([0, 1].map(() => [
+      { type: 'content', text: 'Hola' }, { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]));
+    const { deps, runs } = baseDeps({
+      agents: makeFakeAgentConfigResolver(agent), gateway, projectRoot: 'N:\\Proyecto abierto',
+      context: createContextBuilder(createTokenEstimator(agent.model)),
+      chatCollaborators: { listEnabled: async () => [collaborator] },
+    });
+    const controller = new RunController(deps);
+    const first = await controller.start('chat_1', '¿Dónde trabajás?', 'agent');
+    await waitTerminal(runs, first.runId);
+    const next = await controller.continueRun(first.runId);
+    await waitTerminal(runs, next.runId);
+    for (const request of gateway.requests) {
+      const system = request.messages.find((message) => message.role === 'system')!.content;
+      expect(system).toContain('Carpeta de trabajo: N:\\Proyecto abierto');
+      expect(system).not.toContain(agent.workingDir);
+      expect(system).toContain('Tester Persistente');
+      expect(system).toContain('agent_tester');
+    }
+    expect(agent.workingDir).toBe('C:\\Users\\example\\AppData\\SaurioLLM');
+    expect(gateway.requests).toHaveLength(2);
+  });
+
+  it('recarga la allowlist al reanudar un permiso después de reiniciar', async () => {
+    const lead = makeTestAgentConfig({ role: 'lead' });
+    const calls: string[] = [];
+    const { deps, runs } = baseDeps({
+      agents: makeFakeAgentConfigResolver(lead),
+      chatCollaborators: { listEnabled: async (chatId) => { calls.push(chatId); return []; } },
+    });
+    await runs.create({ id: 'run_resume_team', chatId: 'chat_1', agentId: lead.id, mode: 'agent', state: 'awaiting_permission', iteration: 0, lastEventSeq: 0, createdAt: 0 });
+    await deps.toolCalls.upsert({ id: 'call_resume_team', runId: 'run_resume_team', iteration: 0, toolName: 'edit_file', args: { path: 'a.ts' }, argsHash: 'h', category: 'write', risk: 'medium', transport: 'native', status: 'awaiting_permission' });
+    const controller = new RunController(deps);
+    await expect(controller.resumeAfterRestart('run_resume_team')).resolves.toBe(true);
+    expect(calls).toEqual(['chat_1']);
+    await controller.cancel('run_resume_team');
+  });
+
+  it('persiste el checklist de un plan textual sin segunda respuesta ni tools', async () => {
+    const gateway = makeScriptedGateway([[
+      { type: 'content', text: '1. Leer math.ts\n2. Corregir suma\n3. Ejecutar las pruebas' },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]]);
+    const { deps, runs } = baseDeps({ gateway });
+    const { runId } = await new RunController(deps).start('chat_1', 'Armá un plan', 'plan');
+    await waitTerminal(runs, runId);
+    expect((await deps.taskManager.list('chat_1')).map((task) => task.title))
+      .toEqual(['Leer math.ts', 'Corregir suma', 'Ejecutar las pruebas']);
+    expect(gateway.calls).toBe(1);
+    expect((await runs.get(runId))?.state).toBe('completed');
+  });
+
+  it('pide una sola corrección si modo plan termina en prosa y persiste la lista explícita del segundo intento', async () => {
+    const gateway = makeScriptedGateway([
+      [
+        { type: 'content', text: 'El bug está en math.ts y hace una resta en vez de sumar.' },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+      [
+        { type: 'content', text: '1. Leer math.ts\n2. Corregir suma\n3. Ejecutar las pruebas' },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ]);
+    const { deps, runs } = baseDeps({
+      gateway, context: createContextBuilder(createTokenEstimator(makeTestAgentConfig().model)),
+    });
+    const { runId } = await new RunController(deps).start('chat_1', 'Explorá el bug', 'plan');
+    await waitTerminal(runs, runId);
+
+    expect((await deps.taskManager.list('chat_1')).map((task) => task.title))
+      .toEqual(['Leer math.ts', 'Corregir suma', 'Ejecutar las pruebas']);
+    expect(gateway.calls).toBe(2);
+    expect(gateway.requests[1]?.messages.at(-1)).toMatchObject({
+      role: 'user', content: expect.stringContaining('Corrección interna del runtime'),
+    });
+    expect(gateway.requests[1]?.messages.some((message) => (
+      message.role === 'user' && message.content.includes('Corrección interna del runtime: la respuesta anterior no incluyó un plan explícito')
+    ))).toBe(true);
+    expect((await runs.get(runId))?.state).toBe('completed');
+  });
+
+  it.each(['prosa', 'vacía'])('falla sin inventar tasks ni agregar reintentos si la corrección del plan queda %s', async (kind) => {
+    const prose = 'El bug está en math.ts y hace una resta en vez de sumar.';
+    const gateway = makeScriptedGateway([0, 1].map((index) => [
+      { type: 'content' as const, text: index === 1 && kind === 'vacía' ? '' : prose },
+      { type: 'done' as const, doneReason: 'stop', metrics: { quality: 'measured' as const } },
+    ]));
+    const { deps, runs } = baseDeps({ gateway });
+    const { runId } = await new RunController(deps).start('chat_1', 'Explorá el bug', 'plan');
+    await waitTerminal(runs, runId);
+
+    expect(await deps.taskManager.list('chat_1')).toEqual([]);
+    expect(gateway.calls).toBe(2);
+    expect((await runs.get(runId))?.state).toBe('failed');
+    expect(deps.events.since(runId, 0)).toContainEqual(expect.objectContaining({
+      type: 'run.error', error: expect.objectContaining({ message: expect.stringContaining('no produjo un plan') }),
+    }));
+  });
+
+  it('corrige una vez finish sin tasks y acepta las tasks estructuradas del segundo intento', async () => {
+    const finish = {
+      ...makeFinishTool(),
+      handler: async (args: unknown) => ({
+        content: [{ type: 'text' as const, text: 'ok' }], isError: false,
+        structured: args,
+      }),
+    } satisfies ToolDefinition;
+    const gateway = makeScriptedGateway([
+      [
+        { type: 'tool_call', call: { id: 'finish_sin_tasks', name: 'finish', args: { summary: 'El bug está en math.ts.' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+      [
+        { type: 'tool_call', call: { id: 'finish_con_tasks', name: 'finish', args: {
+          summary: 'Plan listo', tasks: [
+            { title: 'Corregir suma', status: 'pending' },
+            { title: 'Ejecutar las pruebas', status: 'pending' },
+          ],
+        }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ]);
+    const { deps, runs } = baseDeps({ gateway, tools: makeFakeToolRegistry([finish, makeListFilesTool()]) });
+    const { runId } = await new RunController(deps).start('chat_1', 'Explorá el bug', 'plan');
+    await waitTerminal(runs, runId);
+
+    expect((await deps.taskManager.list('chat_1')).map((task) => task.title))
+      .toEqual(['Corregir suma', 'Ejecutar las pruebas']);
+    expect(gateway.calls).toBe(2);
+    expect((await runs.get(runId))?.state).toBe('completed');
+  });
+
+  it('no aplica la corrección de plan en modo ask ni después de un reintento de formato', async () => {
+    const prose = 'El bug está en math.ts y hace una resta en vez de sumar.';
+    const askGateway = makeScriptedGateway([[
+      { type: 'content', text: prose },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]]);
+    const ask = baseDeps({ gateway: askGateway });
+    const askRun = await new RunController(ask.deps).start('chat_1', '¿Dónde está el bug?', 'ask');
+    await waitTerminal(ask.runs, askRun.runId);
+    expect(askGateway.calls).toBe(1);
+
+    const nativeProtocol = makeNativeToolProtocol();
+    const retryProtocol: ToolProtocol = {
+      ...nativeProtocol,
+      parse: (message, tools) => message.content === 'formato inválido'
+        ? { toolCalls: [], text: '', parseErrors: ['bloque de tool call incompleto'] }
+        : nativeProtocol.parse(message, tools),
+    };
+    const retryGateway = makeScriptedGateway([
+      [
+        { type: 'content', text: 'formato inválido' },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+      [
+        { type: 'content', text: prose },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ]);
+    const retry = baseDeps({
+      gateway: retryGateway,
+      toolProtocols: { native: retryProtocol, text: createTextToolProtocol() },
+    });
+    const retryRun = await new RunController(retry.deps).start('chat_1', 'Explorá el bug', 'plan');
+    await waitTerminal(retry.runs, retryRun.runId);
+    expect(retryGateway.calls).toBe(2);
+    expect(await retry.deps.taskManager.list('chat_1')).toEqual([]);
+  });
+});
+
+describe('RunController — regenerar una respuesta', () => {
+  const originModel = { providerId: 'openai-compatible', name: 'modelo-historico', locality: 'cloud' as const };
+  const effectiveConfig = {
+    model: originModel, numCtx: 16_384, think: false, tools: ['finish'] as string[],
+    transport: 'native' as const, promptHash: 'hash_historico', adjustments: [],
+    contextLimitSource: 'reported' as const,
+  };
+
+  function snapshotContext(): ContextBuilder {
+    const base = makeFakeContextBuilder();
+    return {
+      willCompact: (input) => base.willCompact(input),
+      build: async (input) => {
+        const built = await base.build(input);
+        return { ...built, messages: built.messages.map((message) => ({ ...message })) };
+      },
+    };
+  }
+
+  async function seedOrigin(
+    deps: RunControllerDeps,
+    runs: ReturnType<typeof makeFakeRunRepository>,
+    state: 'completed' | 'generating' = 'completed',
+  ): Promise<ChatMessage[]> {
+    await runs.create({
+      id: 'run_origin', chatId: 'chat_1', agentId: 'agent_1', mode: 'agent', state,
+      iteration: 1, lastEventSeq: 0, effectiveConfig, createdAt: 1,
+    });
+    const history: ChatMessage[] = [
+      { id: 'user_older', originRunId: 'run_older', role: 'user', content: 'contexto anterior' },
+      { id: 'assistant_older', originRunId: 'run_older', role: 'assistant', content: 'respuesta anterior' },
+      { id: 'user_origin', originRunId: 'run_origin', role: 'user', content: 'pedido exacto' },
+      { id: 'assistant_origin', originRunId: 'run_origin', role: 'assistant', content: 'respuesta a conservar' },
+      { id: 'tool_origin', originRunId: 'run_origin', role: 'tool', content: 'salida a conservar', toolCallId: 'call_origin' },
+    ];
+    for (const message of history) await deps.messages.append('chat_1', message);
+    deps.events.append({
+      runId: 'run_origin', chatId: 'chat_1', ts: deps.clock.now(), type: 'message.done',
+      message: history[2]!, metrics: { quality: 'unavailable' },
+    });
+    deps.events.append({
+      runId: 'run_origin', chatId: 'chat_1', ts: deps.clock.now(), type: 'message.done',
+      message: history[3]!, metrics: { quality: 'measured' },
+    });
+    return history;
+  }
+
+  it('rechaza un origen de otro proyecto antes de crear o generar', async () => {
+    const chats = makeFakeChatRepository([makeTestChat({ id: 'chat_1', projectId: 'project_a' })]);
+    const gateway = makeScriptedGateway([]);
+    const { deps, runs } = baseDeps({ chats, gateway, projectId: 'project_b', projectRoot: '/project-b' });
+    await seedOrigin(deps, runs);
+
+    await expect(new RunController(deps).regenerate('run_origin'))
+      .rejects.toThrow(/chat_1 pertenece al proyecto project_a/);
+    expect(gateway.calls).toBe(0);
+    expect(runs.all.size).toBe(1);
+  });
+
+  it('rechaza un origen activo y bloquea dos regeneraciones simultáneas del mismo chat', async () => {
+    const { deps, runs } = baseDeps();
+    await seedOrigin(deps, runs, 'generating');
+    const controller = new RunController(deps);
+    await expect(controller.regenerate('run_origin')).rejects.toThrow(/todavía está activo/);
+
+    await runs.update('run_origin', { state: 'completed' });
+    const settled = await Promise.allSettled([
+      controller.regenerate('run_origin'),
+      controller.regenerate('run_origin'),
+    ]);
+    expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(settled.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    expect(String(rejected?.reason)).toMatch(/ya está iniciando otra ejecución|ya tiene un run activo/);
+  });
+
+  it('conserva el historial persistido pero el prompt termina en el user origen y usa su modelo efectivo', async () => {
+    const gateway = makeScriptedGateway([[
+      { type: 'content', text: 'respuesta regenerada' },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]]);
+    const { deps, runs } = baseDeps({ gateway, context: snapshotContext() });
+    const originalHistory = await seedOrigin(deps, runs);
+    const before = await deps.messages.listByChat('chat_1');
+
+    const { runId } = await new RunController(deps).regenerate('run_origin');
+    await waitTerminal(runs, runId);
+
+    expect(await deps.messages.listByChat('chat_1')).toEqual(before);
+    expect(before).toEqual(originalHistory);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]?.model).toBe(originModel.name);
+    expect((await runs.get(runId))?.effectiveConfig?.model).toEqual(originModel);
+    expect((await runs.get(runId))?.effectiveConfig?.regenerationSourceMessageId).toBe('user_origin');
+    expect(gateway.requests[0]?.messages.filter((message) => !message.ephemeral).map((message) => message.id))
+      .toEqual(['user_older', 'assistant_older', 'user_origin']);
+    expect(gateway.requests[0]?.messages.find((message) => message.id === 'user_origin')).toMatchObject({
+      id: 'user_origin', role: 'user', content: 'pedido exacto', originRunId: 'run_origin',
+    });
+  });
+
+  it('puede volver a regenerar la respuesta regenerada usando la correlación persistida', async () => {
+    const gateway = makeScriptedGateway([0, 1].map((index) => [
+      { type: 'content' as const, text: `alternativa ${index + 1}` },
+      { type: 'done' as const, doneReason: 'stop', metrics: { quality: 'measured' as const } },
+    ]));
+    const { deps, runs } = baseDeps({ gateway, context: snapshotContext() });
+    await seedOrigin(deps, runs);
+    const controller = new RunController(deps);
+
+    const first = await controller.regenerate('run_origin');
+    await waitTerminal(runs, first.runId);
+    const second = await controller.regenerate(first.runId);
+    await waitTerminal(runs, second.runId);
+
+    expect(gateway.requests).toHaveLength(2);
+    for (const request of gateway.requests) {
+      expect(request.messages.filter((message) => !message.ephemeral).map((message) => message.id))
+        .toEqual(['user_older', 'assistant_older', 'user_origin']);
+    }
+    expect((await runs.get(second.runId))?.effectiveConfig?.regenerationSourceMessageId).toBe('user_origin');
+  });
+
+  it('falla antes de crear el run cuando el pedido o una imagen adjunta no son restaurables', async () => {
+    const { deps, runs } = baseDeps();
+    await runs.create({
+      id: 'run_missing', chatId: 'chat_1', agentId: 'agent_1', mode: 'agent', state: 'completed',
+      iteration: 1, lastEventSeq: 0, effectiveConfig, createdAt: 1,
+    });
+    const controller = new RunController(deps);
+    await expect(controller.regenerate('run_missing')).rejects.toThrow(/terminó antes de persistir una respuesta/);
+
+    await deps.messages.append('chat_1', { id: 'user_broken', originRunId: 'run_missing', role: 'user', content: 'mirá', images: [''] });
+    await deps.messages.append('chat_1', { id: 'assistant_broken', originRunId: 'run_missing', role: 'assistant', content: 'veo' });
+    deps.events.append({
+      runId: 'run_missing', chatId: 'chat_1', ts: deps.clock.now(), type: 'message.done',
+      message: { id: 'user_broken', originRunId: 'run_missing', role: 'user', content: 'mirá', images: [''] },
+      metrics: { quality: 'unavailable' },
+    });
+    deps.events.append({
+      runId: 'run_missing', chatId: 'chat_1', ts: deps.clock.now(), type: 'message.done',
+      message: { id: 'assistant_broken', originRunId: 'run_missing', role: 'assistant', content: 'veo' },
+      metrics: { quality: 'measured' },
+    });
+    await expect(controller.regenerate('run_missing')).rejects.toThrow(/imagen adjunta.*no tiene datos restaurables/);
+    expect(runs.all.size).toBe(1);
+  });
+});
+
+describe('RunController — origen de selección de modelo', () => {
+  const recommended = { providerId: 'ollama', name: 'qwen-role-fit:8b', locality: 'local' as const };
+  const legacyCloud = { providerId: 'cloud-one', name: 'cloud-model', locality: 'cloud' as const };
+
+  it('sólo omite el override para chats marcados auto; legacy y explícito conservan su elección', async () => {
+    const autoAgent = makeTestAgentConfig({ modelMode: 'auto', model: legacyCloud });
+    const explicitSame = recommended;
+    const chats = makeFakeChatRepository([
+      makeTestChat({ id: 'chat_auto', modelRef: undefined, modelSelection: 'auto' }),
+      makeTestChat({ id: 'chat_explicit', modelRef: explicitSame, modelSelection: 'explicit' }),
+      makeTestChat({ id: 'chat_legacy', modelRef: legacyCloud, modelSelection: undefined }),
+    ]);
+    const seen: Array<unknown> = [];
+    const resolveModelRef: NonNullable<RunControllerDeps['resolveModelRef']> = async (_agent, chatModelRef) => {
+      seen.push(chatModelRef);
+      return chatModelRef ?? recommended;
+    };
+    const gateway = makeScriptedGateway([0, 1, 2].map(() => [
+      { type: 'content', text: 'listo' },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]));
+    const { deps, runs } = baseDeps({
+      agents: makeFakeAgentConfigResolver(autoAgent), chats, resolveModelRef, gateway,
+      context: createContextBuilder(createTokenEstimator(recommended)),
+    });
+    const controller = new RunController(deps);
+
+    for (const chatId of ['chat_auto', 'chat_explicit', 'chat_legacy']) {
+      const { runId } = await controller.start(chatId, 'hola', 'ask');
+      await waitTerminal(runs, runId);
+    }
+
+    expect(seen).toEqual([undefined, explicitSame, legacyCloud]);
+  });
+
+  it('persiste y emite la razón entregada por el mismo resolver que elige el modelo', async () => {
+    const resolution = {
+      source: 'automatic_recommendation' as const, contextMax: 32768,
+      fitClass: 'tight' as const, fitQuality: 'estimated' as const,
+    };
+    const gateway = makeScriptedGateway([[
+      { type: 'content', text: 'listo' },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]]);
+    const { deps, runs } = baseDeps({
+      resolveModelRef: async () => ({ ref: recommended, resolution }), gateway,
+      context: createContextBuilder(createTokenEstimator(recommended)),
+    });
+    const { runId } = await new RunController(deps).start('chat_1', 'hola', 'ask');
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.effectiveConfig?.model).toEqual(recommended);
+    expect((await runs.get(runId))?.effectiveConfig?.modelResolution).toEqual(resolution);
+    const built = (deps.events as ReturnType<typeof makeFakeEventStore>).all
+      .find((event) => event.runId === runId && event.type === 'context.built');
+    expect(built?.type).toBe('context.built');
+    if (!built || built.type !== 'context.built') throw new Error('faltó context.built');
+    expect(built.modelResolution).toEqual(resolution);
+  });
+
+  it('al continuar conserva la razón del run anterior e identifica la herencia', async () => {
+    const resolution = { source: 'chat_override' as const };
+    const gateway = makeScriptedGateway([0, 1].map(() => [
+      { type: 'content', text: 'listo' },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]));
+    const { deps, runs } = baseDeps({
+      resolveModelRef: async () => ({ ref: recommended, resolution }), gateway,
+      context: createContextBuilder(createTokenEstimator(recommended)),
+    });
+    const controller = new RunController(deps);
+    const first = await controller.start('chat_1', 'hola', 'ask');
+    await waitTerminal(runs, first.runId);
+    const next = await controller.continueRun(first.runId);
+    await waitTerminal(runs, next.runId);
+
+    expect((await runs.get(next.runId))?.effectiveConfig?.modelResolution).toEqual({
+      source: 'chat_override', inheritedFromRunId: first.runId,
+    });
   });
 });
 
@@ -589,6 +1325,7 @@ describe('RunController — timeout de tool handler', () => {
     const { deps, runs } = baseDeps({
       gateway: makeScriptedGateway(scripts),
       tools: makeFakeToolRegistry([makeFinishTool(), hangingTool, makeListFilesTool()]),
+      agents: makeFakeAgentConfigResolver(makeTestAgentConfig({ allowedTools: ['finish', 'hang_forever'] })),
       defaultToolTimeoutMs: 20,
     });
     const controller = new RunController(deps);
@@ -681,6 +1418,161 @@ describe('RunController — provider caído (connection_refused) falla rápido e
   });
 });
 
+describe('RunController — provider ocupado (server_busy) tiene reintentos acotados', () => {
+  const busyScript: ChatChunk[] = [{ type: 'error', code: 'server_busy', message: 'HTTP 429: rate limit' }];
+  const connectionScript: ChatChunk[] = [{ type: 'error', code: 'connection_refused', message: 'ECONNREFUSED' }];
+  const listScript: ChatChunk[] = [
+    { type: 'tool_call', call: { id: 'call_list_after_busy', name: 'list_files', args: {}, transport: 'native' } },
+    { type: 'done', doneReason: 'tool_calls', metrics: { quality: 'measured' } },
+  ];
+  const finishScript: ChatChunk[] = [
+    { type: 'tool_call', call: { id: 'call_finish_after_busy', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+    { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+  ];
+
+  it('falla con server_busy visible después de tres reintentos y no hace una quinta llamada', async () => {
+    const gateway = makeScriptedGateway([busyScript, busyScript, busyScript, busyScript, busyScript]);
+    const { deps, runs } = baseDeps({ gateway });
+    const { runId } = await new RunController(deps).start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.state).toBe('failed');
+    expect(run?.error).toMatchObject({ code: 'server_busy' });
+    expect(run?.error?.message).toContain('tras 3 reintentos');
+    expect(gateway.calls).toBe(4);
+    const runError = (deps.events as ReturnType<typeof makeFakeEventStore>).all.find((event) => event.type === 'run.error');
+    expect(runError).toMatchObject({ type: 'run.error', error: { code: 'server_busy' }, recoverable: false });
+  });
+
+  it('mantiene contadores separados y reinicia la racha busy al recibir una respuesta real', async () => {
+    const gateway = makeScriptedGateway([
+      connectionScript, connectionScript, connectionScript,
+      busyScript, busyScript, busyScript,
+      listScript,
+      busyScript, busyScript, busyScript,
+      finishScript,
+    ]);
+    const { deps, runs } = baseDeps({ gateway });
+    const { runId } = await new RunController(deps).start('chat_1', 'listá y terminá', 'agent');
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.state).toBe('completed');
+    expect(gateway.calls).toBe(11);
+  });
+
+  it('cancelar durante el backoff busy conserva cancelled sin reintentar ni emitir run.error', async () => {
+    let notifyDelayStarted!: () => void;
+    let releaseDelay!: () => void;
+    const delayStarted = new Promise<void>((resolve) => { notifyDelayStarted = resolve; });
+    const delayGate = new Promise<void>((resolve) => { releaseDelay = resolve; });
+    const gateway = makeScriptedGateway([busyScript, busyScript]);
+    const { deps, runs } = baseDeps({
+      gateway,
+      delay: async () => { notifyDelayStarted(); await delayGate; },
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await delayStarted;
+
+    await controller.cancel(runId);
+    expect((await runs.get(runId))?.state).toBe('cancelling');
+    releaseDelay();
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.state).toBe('cancelled');
+    expect(gateway.calls).toBe(1);
+    expect((deps.events as ReturnType<typeof makeFakeEventStore>).all.some((event) => event.type === 'run.error')).toBe(false);
+  });
+});
+
+describe('RunController — allowlist efectiva de tools', () => {
+  it('rechaza un write_file nativo no habilitado antes de permisos o ejecución', async () => {
+    let permissionEvaluations = 0;
+    let applied = false;
+    const permissions = makeAllowAllPermissionEngine();
+    const originalEvaluate = permissions.evaluate.bind(permissions);
+    permissions.evaluate = (...args) => { permissionEvaluations += 1; return originalEvaluate(...args); };
+    const forbiddenWriteTool: ToolDefinition = {
+      name: 'write_file', description: 'escribe un archivo', inputSchema: {}, category: 'write',
+      mutating: true, idempotent: false, allowedInModes: ['edit', 'agent'], source: { kind: 'builtin' },
+      classify: () => ({ category: 'write', risk: 'medium', summary: 'write_file', paths: ['src/a.ts'] }),
+      handler: async () => { applied = true; return { content: [{ type: 'text', text: 'escrito' }], isError: false }; },
+    };
+    const gateway = makeScriptedGateway([[
+      { type: 'tool_call', call: { id: 'call_forbidden_write', name: 'write_file', args: { path: 'src/a.ts' }, transport: 'native' } },
+      { type: 'done', doneReason: 'tool_calls', metrics: { quality: 'measured' } },
+    ]]);
+    const agent = makeTestAgentConfig({ role: 'reviewer', allowedTools: ['read_file', 'finish'] });
+    const { deps, runs } = baseDeps({
+      gateway,
+      agents: makeFakeAgentConfigResolver(agent),
+      permissions,
+      tools: makeFakeToolRegistry([makeReadFileTool(), makeFinishTool(), forbiddenWriteTool]),
+    });
+    const { runId } = await new RunController(deps).start('chat_1', 'revisá sin escribir', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.state).toBe('failed');
+    expect(run?.error).toMatchObject({ code: 'format' });
+    expect(run?.error?.message).toContain('"write_file"');
+    expect(run?.error?.message).toContain('No se solicitó permiso ni se ejecutó');
+    expect(permissionEvaluations).toBe(0);
+    expect(applied).toBe(false);
+    expect((deps.events as ReturnType<typeof makeFakeEventStore>).all.some((event) => event.type === 'tool.permission')).toBe(false);
+    expect((await deps.toolCalls.listByRun(runId))).toEqual([]);
+  });
+
+  it('rechaza delegate inventado también por transporte text sin crear un worker', async () => {
+    const gateway = makeScriptedGateway([[
+      { type: 'content', text: '<tool_call>{"name":"delegate","arguments":{"task":"escribir","expectedDeliverable":"cambio"}}</tool_call>' },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ]]);
+    const agent = makeTestAgentConfig({ role: 'reviewer', toolTransport: 'text', allowedTools: ['read_file', 'finish'] });
+    const { deps, runs } = baseDeps({
+      gateway,
+      agents: makeFakeAgentConfigResolver(agent),
+      tools: makeFakeToolRegistry([makeReadFileTool(), makeFinishTool(), makeDelegateToolStub()]),
+      toolProtocols: { native: makeNativeToolProtocol(), text: createTextToolProtocol() },
+    });
+    const { runId } = await new RunController(deps).start('chat_1', 'revisá', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.state).toBe('failed');
+    expect(run?.error?.message).toContain('"delegate"');
+    expect((deps.events as ReturnType<typeof makeFakeEventStore>).all.some((event) => event.type === 'run.delegated')).toBe(false);
+    expect((deps.events as ReturnType<typeof makeFakeEventStore>).all.some((event) => event.type === 'tool.permission')).toBe(false);
+    expect((await deps.toolCalls.listByRun(runId))).toEqual([]);
+  });
+
+  it('conserva read_file y finish cuando sí están en la allowlist efectiva', async () => {
+    const gateway = makeScriptedGateway([
+      [
+        { type: 'tool_call', call: { id: 'call_allowed_read', name: 'read_file', args: { path: 'src/a.ts' }, transport: 'native' } },
+        { type: 'done', doneReason: 'tool_calls', metrics: { quality: 'measured' } },
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_allowed_finish', name: 'finish', args: { summary: 'revisión lista' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ]);
+    const agent = makeTestAgentConfig({ role: 'reviewer', allowedTools: ['read_file', 'finish'] });
+    const { deps, runs } = baseDeps({
+      gateway,
+      agents: makeFakeAgentConfigResolver(agent),
+      tools: makeFakeToolRegistry([makeReadFileTool(), makeFinishTool(), makeEditFileTool()]),
+    });
+    const { runId } = await new RunController(deps).start('chat_1', 'revisá', 'agent');
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.state).toBe('completed');
+    expect(gateway.calls).toBe(2);
+    expect((await deps.toolCalls.get('call_allowed_read'))?.status).toBe('done');
+  });
+});
+
 describe('RunController — oom_load reintenta bajando numGpu antes de fallar (tarea "carga de modelo")', () => {
   const oomScript: ChatChunk[] = [{
     type: 'error', code: 'oom_load',
@@ -750,6 +1642,37 @@ describe('RunController — oom_load reintenta bajando numGpu antes de fallar (t
     // Nuevo run (nueva instancia de RunController + LiveRun): sin herencia del ajuste anterior.
     expect(gatewayB.requests.map((r) => r.options.numGpu)).toEqual([undefined]);
   });
+
+  it('tras reiniciar en un permiso conserva numGpu y continúa la escalera OOM sin repetir 75%', async () => {
+    const permissionScript: ChatChunk[] = [
+      { type: 'tool_call', call: { id: 'call_permission', name: 'list_files', args: { path: '.' }, transport: 'native' } },
+      { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+    ];
+    const gatewayA = makeScriptedGateway([oomScript, permissionScript]);
+    const modelLayerCountProbe = { getBlockCount: async () => 32 };
+    const { deps, runs } = baseDeps({
+      gateway: gatewayA,
+      modelLayerCountProbe,
+      permissions: makeAskThenRecordPermissionEngine(),
+    });
+    const controllerA = new RunController(deps);
+    const { runId } = await controllerA.start('chat_1', 'listá archivos', 'agent');
+    await waitUntil(async () => (await runs.get(runId))?.state === 'awaiting_permission');
+
+    expect(gatewayA.requests.map((request) => request.options.numGpu)).toEqual([undefined, 24]);
+    expect((await runs.get(runId))?.effectiveConfig?.adjustments.filter((adjustment) => adjustment.param === 'numGpu')).toHaveLength(1);
+
+    const gatewayB = makeScriptedGateway([oomScript, finishScript]);
+    const controllerB = new RunController({ ...deps, gateway: gatewayB });
+    await controllerB.answerPermission('call_permission', {
+      toolCallId: 'call_permission', answer: 'allow_once',
+    });
+    await waitTerminal(runs, runId);
+
+    expect((await runs.get(runId))?.state).toBe('completed');
+    // El primer request rehidratado conserva 24; ante otro OOM sigue por 50% (=16), no vuelve a 24.
+    expect(gatewayB.requests.map((request) => request.options.numGpu)).toEqual([24, 16]);
+  });
 });
 
 // ── delegate (doc 19 §2, E3a "Delegación desde el chat") ─────────────────────
@@ -795,6 +1718,169 @@ function makeFakeAgentProfilePort(): AgentProfilePort & { created: { input: Agen
 const doneChunk: ChatChunk = { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } };
 
 describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
+  it('T10: padre e hijo completan con un Scheduler real de un solo slot, sin retenerlo durante la espera', async () => {
+    const scripts: ChatChunk[][] = [
+      [{ type: 'tool_call', call: { id: 'call_delegate_slot', name: 'delegate', args: { targetAgentId: 'agent_reviewer', task: 'revisar', expectedDeliverable: 'informe' }, transport: 'native' } }, doneChunk],
+      [{ type: 'tool_call', call: { id: 'call_finish_child_slot', name: 'finish', args: { summary: 'hijo listo' }, transport: 'native' } }, doneChunk],
+      [{ type: 'tool_call', call: { id: 'call_finish_parent_slot', name: 'finish', args: { summary: 'padre listo' }, transport: 'native' } }, doneChunk],
+    ];
+    let scriptIndex = 0;
+    let activeStreams = 0;
+    let maxActiveStreams = 0;
+    const provider: Provider = {
+      id: 'ollama_local', kind: 'openai-compat', locality: 'local',
+      health: async () => ({ ok: true }),
+      listModels: async () => [],
+      describeModel: async () => { throw new Error('no usado'); },
+      chat(_request, _signal) {
+        const script = scripts[scriptIndex++] ?? [doneChunk];
+        return (async function* () {
+          activeStreams += 1;
+          maxActiveStreams = Math.max(maxActiveStreams, activeStreams);
+          try {
+            for (const chunk of script) {
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              yield chunk;
+            }
+          } finally {
+            activeStreams -= 1;
+          }
+        })();
+      },
+    };
+    const gateway = new ModelGatewayImpl([provider], { slots: 1, groupByModel: true });
+    const { deps, runs } = baseDeps({
+      gateway,
+      delay: async () => { await new Promise<void>((resolve) => setImmediate(resolve)); },
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agents: makeMultiAgentConfigResolver({
+        agent_1: makeTestAgentConfig({ role: 'lead', allowedTools: ['finish', 'delegate'] }),
+        agent_reviewer: makeTestAgentConfig({ id: 'agent_reviewer', role: 'reviewer', allowedTools: ['finish'] }),
+      }),
+    });
+    const { runId } = await new RunController(deps).start('chat_1', 'delegá y cerrá', 'agent');
+    await waitTerminal(runs, runId);
+
+    const delegated = (deps.events as ReturnType<typeof makeFakeEventStore>).all
+      .find((event): event is Extract<RunEvent, { type: 'run.delegated' }> => event.type === 'run.delegated');
+    expect((await runs.get(runId))?.state).toBe('completed');
+    expect((await runs.get(delegated?.childRunId ?? ''))?.state).toBe('completed');
+    expect(scriptIndex).toBe(3);
+    expect(maxActiveStreams).toBe(1);
+    expect(gateway.status().queue).toEqual([]);
+  });
+
+  it('cancelChild valida proyecto y parentesco, y detener un hijo no cancela padre ni hermano', async () => {
+    const parentChat = makeTestChat({ id: 'chat_parent' });
+    const childChat = makeTestChat({ id: 'chat_child', originRunId: 'run_parent' });
+    const siblingChat = makeTestChat({ id: 'chat_sibling', originRunId: 'run_parent' });
+    const foreignChat = makeTestChat({ id: 'chat_foreign', projectId: 'project_foreign', originRunId: 'run_parent' });
+    const chats = makeFakeChatRepository([parentChat, childChat, siblingChat, foreignChat]);
+    const blockingGateway: ModelGateway = {
+      chat(_ref, _request, context) {
+        return (async function* () {
+          await new Promise<void>((_resolve, reject) => {
+            context.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+          });
+          yield doneChunk;
+        })();
+      },
+      providers: () => [],
+      resolve: () => { throw new Error('no usado'); },
+      ensureLoaded: async () => {},
+      status: () => ({ slots: [], queue: [] }),
+    };
+    const { deps, runs } = baseDeps({ chats, gateway: blockingGateway });
+    await runs.create({
+      id: 'run_parent', chatId: parentChat.id, agentId: 'agent_1', mode: 'agent', state: 'generating',
+      iteration: 1, lastEventSeq: 0, createdAt: 0, delegationDepth: 0,
+    });
+    const controller = new RunController(deps);
+    const { runId: childRunId } = await controller.start(childChat.id, 'hijo', 'agent');
+    const { runId: siblingRunId } = await controller.start(siblingChat.id, 'hermano', 'agent');
+    await controller.cancelChild('run_parent', childRunId);
+    await waitTerminal(runs, childRunId);
+
+    expect((await runs.get(childRunId))?.state).toBe('cancelled');
+    expect((await runs.get('run_parent'))?.state).toBe('generating');
+    expect((await runs.get(siblingRunId))?.state).not.toBe('cancelled');
+
+    await runs.create({
+      id: 'run_unrelated', chatId: parentChat.id, agentId: 'agent_1', mode: 'agent', state: 'generating',
+      iteration: 0, lastEventSeq: 0, createdAt: 0,
+    });
+    await expect(controller.cancelChild('run_unrelated', siblingRunId)).rejects.toThrow(/no es hijo/);
+
+    await runs.create({
+      id: 'run_foreign_child', chatId: foreignChat.id, parentRunId: 'run_parent', agentId: 'agent_1', mode: 'agent', state: 'generating',
+      iteration: 0, lastEventSeq: 0, createdAt: 0,
+    });
+    await expect(controller.cancelChild('run_parent', 'run_foreign_child')).rejects.toThrow(/project_foreign/);
+
+    await controller.cancelChild('run_parent', siblingRunId);
+    await waitTerminal(runs, siblingRunId);
+  });
+
+  it('Director sólo delega a colaboradores habilitados y recibe su roster en el prompt', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_blocked', name: 'delegate', args: { targetAgentId: 'agent_intruder', task: 'revisar', expectedDeliverable: 'informe' }, transport: 'native' } },
+        doneChunk,
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_finish_parent', name: 'finish', args: { summary: 'No delegué fuera del equipo.' }, transport: 'native' } },
+        doneChunk,
+      ],
+    ];
+    const gateway = makeScriptedGateway(scripts);
+    const reviewer = makeTestAgentConfig({ id: 'agent_reviewer', name: 'Revisor Ada', role: 'reviewer', allowedTools: ['finish'] });
+    const { deps, runs } = baseDeps({
+      gateway,
+      context: createContextBuilder(createTokenEstimator(reviewer.model)),
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agents: makeMultiAgentConfigResolver({
+        agent_1: makeTestAgentConfig({ role: 'lead', allowedTools: ['finish', 'delegate'] }),
+        agent_reviewer: reviewer,
+        agent_intruder: makeTestAgentConfig({ id: 'agent_intruder', name: 'Intruso' }),
+      }),
+      chatCollaborators: { listEnabled: async () => [reviewer] },
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'delegá la revisión', 'agent');
+    await waitTerminal(runs, runId);
+
+    expect(gateway.requests[0]?.messages.some((message) =>
+      message.content.includes('Revisor Ada') && message.content.includes('agent_reviewer'))).toBe(true);
+    const blocked = [...(deps.toolCalls as ReturnType<typeof makeFakeToolCallRepository>).all.values()]
+      .find((call) => call.id === 'call_blocked');
+    expect(blocked?.resultIsError).toBe(true);
+    expect(blocked?.resultPreview).toContain('no está habilitado');
+    expect((deps.events as ReturnType<typeof makeFakeEventStore>).all.some((event) => event.type === 'run.delegated')).toBe(false);
+  });
+
+  it('aplica budget.maxIterations al run hijo sin ampliar el límite del perfil', async () => {
+    const scripts: ChatChunk[][] = [
+      [{ type: 'tool_call', call: { id: 'call_delegate_budget', name: 'delegate', args: { targetAgentId: 'agent_reviewer', task: 'revisar', expectedDeliverable: 'informe', budget: { maxIterations: 1 } }, transport: 'native' } }, doneChunk],
+      [{ type: 'tool_call', call: { id: 'call_child_read', name: 'list_files', args: {}, transport: 'native' } }, doneChunk],
+      [{ type: 'tool_call', call: { id: 'call_finish_parent', name: 'finish', args: { summary: 'El hijo agotó su presupuesto.' }, transport: 'native' } }, doneChunk],
+    ];
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub(), makeListFilesTool()]),
+      agents: makeMultiAgentConfigResolver({
+        agent_1: makeTestAgentConfig({ allowedTools: ['finish', 'delegate'] }),
+        agent_reviewer: makeTestAgentConfig({ id: 'agent_reviewer', allowedTools: ['finish', 'list_files'], maxIterations: 9 }),
+      }),
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'delegá con presupuesto corto', 'agent');
+    await waitTerminal(runs, runId);
+    const event = (deps.events as ReturnType<typeof makeFakeEventStore>).all.find((item) => item.type === 'run.delegated');
+    expect(event?.type).toBe('run.delegated');
+    if (!event || event.type !== 'run.delegated') throw new Error('faltó run.delegated');
+    expect((await runs.get(event.childRunId))?.error?.code).toBe('max_iterations');
+  });
+
   it('T06: delega a un agente existente — crea el run/chat hijo con parent_run_id/delegation_depth y el padre recibe el DelegationResult', async () => {
     const scripts: ChatChunk[][] = [
       // Turno 1 del PADRE: llama a delegate.
@@ -842,6 +1928,7 @@ describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
     expect(delegatedEvent).toBeDefined();
     expect(delegatedEvent?.targetAgentId).toBe('agent_reviewer');
     expect(delegatedEvent?.parentRunId).toBe(runId);
+    expect(delegatedEvent?.toolCallId).toBe('call_delegate');
 
     const childRun = await runs.get(delegatedEvent!.childRunId);
     expect(childRun?.parentRunId).toBe(runId);
@@ -872,6 +1959,7 @@ describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
     const { deps, runs } = baseDeps({
       gateway: makeScriptedGateway(scripts),
       tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agents: makeFakeAgentConfigResolver(makeTestAgentConfig({ allowedTools: ['finish', 'delegate'] })),
       agentProfiles,
     });
     const controller = new RunController(deps);
@@ -900,6 +1988,7 @@ describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
     const { deps, runs } = baseDeps({
       gateway: makeScriptedGateway(scripts),
       tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agents: makeFakeAgentConfigResolver(makeTestAgentConfig({ allowedTools: ['finish', 'delegate'] })),
     });
     const controller = new RunController(deps);
     const { runId } = await controller.start('chat_1', 'delegá sin decir a quién', 'agent');
@@ -928,6 +2017,7 @@ describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
     const { deps, runs } = baseDeps({
       gateway: makeScriptedGateway(scripts),
       tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agents: makeFakeAgentConfigResolver(makeTestAgentConfig({ allowedTools: ['finish', 'delegate'] })),
       chats: makeFakeChatRepository([makeTestChat(), childChat]),
     });
     // Run padre pre-sembrado (profundidad 0) para que `start()` pueda derivar delegationDepth = 1
@@ -969,6 +2059,7 @@ describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
     const { deps, runs } = baseDeps({
       gateway: makeScriptedGateway(scripts),
       tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+      agents: makeFakeAgentConfigResolver(makeTestAgentConfig({ allowedTools: ['finish', 'delegate'] })),
     });
     // Primer id que asigna start() es el runId (ver RunController.start(): `ids.next()` antes que
     // cualquier otro consumidor) — con `makeFakeIds()` fresco eso es siempre 'id_1'.
@@ -1011,7 +2102,9 @@ describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
     const { deps, runs } = baseDeps({
       gateway: makeScriptedGateway(scripts),
       tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
-      agents: makeMultiAgentConfigResolver({ agent_1: makeTestAgentConfig() }),
+      agents: makeMultiAgentConfigResolver({
+        agent_1: makeTestAgentConfig({ allowedTools: ['finish', 'delegate'] }),
+      }),
     });
     const controller = new RunController(deps);
     const { runId } = await controller.start('chat_1', 'delegale a un agente que no existe', 'agent');
@@ -1095,6 +2188,175 @@ describe('RunController — preset de permisos por chat', () => {
     // `finish` no pasa por evaluate() (RunController.runFinish la intercepta antes) — este caso solo
     // confirma que el run no se rompe sin permissionPreset; el propagado ya lo cubre el test de arriba.
     await expect(runs.get(runId)).resolves.toMatchObject({ state: 'completed' });
+  });
+});
+
+describe('RunController — policy efectiva del máximo confirmado', () => {
+  it('usa 40k para presupuesto, historia y numPredict aunque el agente persistido tenga policy de 8k', async () => {
+    const agent = makeTestAgentConfig();
+    const gateway = makeScriptedGateway([]);
+    const history: ChatMessage[] = Array.from({ length: 12 }, (_, index) => ({
+      id: `history-40k-${index}`,
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: 'x'.repeat(4_000),
+    }));
+    const { deps, runs } = baseDeps({
+      agents: makeFakeAgentConfigResolver(agent),
+      gateway,
+      context: createContextBuilder(createTokenEstimator(agent.model)),
+      numCtxForModel: async () => 40_960,
+      modelContextProbe: { getContextMax: async () => 40_960 },
+    });
+    (deps.messages as ReturnType<typeof makeFakeMessageRepository>).byChat.set('chat_1', history);
+
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'seguí', 'agent');
+    await waitTerminal(runs, runId);
+
+    const effectivePolicy = contextPolicyForNumCtx(40_960, agent.contextPolicy);
+    const request = gateway.requests[0];
+    expect(request?.options.numCtx).toBe(40_960);
+    expect(request?.options.numPredict).toBe(effectivePolicy.reserveForResponse);
+    expect(request?.messages.filter((message) => message.id.startsWith('history-40k-'))).toHaveLength(history.length);
+
+    const event = (deps.events as ReturnType<typeof makeFakeEventStore>).all.find((candidate) => candidate.type === 'context.built');
+    expect(event?.type).toBe('context.built');
+    if (!event || event.type !== 'context.built') throw new Error('faltó context.built');
+    expect(event.budget).toMatchObject({
+      numCtx: 40_960,
+      effectiveNumCtx: 40_960,
+      reserveForResponse: effectivePolicy.reserveForResponse,
+      contextLimitSource: 'reported',
+      fits: true,
+    });
+    expect(event.budget.used.history).toBeGreaterThan(8_192);
+  });
+
+  it('preserva el entregable real del worker y sólo devuelve artifacts existentes dentro del proyecto', async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'saurio-delegate-result-'));
+    writeFileSync(join(projectRoot, 'ideas.txt'), 'Luna\nMax\nBella\n', 'utf8');
+    mkdirSync(join(projectRoot, '.git'));
+    writeFileSync(join(projectRoot, '.git', 'config'), '[core]\n', 'utf8');
+    symlinkSync(join(projectRoot, '.git'), join(projectRoot, 'safe-link'), 'junction');
+    try {
+      const scripts: ChatChunk[][] = [
+        [
+          { type: 'tool_call', call: { id: 'call_delegate', name: 'delegate', args: { targetAgentId: 'agent_reviewer', task: 'proponer nombres', expectedDeliverable: 'tres nombres concretos' }, transport: 'native' } },
+          doneChunk,
+        ],
+        [
+          { type: 'content', text: '1. Luna\n2. Max\n3. Bella' },
+          {
+            type: 'tool_call',
+            call: {
+              id: 'call_finish_child', name: 'finish', transport: 'native', args: {
+                summary: JSON.stringify({
+                  status: 'completed', summary: 'Se proporcionaron tres ideas.',
+                  artifacts: [
+                    { path: 'ideas.txt', description: 'nombres reales' },
+                    { path: 'fantasma.txt', description: 'archivo inexistente' },
+                    { path: 'safe-link/config', description: 'alias a ruta protegida' },
+                  ],
+                }),
+              },
+            },
+          },
+          doneChunk,
+        ],
+        [
+          { type: 'tool_call', call: { id: 'call_finish_parent', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+          doneChunk,
+        ],
+      ];
+      const gateway = makeScriptedGateway(scripts);
+      // SqliteEventStore proyecta `message.done` a MessageRepository en la misma transacción. El
+      // fake base sólo guarda eventos; para probar buildDelegationResult se replica esa proyección.
+      const messages = makeFakeMessageRepository();
+      const events = makeFakeEventStore();
+      const appendEvent = events.append.bind(events);
+      events.append = (event) => {
+        const persisted = appendEvent(event);
+        if (persisted.type === 'message.done') {
+          const chatMessages = messages.byChat.get(persisted.chatId) ?? [];
+          chatMessages.push(persisted.message);
+          messages.byChat.set(persisted.chatId, chatMessages);
+        }
+        return persisted;
+      };
+      const { deps, runs } = baseDeps({
+        gateway,
+        events,
+        messages,
+        projectRoot,
+        workspaceFs: new WorkspaceFsImpl(projectRoot),
+        // La lectura real de SAURIO.md cede al event loop. El polling de delegación también debe
+        // ceder: el delay instantáneo de baseDeps avanzaría 120k ticks del reloj fake antes de que
+        // el fs asíncrono del hijo pueda resolver y lo cancelaría artificialmente.
+        delay: async () => { await new Promise<void>((resolve) => setImmediate(resolve)); },
+        tools: makeFakeToolRegistry([makeFinishTool(), makeDelegateToolStub()]),
+        agents: makeMultiAgentConfigResolver({
+          agent_1: makeTestAgentConfig({ allowedTools: ['finish', 'delegate'] }),
+          agent_reviewer: makeTestAgentConfig({ id: 'agent_reviewer', name: 'Revisor', allowedTools: ['finish'] }),
+        }),
+      });
+      const controller = new RunController(deps);
+      const { runId } = await controller.start('chat_1', 'delegá tres nombres', 'agent');
+      await waitTerminal(runs, runId);
+
+      const parentRequest = gateway.requests[2];
+      const delegateMessage = parentRequest?.messages.find((message) => message.toolName === 'delegate');
+      expect(delegateMessage).toBeDefined();
+      const result = DelegationResultSchema.parse(JSON.parse(delegateMessage!.content));
+      expect(result.summary).toContain('Se proporcionaron tres ideas.');
+      expect(result.summary).toContain('Luna');
+      expect(result.summary).toContain('Max');
+      expect(result.summary).toContain('Bella');
+      expect(result.artifacts).toEqual([{ path: 'ideas.txt', description: 'nombres reales' }]);
+      expect(result.uncertainties).toContain('artifact excluido porque no se pudo verificar dentro del proyecto: "fantasma.txt"');
+      expect(result.uncertainties).toContain('artifact excluido porque no se pudo verificar dentro del proyecto: "safe-link/config"');
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('si el máximo confirmado es 4k, poda y reserva contra 4k aunque la policy persistida sea 8k', async () => {
+    const agent = makeTestAgentConfig();
+    const gateway = makeScriptedGateway([]);
+    const history: ChatMessage[] = Array.from({ length: 8 }, (_, index) => ({
+      id: `history-4k-${index}`,
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: 'y'.repeat(4_000),
+    }));
+    const { deps, runs } = baseDeps({
+      agents: makeFakeAgentConfigResolver(agent),
+      gateway,
+      context: createContextBuilder(createTokenEstimator(agent.model)),
+      numCtxForModel: async () => 8_192,
+      modelContextProbe: { getContextMax: async () => 4_096 },
+    });
+    (deps.messages as ReturnType<typeof makeFakeMessageRepository>).byChat.set('chat_1', history);
+
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'seguí', 'agent');
+    await waitTerminal(runs, runId);
+
+    const effectivePolicy = contextPolicyForNumCtx(4_096, agent.contextPolicy);
+    const request = gateway.requests[0];
+    expect(request?.options.numCtx).toBe(4_096);
+    expect(request?.options.numPredict).toBe(effectivePolicy.reserveForResponse);
+    expect(request?.messages.filter((message) => message.id.startsWith('history-4k-')).length).toBeLessThan(history.length);
+
+    const event = (deps.events as ReturnType<typeof makeFakeEventStore>).all.find((candidate) => candidate.type === 'context.built');
+    expect(event?.type).toBe('context.built');
+    if (!event || event.type !== 'context.built') throw new Error('faltó context.built');
+    expect(event.budget).toMatchObject({
+      numCtx: 4_096,
+      effectiveNumCtx: 4_096,
+      reserveForResponse: effectivePolicy.reserveForResponse,
+      contextLimitSource: 'reported',
+      fits: true,
+    });
+    expect(event.budget.totalUsed).toBeLessThanOrEqual(4_096 - effectivePolicy.reserveForResponse);
   });
 });
 

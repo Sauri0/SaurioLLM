@@ -33,6 +33,18 @@ describe('agent/defaults — contextPolicyForNumCtx', () => {
     expect(policy.keepLastTurns).toBe(DEFAULT_CONTEXT_POLICY.keepLastTurns);
   });
 
+  it('conserva la proporción de una reserva ajustada por effort al cambiar de numCtx', () => {
+    const fastBase = {
+      ...DEFAULT_CONTEXT_POLICY,
+      reserveForResponse: Math.round(DEFAULT_CONTEXT_POLICY.reserveForResponse * 0.6),
+    };
+    const balancedAt40k = contextPolicyForNumCtx(40_960, DEFAULT_CONTEXT_POLICY);
+    const fastAt40k = contextPolicyForNumCtx(40_960, fastBase);
+
+    expect(fastAt40k.reserveForResponse).toBe(Math.round(balancedAt40k.reserveForResponse * 0.6));
+    expect(fastAt40k.repoMapTokens).toBe(balancedAt40k.repoMapTokens);
+  });
+
   it('nunca deja valores negativos para un numCtx muy chico', () => {
     const policy = contextPolicyForNumCtx(1);
     expect(policy.reserveForResponse).toBeGreaterThanOrEqual(0);

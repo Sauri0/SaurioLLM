@@ -7,7 +7,10 @@ import type { ChatChunk, ChatRequest, ProviderErrorCode } from '../../types.js';
 import type { ModelInfo, ModelDescription, Locality, ResponseMetrics, ToolCall } from '@saurio/shared';
 import { OpenAICompatClient, OpenAICompatHttpError } from './client.js';
 import { isAbortError } from './errors.js';
-import { toOpenAIChatRequest, classifyLocality, mapModelInfo, fromOpenAIToolCallDelta, type PendingToolCall } from './mappers.js';
+import {
+  toOpenAIChatRequest, classifyLocality, mapModelInfo, mapOpenRouterModelInfo,
+  isOfficialOpenRouterBaseUrl, fromOpenAIToolCallDelta, type PendingToolCall,
+} from './mappers.js';
 import type { OpenAIUsage } from './schemas.js';
 
 export interface OpenAICompatProviderOptions {
@@ -25,10 +28,12 @@ export class OpenAICompatProvider implements Provider {
   readonly kind = 'openai-compat' as const;
   readonly locality: Locality;
   private readonly client: OpenAICompatClient;
+  private readonly isOfficialOpenRouter: boolean;
 
   constructor(opts: OpenAICompatProviderOptions) {
     this.id = opts.id;
     this.locality = classifyLocality(opts.baseUrl);
+    this.isOfficialOpenRouter = isOfficialOpenRouterBaseUrl(opts.baseUrl);
     this.client = new OpenAICompatClient({ baseUrl: opts.baseUrl, getApiKey: opts.getApiKey, headers: opts.headers });
   }
 
@@ -41,16 +46,21 @@ export class OpenAICompatProvider implements Provider {
     }
   }
 
-  async listModels(): Promise<ModelInfo[]> {
-    const { data } = await this.client.listModels();
-    return data.map((m) => mapModelInfo(this.id, this.locality, m));
+  async listModels(signal?: AbortSignal): Promise<ModelInfo[]> {
+    const { data } = await this.client.listModels(signal);
+    const metadataCheckedAt = Date.now();
+    return data.map((model) => this.isOfficialOpenRouter
+      ? mapOpenRouterModelInfo(this.id, this.locality, model, metadataCheckedAt)
+      : mapModelInfo(this.id, this.locality, model));
   }
 
   async describeModel(name: string): Promise<ModelDescription> {
     const { data } = await this.client.listModels();
     const model = data.find((m) => m.id === name);
     const base: ModelInfo = model !== undefined
-      ? mapModelInfo(this.id, this.locality, model)
+      ? (this.isOfficialOpenRouter
+        ? mapOpenRouterModelInfo(this.id, this.locality, model, Date.now())
+        : mapModelInfo(this.id, this.locality, model))
       : {
         ref: { providerId: this.id, name, locality: this.locality },
         digest: '',
@@ -123,6 +133,13 @@ export class OpenAICompatProvider implements Provider {
       // el objeto completo (tok/s solo puede salir del reloj de cliente, mezclando TTFT y generación).
       quality: 'estimated',
     };
+    if (this.isOfficialOpenRouter && usage?.cost !== undefined) {
+      // Cero es un costo válido (p. ej. modelo gratuito): por eso se chequea contra undefined.
+      metrics.costUsd = usage.cost;
+      metrics.costSource = 'reported';
+    } else {
+      metrics.costSource = 'unavailable';
+    }
     yield { type: 'done', doneReason: doneReason ?? 'stop', metrics };
   }
 }

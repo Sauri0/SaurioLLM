@@ -16,6 +16,7 @@ import { createAgentRepository } from './agent.js';
 import { createAgentMemoryRepository } from './agentMemory.js';
 import { createCheckpointStoreRepository, createBlobRefStore } from './checkpointStore.js';
 import { createPermissionRuleRepository, createPermissionDecisionRepository } from './permission.js';
+import { createModelCompatRepository, createModelLoadSamplesRepository } from './modelEvidence.js';
 
 export function createRepositories(driver: SqliteDriver) {
   return {
@@ -37,6 +38,8 @@ export function createRepositories(driver: SqliteDriver) {
     // las interfaces que permissions/repository.ts declaraba sin backend.
     permissionRules: createPermissionRuleRepository(driver),
     permissionDecisions: createPermissionDecisionRepository(driver),
+    modelLoadSamples: createModelLoadSamplesRepository(driver),
+    modelCompat: createModelCompatRepository(driver),
   };
 }
 
@@ -54,3 +57,12 @@ export { createAgentRepository, type AgentRepository, type AgentProfileFilter } 
 export { createAgentMemoryRepository, type AgentMemoryRepository, type AgentMemoryUpsertInput } from './agentMemory.js';
 export { createCheckpointStoreRepository, createBlobRefStore } from './checkpointStore.js';
 export { createPermissionRuleRepository, createPermissionDecisionRepository } from './permission.js';
+export {
+  createModelCompatRepository,
+  createModelLoadSamplesRepository,
+  type ModelCompatLookup,
+  type ModelCompatRecord,
+  type ModelCompatRepository,
+  type ModelLoadSampleRecord,
+  type ModelLoadSamplesRepository,
+} from './modelEvidence.js';

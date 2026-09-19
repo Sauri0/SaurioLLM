@@ -37,15 +37,8 @@ export class LocalSettingsStore {
 
   set(key: string, value: unknown, projectId?: string): void {
     this.load();
-    this.data[storeKey(key, projectId)] = value;
-    this.persist();
-  }
-
-  private persist(): void {
-    try {
-      writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
-    } catch (error) {
-      console.error('[settings] no se pudo escribir settings.local.json', error);
-    }
+    const next = { ...this.data, [storeKey(key, projectId)]: value };
+    writeFileSync(this.filePath, JSON.stringify(next, null, 2));
+    this.data = next;
   }
 }

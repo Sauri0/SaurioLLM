@@ -4,7 +4,7 @@
 // el renderer es derivado de acá o de `chat:history` (doc 01 §4.1 "todo derivado, reconstruible").
 import { create } from 'zustand';
 import type {
-  Adjustment, ChatMessage, Checkpoint, ModelRef, PermissionRequest, ResponseMetrics, RunError, Task,
+  Adjustment, ChatMessage, Checkpoint, ModelRef, ModelResolution, PermissionRequest, ResponseMetrics, RunError, Task,
   ToolCallRecord,
 } from '@saurio/shared';
 import type { ContextBudgetReport, RunActivityPhase, RunEvent, RunState } from '@saurio/shared';
@@ -55,6 +55,8 @@ export interface RunStoreState {
    *  modelo… mm:ss" (tarea "carga de modelo/oom_load"). No se borra en `clearChat` a propósito: es
    *  información liviana y un run viejo no vuelve a usarse como referencia de tiempo activo. */
   runStartedAt: Record<string, number>;
+  /** Conservada después de message.done para no volver a simular una carga entre turnos internos. */
+  firstChunkByRun?: Record<string, boolean>;
   /** `chatId` de cada run visto (para poder derivar qué chat corresponde a un runId suelto). */
   runChatIds: Record<string, string>;
   /** Mensajes ya cerrados (`message.done`) por chat, en orden de llegada. */
@@ -90,6 +92,8 @@ export interface RunStoreState {
   /** `childChatId` de cada `childRunId` visto en `run.delegated` — `DelegationCard` lo necesita para
    *  el link "ver conversación completa" sin escanear el stream de eventos del hijo. */
   childChatIdByRun: Record<string, string>;
+  /** Correlación exacta de delegaciones nuevas. Eventos legacy sin toolCallId mantienen el fallback histórico. */
+  childChatIdByToolCall: Record<string, string>;
   /** Última `run.activity` de cada run — línea viva del bloque "Actividad" (rediseño del chat,
    *  feedback real v0.2.1: "una sola línea plegable que va contando qué hace"). */
   activityByRun: Record<string, RunActivity>;
@@ -99,6 +103,8 @@ export interface RunStoreState {
   /** Último `context.built` por CHAT — `effectiveNumCtx` es el numCtx REAL (rediseño del chat,
    *  punto 1: "indicador de contexto REAL, nunca el máximo teórico del modelo"). */
   contextBudgetByChat: Record<string, ContextBudgetReport>;
+  /** Procedencia persistida del modelo efectivo del último run del chat; ausente = legacy/desconocida. */
+  modelResolutionByChat: Record<string, ModelResolution>;
 
   applyEvents: (events: RunEvent[]) => void;
   clearChat: (chatId: string) => void;
@@ -142,7 +148,7 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
         runStates: { ...state.runStates, [event.runId]: event.to },
       };
     }
-    case 'context.built':
+    case 'context.built': {
       // Rediseño del chat, punto 1 ("indicador de contexto REAL — effectiveNumCtx, nunca el máximo
       // teórico del modelo"): antes el compositor mostraba `activeModelInfo.contextMax` (el máximo
       // que DECLARA el modelo, p.ej. 262k), no el numCtx real que de verdad se le manda al provider
@@ -150,7 +156,15 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
       // packages/shared/src/events.ts). Se guarda por CHAT (no por run) para que el compositor lo
       // siga mostrando entre un run y el siguiente, sin volver a mostrar el máximo teórico mientras
       // tanto.
-      return { ...state, runChatIds, contextBudgetByChat: { ...state.contextBudgetByChat, [event.chatId]: event.budget } };
+      const modelResolutionByChat = { ...state.modelResolutionByChat };
+      if (event.modelResolution) modelResolutionByChat[event.chatId] = event.modelResolution;
+      else delete modelResolutionByChat[event.chatId];
+      return {
+        ...state, runChatIds,
+        contextBudgetByChat: { ...state.contextBudgetByChat, [event.chatId]: event.budget },
+        modelResolutionByChat,
+      };
+    }
     case 'context.usage':
     case 'context.compacted':
       // El MVP muestra el resultado agregado bajo el mensaje (métricas), no cada evento de
@@ -168,6 +182,7 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
       return {
         ...state,
         runChatIds,
+        firstChunkByRun: { ...state.firstChunkByRun, [event.runId]: true },
         streaming: { ...state.streaming, [event.messageId]: next },
       };
     }
@@ -181,6 +196,8 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
       return {
         ...state,
         runChatIds,
+        firstChunkByRun: event.message.role === 'assistant'
+          ? { ...state.firstChunkByRun, [event.runId]: true } : state.firstChunkByRun,
         streaming: restStreaming,
         messagesByChat: { ...state.messagesByChat, [event.chatId]: nextMessages },
         metricsByMessage: { ...state.metricsByMessage, [event.message.id]: event.metrics },
@@ -283,6 +300,9 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
           [event.parentRunId]: children.includes(event.childRunId) ? children : [...children, event.childRunId],
         },
         childChatIdByRun: { ...state.childChatIdByRun, [event.childRunId]: event.childChatId },
+        childChatIdByToolCall: event.toolCallId
+          ? { ...state.childChatIdByToolCall, [event.toolCallId]: event.childChatId }
+          : state.childChatIdByToolCall,
       };
     }
     default: {
@@ -310,9 +330,11 @@ const initialState: Omit<RunStoreState, 'applyEvents' | 'clearChat' | 'dismissIn
   lastSeqByRun: {},
   childRunsByParent: {},
   childChatIdByRun: {},
+  childChatIdByToolCall: {},
   activityByRun: {},
   smallModelWarningByRun: {},
   contextBudgetByChat: {},
+  modelResolutionByChat: {},
 };
 
 export const useRunStore = create<RunStoreState>((set) => ({
@@ -332,7 +354,11 @@ export const useRunStore = create<RunStoreState>((set) => ({
       const { [chatId]: _m, ...restMessages } = state.messagesByChat;
       const { [chatId]: _c, ...restCheckpoints } = state.checkpointsByChat;
       const { [chatId]: _t, ...restTasks } = state.tasksByChat;
-      return { ...state, messagesByChat: restMessages, checkpointsByChat: restCheckpoints, tasksByChat: restTasks };
+      const { [chatId]: _r, ...restModelResolution } = state.modelResolutionByChat;
+      return {
+        ...state, messagesByChat: restMessages, checkpointsByChat: restCheckpoints, tasksByChat: restTasks,
+        modelResolutionByChat: restModelResolution,
+      };
     });
   },
   dismissInterrupted: (runId) => {

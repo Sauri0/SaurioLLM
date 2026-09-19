@@ -5,7 +5,7 @@
 // cruzan IPC/RunEvent — doc 02 §3.
 import type {
   RunState, ModelRef, AgentRole, Mode, ToolTransport, Adjustment, RunError, ToolCallRecord, ModelMode,
-  Attachment,
+  Attachment, ModelResolution,
 } from '@saurio/shared';
 import type { ChatRequest } from '../gateway/types.js';
 import type { PermissionPolicy } from '../permissions/types.js';
@@ -37,6 +37,12 @@ export interface AgentConfig {
 
 /** Congelada al iniciar el run (regla 4: prefijo estable); nunca cambia dentro del mismo run. */
 export interface EffectiveConfig {
+  contextLimitSource?: 'reported' | 'provisional';
+  /** Ausente en runs legacy creados antes de persistir la procedencia de selección. */
+  modelResolution?: ModelResolution;
+  /** Mensaje user histórico que originó una regeneración. Vive en effective_config_json, por lo
+   * que correlaciona regeneraciones sucesivas sin una migración ni duplicar el mensaje en el chat. */
+  regenerationSourceMessageId?: string;
   model: ModelRef; numCtx: number; think: ChatRequest['think']; tools: string[];
   transport: ToolTransport; promptHash: string; profileId?: string; adjustments: Adjustment[];
 }
@@ -79,6 +85,9 @@ export interface RunController {
    *  punto se ignora. */
   start(chatId: string, text: string, mode: Mode, attachments?: Attachment[]): Promise<{ runId: string }>;
   cancel(runId: string): Promise<void>;
+  cancelChild(parentRunId: string, childRunId: string): Promise<void>;
   continueRun(runId: string, extraIterations?: number): Promise<{ runId: string }>;   // crea un run nuevo
+  /** Repite el pedido de un run terminal sin borrar ni truncar su respuesta histórica. */
+  regenerate(runId: string): Promise<{ runId: string }>;
   recover(): Promise<{ orphaned: ToolCallRecord[]; abandoned: ToolCallRecord[] }>;      // al arrancar la app
 }

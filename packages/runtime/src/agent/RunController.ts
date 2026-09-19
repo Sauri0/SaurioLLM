@@ -14,9 +14,12 @@
 import type {
   Mode, RunState, ChatMessage, ToolCall, ToolResult, PermissionAnswer, PermissionRequest,
   RunError as RunErrorShared, ResponseMetrics, ToolTransport, DelegationRequest, DelegationResult,
-  ChatPermissionPreset, Effort, RunActivityPhase, Attachment,
+  ChatPermissionPreset, Effort, RunActivityPhase, Attachment, ModelRef, AgentMemory, RunEvent,
+  ModelResolution,
 } from '@saurio/shared';
 import { DelegationRequestSchema, DelegationResultSchema } from '@saurio/shared';
+import { realpath, stat } from 'node:fs/promises';
+import { isAbsolute, relative, sep } from 'node:path';
 import type { ModelGateway, ChatRequest, JsonSchemaTool } from '../gateway/types.js';
 import type {
   ToolRegistry, ToolProtocol, ToolDefinition, ToolContext, CheckpointHandle, ToolClassification,
@@ -25,8 +28,10 @@ import type {
 import type { PermissionEngine } from '../permissions/types.js';
 import { toAgentLevelPreset } from '../permissions/engine.js';
 import type { PermissionMemory } from '../permissions/memory.js';
+import { planStepsFromText } from '../tasks/planText.js';
 import type { CheckpointService } from '../checkpoint/types.js';
-import type { ContextBuilder, RepoMapClient, CompactionResult } from '../context/types.js';
+import type { ContextBuilder, RepoMapClient, CompactionResult, ContextInspectionInput } from '../context/types.js';
+import { ToolExecutionError } from '../tools/errors.js';
 import type {
   EventStore, ChatRepository, MessageRepository, ToolCallRepository, CheckpointRepository,
 } from '../persistence/types.js';
@@ -37,6 +42,7 @@ import type {
 import type {
   RunRepository, RunRecord, AgentConfigResolver, Clock, IdGenerator, OrphanDiagnostics, ModelContextProbe,
   LastReadHashes, ModelLayerCountProbe, AgentProfilePort, ModelParameterSizeProbe, ModelVisionProbe,
+  ChatCollaboratorPort, AgentMemoryPort,
 } from './ports.js';
 import { RunStateMachine } from './RunStateMachine.js';
 import { LoopDetector } from './LoopDetector.js';
@@ -45,6 +51,8 @@ import { MessageDeltaBatcher } from './deltaBatcher.js';
 import { hashArgs } from './hash.js';
 import { recover as recoverRuns, synthesizeInterruptedResultMessage, type RecoverResult } from './recover.js';
 import { buildEnvironmentPrompt } from './environmentPrompt.js';
+import { contextPolicyForNumCtx, hashSystemPrompt } from './defaults.js';
+import { textMutationCorrectionFor } from './textMutationCorrection.js';
 
 /** Punto 1c/9 del encargo: tope de caracteres por adjunto de texto (no confundir con el límite de
  *  tamaño de ARCHIVO, que aplica el host antes de siquiera llamar a `start()` — ver
@@ -90,6 +98,9 @@ const BUSY_RETRY_CODE = 'server_busy';
  *  2s = ~6s de "Generando…" como máximo con el provider caído, un tiempo corto y predecible en vez
  *  de indefinido. */
 const MAX_CONNECTION_RETRIES = 3;
+/** Un 429/server_busy persistente no puede dejar el run reintentando cada 3s para siempre. Se
+ * permiten tres reintentos consecutivos, igual que para un provider que rechaza la conexión. */
+const MAX_SERVER_BUSY_RETRIES = 3;
 const MAX_FORMAT_RETRIES = 2;
 /** Doc 19 §2.5/§5 (E3a delegación): profundidad máxima 1 (un run hijo no puede delegar de nuevo) y
  *  máximo 3 delegaciones por run — límites duros contra un modelo de 8B que delega de más, sin
@@ -107,6 +118,51 @@ const MUTATING_FILE_TOOLS = new Set(['edit_file', 'write_file', 'delete_file']);
 /** Estados desde los que RUN_TRANSITIONS permite -> cancelling (doc 10 §2; `compacting` se agregó
  *  en esta tarea, ver nota de cabecera del archivo). */
 const CANCELLABLE_STATES = new Set<RunState>(['queued', 'generating', 'parsing', 'awaiting_permission', 'executing_tool', 'compacting']);
+const TERMINAL_STATES = new Set<RunState>(['completed', 'cancelled', 'failed', 'interrupted']);
+
+/** Serializa memorias ya filtradas por el host como datos con procedencia, no como instrucciones.
+ * El contenedor que agrega ContextBuilder es deliberadamente separado de `projectMemory`/SAURIO.md. */
+export function formatAgentMemoryForContext(memories: AgentMemory[]): string | undefined {
+  if (memories.length === 0) return undefined;
+  const sourceLabels: Record<AgentMemory['sourceKind'], string> = {
+    user_stated: 'dicho por la persona usuaria',
+    inferred: 'inferida',
+    file_derived: 'derivada de un archivo',
+  };
+  const confidenceLabels: Record<AgentMemory['confidence'], string> = {
+    confirmed: 'confirmada',
+    hypothesis: 'hipótesis',
+  };
+  return memories.map((memory) => {
+    const origin = memory.originRef ? `; origen: ${memory.originRef}` : '';
+    const scope = memory.projectId ? 'proyecto actual' : 'global';
+    return [
+      `--- inicio memoria (${confidenceLabels[memory.confidence]}; ${sourceLabels[memory.sourceKind]}; alcance: ${scope}${origin}) ---`,
+      memory.content,
+      '--- fin memoria ---',
+    ].join('\n');
+  }).join('\n\n');
+}
+
+function inspectAttachments(attachments: Attachment[]): ContextInspectionInput['attachments'] {
+  return attachments.map((attachment) => {
+    if (!attachment.dataBase64) {
+      return {
+        name: attachment.name, kind: attachment.kind, status: 'excluded' as const,
+        reason: 'missing_data' as const, truncated: false,
+      };
+    }
+    if (attachment.kind === 'file') {
+      const chars = Buffer.from(attachment.dataBase64, 'base64').toString('utf8').length;
+      const truncated = chars > MAX_ATTACHMENT_TEXT_CHARS;
+      return {
+        name: attachment.name, kind: attachment.kind, status: 'included' as const,
+        ...(truncated ? { reason: 'truncated_for_limit' as const } : {}), truncated,
+      };
+    }
+    return { name: attachment.name, kind: attachment.kind, status: 'included' as const, truncated: false };
+  });
+}
 
 export interface RunControllerDeps {
   gateway: ModelGateway;
@@ -124,6 +180,9 @@ export interface RunControllerDeps {
   toolCalls: ToolCallRepository;
   checkpointRepo?: CheckpointRepository;
   agents: AgentConfigResolver;
+  /** Memorias ya autorizadas por el host para este agente y proyecto. El controlador no decide
+   * alcance: sólo las agrega como datos etiquetados si el perfil permite leer memoria. */
+  agentMemories?: AgentMemoryPort;
   orphanDiagnostics?: OrphanDiagnostics;
   /** WorkspaceFs no es responsabilidad de este módulo (vive en packages/runtime/src/tools/); si no se
    *  provee, cualquier tool cuyo handler use `ctx.fs` fallará explícitamente (ver deviations). */
@@ -167,6 +226,14 @@ export interface RunControllerDeps {
    *  `delegate` no trae `targetAgentId` (ver `AgentProfilePort`, ports.ts). Opcional: sin esto,
    *  delegar sin destino explícito falla con un `ToolResult` de error en vez de romper el run. */
   agentProfiles?: AgentProfilePort;
+  /** Selección persistida de colaboradores del chat. Al estar presente, una delegación sólo puede
+   * apuntar a uno de esos agentes; sin el puerto se conserva el flujo legado de workers efímeros. */
+  chatCollaborators?: ChatCollaboratorPort;
+  /** Resolución de `modelMode: auto` provista por el host. Recibe por separado la selección explícita
+   * del chat para que siempre tenga precedencia. El adaptador debe ofrecer únicamente modelos locales. */
+  resolveModelRef?: (
+    agent: AgentConfig, chatModelRef?: ModelRef,
+  ) => Promise<ModelRef | { ref: ModelRef; resolution: ModelResolution }>;
   /** Punto 10 del encargo (feedback real v0.2.1): permite emitir `run.smallModelWarning` una sola
    *  vez por run cuando el modelo tiene < ~7B parámetros y `mode === 'agent'`. Opcional: sin esto,
    *  el aviso nunca se emite (comportamiento previo — no existía). */
@@ -199,10 +266,22 @@ interface LiveRun {
   abort: AbortController;
   loopDetector: LoopDetector;
   history: ChatMessage[];
+  contextAttachmentsKnown: boolean;
+  contextAttachments: ContextInspectionInput['attachments'];
+  contextAttachmentMessageId?: string;
   /** Resuelve cuando llega `answerPermission` para el toolCallId pendiente. */
   pendingPermission?: { toolCallId: string; resolve: (answer: PermissionAnswer) => void };
   cancelRequested: boolean;
   formatRetries: number;
+  /** Una única corrección interna para el caso estrecho de un modelo text que pide el contenido de
+   * una ruta que read_file puede leer. No es un reintento general ni altera permisos. */
+  textMutationCorrections: number;
+  /** Una única corrección interna cuando el modo Plan termina en prosa sin un checklist explícito.
+   * Nunca convierte esa prosa en tareas: le pide al modelo una lista concreta una sola vez. */
+  planCorrections: number;
+  /** Respuestas completas producidas por el modelo en este run. El guard de TextToolProtocol sólo
+   * puede actuar sobre la primera; un parse retry o cualquier turno posterior queda excluido. */
+  generatedResponses: number;
   /** Paths ya escritos/borrados por este run (hallazgo #1/#4): se pasa a `PermissionEngine.evaluate`
    *  como `touchedPaths` para que `isBlockedByDefault` pueda excusar un `git reset --hard`/`checkout`
    *  sobre algo que el run mismo tocó (doc 06 §5). Se completa en `runHandler` tras cada tool mutante
@@ -219,6 +298,10 @@ interface LiveRun {
    *  reintentar/fallar). Se resetea a 0 apenas se recibe cualquier chunk real del provider (la
    *  conexión funcionó), para no penalizar un corte transitorio aislado en medio de una sesión larga. */
   connectionErrorStreak: number;
+  /** Reintentos consecutivos de `server_busy`. Es independiente de `connectionErrorStreak` para
+   * que un 429 transitorio no convierta un problema de conexión posterior (o viceversa) en un fallo
+   * prematuro. Ambos contadores se limpian cuando llega un chunk real del provider. */
+  serverBusyErrorStreak: number;
   /** Tarea "carga de modelo/oom_load": último `numGpu` aplicado tras un reintento de `oom_load`
    *  (`undefined` = automático de Ollama, comportamiento previo). Persiste para TODOS los turnos de
    *  ESTE run (`buildChatRequest` lo repite en cada `ChatRequest.options.numGpu`) — una vez que el
@@ -237,12 +320,18 @@ interface LiveRun {
    *  1 = run hijo de una delegación). Se fija una sola vez al construir el `LiveRun` en `start()`/
    *  `continueRun()`, a partir de si `chats.origin_run_id` está seteado para este chat. */
   delegationDepth: number;
+  enabledCollaboratorIds?: Set<string>;
+  childRunIds: Set<string>;
 }
 
 type TurnOutcome = 'continue' | 'completed' | 'failed' | 'cancelled';
 
 export class RunController implements RunControllerContract {
   private readonly live = new Map<string, LiveRun>();
+  private readonly delegatedIterationBudgets = new Map<string, number>();
+  /** Reserva síncrona alrededor de las altas derivadas para que dos clicks de regenerar no pasen
+   * juntos el chequeo asíncrono de runs activos antes de que exista la primera fila. */
+  private readonly startingChats = new Set<string>();
   private readonly stateMachine = new RunStateMachine();
 
   constructor(private readonly deps: RunControllerDeps) {}
@@ -252,17 +341,36 @@ export class RunController implements RunControllerContract {
   async start(chatId: string, text: string, mode: Mode, attachments?: Attachment[]): Promise<{ runId: string }> {
     const chat = await this.deps.chats.get(chatId);
     if (!chat) throw new Error(`Chat inexistente: ${chatId}`);
+    this.assertChatBelongsToProject(chat, 'iniciar el run');
 
     const activeRuns = await this.deps.runs.listActive();
     if (activeRuns.some((r) => r.chatId === chatId)) {
       throw new Error(`El chat ${chatId} ya tiene un run activo (un chat = un run a la vez, doc 05 §2.1)`);
     }
 
-    const resolvedAgent = await this.deps.agents.resolve(chat.agentId);
+    const baseResolvedAgent = await this.resolveProjectAgent(chat.agentId);
+    const delegatedMaxIterations = this.delegatedIterationBudgets.get(chatId);
+    const resolvedAgent = delegatedMaxIterations === undefined
+      ? baseResolvedAgent
+      : { ...baseResolvedAgent, maxIterations: Math.min(baseResolvedAgent.maxIterations, delegatedMaxIterations) };
     // El modelo efectivo del run sale del chat cuando el chat tiene uno elegido (doc 03 §4.1
     // `chats.model_ref_json`); si no, del agente. Antes de la integración el chat.modelRef se perdía.
-    const withModel: AgentConfig = chat.modelRef ? { ...resolvedAgent, model: chat.modelRef } : resolvedAgent;
-    const agent = this.applyChatPermissionPreset(this.applyChatEffort(await this.withPersistedRules(withModel), chat), chat);
+    // Sólo un chat marcado explícitamente como automático omite el override. Filas legacy sin el
+    // marcador siguen siendo explícitas, incluso cuando su agente hoy tiene `modelMode: auto`.
+    const chatModelOverride = chat.modelSelection === 'auto' ? undefined : chat.modelRef;
+    const resolvedSelection = this.deps.resolveModelRef
+      ? await this.deps.resolveModelRef(resolvedAgent, chatModelOverride)
+      : (chatModelOverride ?? resolvedAgent.model);
+    const selectedModel = isResolvedModelSelection(resolvedSelection) ? resolvedSelection.ref : resolvedSelection;
+    const modelResolution = isResolvedModelSelection(resolvedSelection)
+      ? resolvedSelection.resolution
+      : inferLegacyModelResolution(resolvedAgent, chatModelOverride);
+    const withModel: AgentConfig = { ...resolvedAgent, model: selectedModel };
+    const collaborators = this.deps.chatCollaborators
+      ? await this.deps.chatCollaborators.listEnabled(chatId)
+      : undefined;
+    const promptedAgent = collaborators && resolvedAgent.role === 'lead' ? withCollaboratorPrompt(withModel, collaborators) : withModel;
+    const agent = this.applyChatPermissionPreset(this.applyChatEffort(await this.withPersistedRules(promptedAgent), chat), chat);
 
     // Punto 1c/9 del encargo: se valida ANTES de crear la fila del run (nunca queda un run
     // 'created' colgado por un adjunto rechazado). 'ask'/errores de capability nunca son silenciosos
@@ -313,7 +421,7 @@ export class RunController implements RunControllerContract {
     // de mandar la imagen y que se pierda en silencio.
     const attachmentBlock = buildAttachmentContextBlock(attachments ?? []);
     const userMessage: ChatMessage = {
-      id: this.deps.ids.next(), role: 'user', content: `${text}${attachmentBlock}`,
+      id: this.deps.ids.next(), originRunId: runId, role: 'user', content: `${text}${attachmentBlock}`,
       ...(imageAttachments.length > 0 ? { images: imageAttachments.map((a) => a.dataBase64).filter((d): d is string => Boolean(d)) } : {}),
     };
     this.deps.events.append({
@@ -322,11 +430,15 @@ export class RunController implements RunControllerContract {
     });
 
     const live: LiveRun = {
-      runId, chatId, agent, mode, effectiveConfig: buildPlaceholderConfig(agent),
+      runId, chatId, agent, mode, effectiveConfig: buildPlaceholderConfig(agent, modelResolution),
       iteration: 0, state: 'created', abort: new AbortController(),
       loopDetector: new LoopDetector(), history: await this.deps.messages.listByChat(chatId),
-      cancelRequested: false, formatRetries: 0, touchedPaths: new Set(), turnsSinceCompaction: 0,
-      connectionErrorStreak: 0, oomGpuRetryStep: 0, delegationDepth,
+      contextAttachmentsKnown: true, contextAttachments: inspectAttachments(attachments ?? []),
+      contextAttachmentMessageId: userMessage.id,
+      cancelRequested: false, formatRetries: 0, textMutationCorrections: 0, planCorrections: 0, generatedResponses: 0, touchedPaths: new Set(), turnsSinceCompaction: 0,
+      connectionErrorStreak: 0, serverBusyErrorStreak: 0, oomGpuRetryStep: 0, delegationDepth,
+      enabledCollaboratorIds: collaborators ? new Set(collaborators.map((item) => item.id)) : undefined,
+      childRunIds: new Set(),
     };
     this.live.set(runId, live);
     await this.prepareAndQueue(live);
@@ -346,6 +458,7 @@ export class RunController implements RunControllerContract {
       await this.persistRunState(live);
     }
     live.abort.abort();
+    await Promise.all([...live.childRunIds].map((childRunId) => this.cancel(childRunId)));
     if (live.pendingPermission) {
       // doc 10 caso (7): toda fila pending/approved/awaiting_permission pasa a cancelled de inmediato.
       const { toolCallId, resolve } = live.pendingPermission;
@@ -359,10 +472,76 @@ export class RunController implements RunControllerContract {
     }
   }
 
+  /** Cancela una delegación puntual iniciada por la persona. La relación persistida es la autoridad:
+   *  un id de otro run del mismo proyecto tampoco alcanza. `cancel()` ya propaga hacia abajo, por lo
+   *  que este camino corta al hijo y sus descendientes sin tocar al padre ni a sus otros hijos. */
+  async cancelChild(parentRunId: string, childRunId: string): Promise<void> {
+    await this.assertRunBelongsToProject(parentRunId, 'detener una delegación hija');
+    await this.assertRunBelongsToProject(childRunId, 'detener una delegación hija');
+    const child = await this.deps.runs.get(childRunId);
+    if (!child || child.parentRunId !== parentRunId) {
+      throw new Error(`No se puede detener el run ${childRunId}: no es hijo del run ${parentRunId}.`);
+    }
+    await this.cancel(childRunId);
+  }
+
   async continueRun(runId: string, extraIterations?: number): Promise<{ runId: string }> {
     const prev = await this.deps.runs.get(runId);
     if (!prev) throw new Error(`Run inexistente: ${runId}`);
-    const baseAgent = await this.deps.agents.resolve(prev.agentId);
+    if (!TERMINAL_STATES.has(prev.state)) {
+      throw new Error(`No se puede continuar el run ${runId}: todavía está activo; sólo se continúan ejecuciones terminales.`);
+    }
+    return this.withInactiveChat(prev, 'continuar', async () => this.createDerivedRun(
+      prev, await this.deps.messages.listByChat(prev.chatId), extraIterations,
+      prev.effectiveConfig?.regenerationSourceMessageId,
+    ));
+  }
+
+  async regenerate(runId: string): Promise<{ runId: string }> {
+    const prev = await this.deps.runs.get(runId);
+    if (!prev) throw new Error(`Run inexistente: ${runId}`);
+    if (!TERMINAL_STATES.has(prev.state)) {
+      throw new Error(`No se puede regenerar el run ${runId}: todavía está activo; sólo se regeneran ejecuciones terminales.`);
+    }
+    if (!prev.effectiveConfig) {
+      throw new Error(`No se puede regenerar el run ${runId}: no quedó persistido el modelo efectivo que produjo la respuesta original.`);
+    }
+    return this.withInactiveChat(prev, 'regenerar', async () => {
+      const { history, sourceMessageId } = await this.regenerationHistory(prev);
+      return await this.createDerivedRun(prev, history, undefined, sourceMessageId);
+    });
+  }
+
+  private async withInactiveChat<T>(
+    prev: RunRecord, action: 'continuar' | 'regenerar', task: () => Promise<T>,
+  ): Promise<T> {
+    const chat = await this.deps.chats.get(prev.chatId);
+    if (!chat) throw new Error(`Chat inexistente para el run ${prev.id}: ${prev.chatId}`);
+    this.assertChatBelongsToProject(chat, `${action} el run ${prev.id}`);
+    if (this.startingChats.has(prev.chatId)) {
+      throw new Error(`No se puede ${action} el run ${prev.id}: el chat ${prev.chatId} ya está iniciando otra ejecución.`);
+    }
+    this.startingChats.add(prev.chatId);
+    try {
+      const activeRuns = await this.deps.runs.listActive();
+      if (activeRuns.some((active) => active.chatId === prev.chatId)) {
+        throw new Error(`No se puede ${action} el run ${prev.id}: el chat ${prev.chatId} ya tiene un run activo.`);
+      }
+      return await task();
+    } finally {
+      this.startingChats.delete(prev.chatId);
+    }
+  }
+
+  /** Camino común de continue/regenerate: resuelve agente/configuración, crea el nuevo run y usa
+   * el loop normal. La única diferencia entre ambas operaciones es el historial que reciben. */
+  private async createDerivedRun(
+    prev: RunRecord, history: ChatMessage[], extraIterations?: number, regenerationSourceMessageId?: string,
+  ): Promise<{ runId: string }> {
+    const chatForPreset = await this.deps.chats.get(prev.chatId);
+    if (!chatForPreset) throw new Error(`Chat inexistente para el run ${prev.id}: ${prev.chatId}`);
+    this.assertChatBelongsToProject(chatForPreset, `continuar el run ${prev.id}`);
+    const baseAgent = await this.resolveProjectAgent(prev.agentId);
     const withModel: AgentConfig = {
       ...baseAgent,
       // El run nuevo hereda el modelo efectivo del run anterior (doc 05 §2.10 "run:continue crea un
@@ -370,9 +549,12 @@ export class RunController implements RunControllerContract {
       ...(prev.effectiveConfig ? { model: prev.effectiveConfig.model } : {}),
       maxIterations: baseAgent.maxIterations + (extraIterations ?? 0),
     };
-    const chatForPreset = await this.deps.chats.get(prev.chatId);
+    const collaborators = this.deps.chatCollaborators
+      ? await this.deps.chatCollaborators.listEnabled(prev.chatId)
+      : undefined;
+    const promptedAgent = collaborators && baseAgent.role === 'lead' ? withCollaboratorPrompt(withModel, collaborators) : withModel;
     const agent = this.applyChatPermissionPreset(
-      this.applyChatEffort(await this.withPersistedRules(withModel), chatForPreset ?? {}), chatForPreset ?? {},
+      this.applyChatEffort(await this.withPersistedRules(promptedAgent), chatForPreset), chatForPreset,
     );
 
     const newRunId = this.deps.ids.next();
@@ -387,17 +569,96 @@ export class RunController implements RunControllerContract {
 
     const live: LiveRun = {
       runId: newRunId, chatId: prev.chatId, agent, mode: prev.mode,
-      effectiveConfig: buildPlaceholderConfig(agent), iteration: 0, state: 'created',
+      effectiveConfig: {
+        ...buildPlaceholderConfig(agent, prev.effectiveConfig?.modelResolution
+          ? { ...prev.effectiveConfig.modelResolution, inheritedFromRunId: prev.id }
+          : undefined),
+        ...(regenerationSourceMessageId ? { regenerationSourceMessageId } : {}),
+      },
+      iteration: 0, state: 'created',
       abort: new AbortController(), loopDetector: new LoopDetector(),
-      history: await this.deps.messages.listByChat(prev.chatId),
-      cancelRequested: false, formatRetries: 0, touchedPaths: new Set(), turnsSinceCompaction: 0,
-      connectionErrorStreak: 0, oomGpuRetryStep: 0, delegationDepth: prev.delegationDepth ?? 0,
+      history,
+      contextAttachmentsKnown: false, contextAttachments: [],
+      cancelRequested: false, formatRetries: 0, textMutationCorrections: 0, planCorrections: 0, generatedResponses: 0, touchedPaths: new Set(), turnsSinceCompaction: 0,
+      connectionErrorStreak: 0, serverBusyErrorStreak: 0, oomGpuRetryStep: 0, delegationDepth: prev.delegationDepth ?? 0,
+      enabledCollaboratorIds: collaborators ? new Set(collaborators.map((item) => item.id)) : undefined,
+      childRunIds: new Set(),
     };
     this.live.set(newRunId, live);
     await this.prepareAndQueue(live);
 
     void this.runLoop(live).catch((err) => this.failUnexpected(live, err));
     return { runId: newRunId };
+  }
+
+  /** Recupera el pedido exacto desde el evento del run origen porque `messages` no conserva las
+   * imágenes. El corte por id mantiene el historial visible en SQLite pero excluye del prompt la
+   * respuesta y cualquier tool posterior al pedido que se está repitiendo. */
+  private async regenerationHistory(prev: RunRecord): Promise<{ history: ChatMessage[]; sourceMessageId: string }> {
+    const persisted = await this.deps.messages.listByChat(prev.chatId);
+    let sourceMessageId = prev.effectiveConfig?.regenerationSourceMessageId;
+
+    if (!sourceMessageId) {
+      // La primera respuesta cerrada fija el límite temporal del run. Buscar simplemente el último
+      // user del chat adivinaría mal al regenerar una respuesta vieja después de turnos nuevos.
+      // Un run que cortó el stream puede tener sólo `message.delta` más un fragmento directo en
+      // messages; ese messageId también alcanza para fijar el corte. Sin done ni delta no hay
+      // respuesta observable y no se intenta adivinar qué user le correspondía.
+      const firstResponseEvent = this.deps.events.since(prev.id, 0).find((event) => (
+        event.type === 'message.delta'
+        || (event.type === 'message.done' && event.message.role === 'assistant')
+      ));
+      const firstResponseMessageId = firstResponseEvent?.type === 'message.delta'
+        ? firstResponseEvent.messageId
+        : firstResponseEvent?.type === 'message.done'
+          ? firstResponseEvent.message.id
+          : undefined;
+      if (!firstResponseMessageId) {
+        throw new Error(
+          `No se puede regenerar el run ${prev.id}: terminó antes de persistir una respuesta que permita asociar su pedido original.`,
+        );
+      }
+      const responseIndex = persisted.findIndex((message) => message.id === firstResponseMessageId);
+      if (responseIndex < 0) {
+        throw new Error(`No se puede regenerar el run ${prev.id}: su primera respuesta ya no está en el historial persistido.`);
+      }
+      sourceMessageId = persisted.slice(0, responseIndex).findLast((message) => message.role === 'user')?.id;
+      if (!sourceMessageId) {
+        throw new Error(`No se puede regenerar el run ${prev.id}: no hay un pedido de usuario verificable antes de su respuesta.`);
+      }
+    }
+
+    const sourceIndex = persisted.findIndex((message) => message.id === sourceMessageId);
+    if (sourceIndex < 0) {
+      throw new Error(`No se puede regenerar el run ${prev.id}: el mensaje original ya no está en el historial persistido.`);
+    }
+    const persistedSource = persisted[sourceIndex]!;
+    if (persistedSource.role !== 'user') {
+      throw new Error(`No se puede regenerar el run ${prev.id}: la correlación persistida no apunta a un pedido de usuario.`);
+    }
+    const sourceRunId = persistedSource.originRunId;
+    const sourceEvent = sourceRunId
+      ? this.deps.events.since(sourceRunId, 0).find((event): event is Extract<RunEvent, { type: 'message.done' }> => (
+          event.type === 'message.done' && event.message.role === 'user' && event.message.id === sourceMessageId
+        ))
+      : undefined;
+    if (!sourceEvent) {
+      throw new Error(
+        `No se puede regenerar el run ${prev.id}: el pedido original es legacy o incompleto y sus adjuntos no se pueden restaurar de forma segura.`,
+      );
+    }
+    if (sourceEvent.message.images?.some((image) => Buffer.byteLength(image, 'base64') === 0)) {
+      throw new Error(
+        `No se puede regenerar el run ${prev.id}: al menos una imagen adjunta del pedido original no tiene datos restaurables.`,
+      );
+    }
+    return {
+      sourceMessageId,
+      history: [
+        ...persisted.slice(0, sourceIndex),
+        { ...sourceEvent.message, originRunId: sourceEvent.message.originRunId ?? sourceRunId },
+      ],
+    };
   }
 
   async recover(): Promise<RecoverResult> {
@@ -427,6 +688,8 @@ export class RunController implements RunControllerContract {
     if (toolCallId.length === 0) {
       throw new Error('answerPermission: toolCallId vacío (la tool call que originó el pedido de permiso no se identificó correctamente)');
     }
+    const record = await this.deps.toolCalls.get(toolCallId);
+    if (record) await this.assertRunBelongsToProject(record.runId, 'responder el permiso');
     if (this.tryResolvePending(toolCallId, answer)) return;
 
     // Doc 16 §4 ítem 2 ("reanudar tras reinicio", doc 10 §5.2): no vive en `this.live` de este
@@ -434,7 +697,6 @@ export class RunController implements RunControllerContract {
     // rehidrata desde `run_events`/`tool_calls` (sin re-ejecutar nada que ya corrió) y se reintenta
     // una vez. Esto mantiene sin cambios el contrato IPC `permission:answer` (apps/desktop no
     // necesita saber que el run se rehidrató).
-    const record = await this.deps.toolCalls.get(toolCallId);
     if (record && record.status === 'awaiting_permission') {
       const resumed = await this.resumeAfterRestart(record.runId);
       if (resumed && this.tryResolvePending(toolCallId, answer)) return;
@@ -467,6 +729,8 @@ export class RunController implements RunControllerContract {
     const awaiting = activeRuns.filter((r) => r.state === 'awaiting_permission' && !this.live.has(r.id));
     const results: { runId: string; chatId: string; request: PermissionRequest }[] = [];
     for (const run of awaiting) {
+      const chat = await this.deps.chats.get(run.chatId);
+      if (!chat || !this.chatBelongsToProject(chat)) continue;
       const calls = await this.deps.toolCalls.listByRun(run.id);
       const pendingRecord = calls.find((c) => c.status === 'awaiting_permission');
       if (!pendingRecord) continue;
@@ -487,38 +751,54 @@ export class RunController implements RunControllerContract {
    *  No hace nada si el run ya está vivo, si no está en `awaiting_permission`, o si no hay ninguna
    *  tool call realmente pendiente (estado inconsistente — se deja para diagnóstico manual). */
   async resumeAfterRestart(runId: string): Promise<boolean> {
-    if (this.live.has(runId)) return true;
     const run = await this.deps.runs.get(runId);
-    if (!run || run.state !== 'awaiting_permission') return false;
+    if (!run) return false;
+    const chatForPreset = await this.deps.chats.get(run.chatId);
+    if (!chatForPreset) throw new Error(`Chat inexistente para el run ${runId}: ${run.chatId}`);
+    this.assertChatBelongsToProject(chatForPreset, `reanudar el run ${runId}`);
+    if (this.live.has(runId)) return true;
+    if (run.state !== 'awaiting_permission') return false;
 
     const calls = await this.deps.toolCalls.listByRun(runId);
     const pendingRecord = calls.find((c) => c.status === 'awaiting_permission');
     if (!pendingRecord) return false;
 
-    const baseAgent = await this.deps.agents.resolve(run.agentId);
-    const chatForPreset = await this.deps.chats.get(run.chatId);
+    const baseAgent = await this.resolveProjectAgent(run.agentId);
+    const collaborators = this.deps.chatCollaborators
+      ? await this.deps.chatCollaborators.listEnabled(run.chatId)
+      : undefined;
+    const resumedBase = run.effectiveConfig ? { ...baseAgent, model: run.effectiveConfig.model } : baseAgent;
     const agent = this.applyChatPermissionPreset(
       this.applyChatEffort(
         await this.withPersistedRules(
-          run.effectiveConfig ? { ...baseAgent, model: run.effectiveConfig.model } : baseAgent,
+          collaborators && baseAgent.role === 'lead' ? withCollaboratorPrompt(resumedBase, collaborators) : resumedBase,
         ),
-        chatForPreset ?? {},
+        chatForPreset,
       ),
-      chatForPreset ?? {},
+      chatForPreset,
     );
     const effectiveConfig = run.effectiveConfig ?? buildPlaceholderConfig(agent);
     const history = await this.deps.messages.listByChat(run.chatId);
+    const persistedOomAdjustments = effectiveConfig.adjustments.filter(
+      (adjustment) => adjustment.param === 'numGpu' && typeof adjustment.applied === 'number',
+    );
+    const lastPersistedNumGpu = persistedOomAdjustments.at(-1)?.applied;
 
     const live: LiveRun = {
       runId, chatId: run.chatId, agent, mode: run.mode, effectiveConfig,
       iteration: run.iteration, state: 'awaiting_permission', abort: new AbortController(),
-      loopDetector: new LoopDetector(), history, cancelRequested: false, formatRetries: 0,
+      loopDetector: new LoopDetector(), history, cancelRequested: false, formatRetries: 0, textMutationCorrections: 0, planCorrections: 0, generatedResponses: 0,
+      contextAttachmentsKnown: false, contextAttachments: [],
       // Doc 10 §5.2 nota: la comparación de conflicto ya no depende de esto (usa
       // `tool_calls.expected_pre_hash`, persistido); se deja vacío como límite conocido documentado
       // — un `git reset`/`checkout` sobre un path tocado antes del reinicio no se reconoce como
       // "tocado por este run" tras rehidratar.
-      touchedPaths: new Set(), turnsSinceCompaction: 0, connectionErrorStreak: 0, oomGpuRetryStep: 0,
+      touchedPaths: new Set(), turnsSinceCompaction: 0, connectionErrorStreak: 0, serverBusyErrorStreak: 0,
+      numGpuOverride: typeof lastPersistedNumGpu === 'number' ? lastPersistedNumGpu : undefined,
+      oomGpuRetryStep: persistedOomAdjustments.length,
       delegationDepth: run.delegationDepth ?? 0,
+      enabledCollaboratorIds: collaborators ? new Set(collaborators.map((item) => item.id)) : undefined,
+      childRunIds: new Set(),
     };
     this.live.set(runId, live);
 
@@ -562,6 +842,36 @@ export class RunController implements RunControllerContract {
       if (ev?.type === 'tool.permission' && ev.request.toolCallId === toolCallId) return ev.request;
     }
     return undefined;
+  }
+
+  /** Resuelve la configuración global del agente para la raíz a la que pertenece este controlador. */
+  private async resolveProjectAgent(agentId: string): Promise<AgentConfig> {
+    const agent = await this.deps.agents.resolve(agentId);
+    // El agente es global y su workingDir persistido puede ser userData o un proyecto anterior.
+    // Cada controlador ya está ligado al WorkspaceFs de esta raíz; el prompt debe usar la misma.
+    return { ...agent, workingDir: this.deps.projectRoot };
+  }
+
+  private chatBelongsToProject(chat: { projectId: string }): boolean {
+    return this.deps.projectId === undefined || chat.projectId === this.deps.projectId;
+  }
+
+  private assertChatBelongsToProject(
+    chat: { id: string; projectId: string }, operation: string,
+  ): void {
+    if (this.chatBelongsToProject(chat)) return;
+    throw new Error(
+      `No se puede ${operation}: el chat ${chat.id} pertenece al proyecto ${chat.projectId}, ` +
+      `pero este runtime está ligado al proyecto ${this.deps.projectId}.`,
+    );
+  }
+
+  private async assertRunBelongsToProject(runId: string, operation: string): Promise<void> {
+    const run = await this.deps.runs.get(runId);
+    if (!run) throw new Error(`Run inexistente: ${runId}`);
+    const chat = await this.deps.chats.get(run.chatId);
+    if (!chat) throw new Error(`Chat inexistente para el run ${runId}: ${run.chatId}`);
+    this.assertChatBelongsToProject(chat, `${operation} del run ${runId}`);
   }
 
   /** Reglas persistidas de proyecto/global (doc 16 §4 ítem 1: "allow_always... se aplica en el
@@ -617,7 +927,9 @@ export class RunController implements RunControllerContract {
     this.transition(live, 'preparing');
     await this.persistRunState(live);
 
-    const effectiveConfig = this.buildEffectiveConfig(live.agent, live.mode);
+    const regenerationSourceMessageId = live.effectiveConfig.regenerationSourceMessageId;
+    const effectiveConfig = this.buildEffectiveConfig(live.agent, live.mode, live.effectiveConfig.modelResolution);
+    if (regenerationSourceMessageId) effectiveConfig.regenerationSourceMessageId = regenerationSourceMessageId;
     await this.applyNumCtxOverride(effectiveConfig);
     await this.capNumCtxAgainstModel(live, effectiveConfig);
     live.effectiveConfig = effectiveConfig;
@@ -662,6 +974,7 @@ export class RunController implements RunControllerContract {
   }
 
   private async capNumCtxAgainstModel(live: LiveRun, effectiveConfig: EffectiveConfig): Promise<void> {
+    effectiveConfig.contextLimitSource = 'provisional';
     if (!this.deps.modelContextProbe) return;
     let contextMax: number | undefined;
     try {
@@ -670,7 +983,9 @@ export class RunController implements RunControllerContract {
       console.warn('[RunController] no se pudo consultar contextMax del modelo; no se capea numCtx', err);
       return;
     }
-    if (contextMax === undefined || contextMax >= effectiveConfig.numCtx) return;
+    if (contextMax === undefined || !Number.isSafeInteger(contextMax) || contextMax <= 0) return;
+    effectiveConfig.contextLimitSource = 'reported';
+    if (contextMax >= effectiveConfig.numCtx) return;
     const requested = effectiveConfig.numCtx;
     effectiveConfig.numCtx = contextMax;
     effectiveConfig.adjustments.push({
@@ -695,7 +1010,27 @@ export class RunController implements RunControllerContract {
       // `cancelRequested` después de cada await largo: sin esto, un cancel() durante esta ventana deja
       // `live.state === 'cancelling'` (RUN_TRANSITIONS['cancelling'] solo permite -> 'cancelled') y el
       // intento de abajo de pasar a 'generating' lanzaría InvalidTransitionError.
-      const repoMapText = await this.buildRepoMap(live);
+      const repoMap = await this.buildRepoMap(live);
+      if (live.cancelRequested) { await this.finishCancelled(live); return; }
+
+      const projectInstructions = await this.loadProjectInstructions();
+      if (live.cancelRequested) { await this.finishCancelled(live); return; }
+
+      // Las memorias del agente nunca se leen directamente desde el runtime: el adaptador del host
+      // aplica el alcance del perfil y el proyecto activo. Si el perfil no las habilita, tampoco se
+      // consulta el puerto. El bloque queda separado de SAURIO.md en ContextBuilder.
+      let agentMemory: string | undefined;
+      let agentMemoryReason: ContextInspectionInput['agentMemoryReason'];
+      if (!live.agent.memory.readProjectMemory) {
+        agentMemoryReason = 'disabled';
+      } else if (!this.deps.agentMemories || !this.deps.projectId) {
+        agentMemoryReason = 'not_configured';
+      } else {
+        agentMemory = formatAgentMemoryForContext(
+          await this.deps.agentMemories.listForRun(live.agent.id, this.deps.projectId),
+        );
+        if (!agentMemory) agentMemoryReason = 'empty';
+      }
       if (live.cancelRequested) { await this.finishCancelled(live); return; }
 
       // Tools renderizadas ANTES de context.build (doc 16 §4 ítem 5): ContextBudgetReport.used.tools
@@ -713,8 +1048,9 @@ export class RunController implements RunControllerContract {
       // a 0 después de un parseo exitoso, ver más abajo) — se le pasa `turnsSinceCompaction:
       // -Infinity`-equivalente apagando el chequeo por completo para esta vuelta puntual.
       const buildInput = {
-        agent: live.agent, mode: live.mode, history: live.history, repoMap: repoMapText,
-        toolsText, turnsSinceCompaction: live.turnsSinceCompaction,
+        agent: live.agent, mode: live.mode, history: live.history, repoMap: repoMap.text,
+        toolsText, agentMemory, projectMemory: projectInstructions.text,
+        turnsSinceCompaction: live.turnsSinceCompaction,
         allowCompaction: live.formatRetries === 0,
         // Feedback real v0.2.1, punto 1e/7: numCtx REAL ya capeado contra el modelo
         // (capNumCtxAgainstModel, más abajo en prepareAndQueue) — puede diferir de
@@ -724,6 +1060,15 @@ export class RunController implements RunControllerContract {
         // I/O (la detección de shell está cacheada a nivel de módulo en run_command.ts), así que
         // recalcularlo en cada vuelta del loop es barato — no hace falta memoizarlo en `live`.
         environmentInfo: buildEnvironmentPrompt(live.agent.workingDir),
+        inspection: {
+          projectRoot: this.deps.projectRoot,
+          repoMapReason: repoMap.reason,
+          projectMemoryReason: projectInstructions.reason,
+          agentMemoryReason,
+          attachmentsKnown: live.contextAttachmentsKnown,
+          attachments: live.contextAttachments,
+          attachmentMessageId: live.contextAttachmentMessageId,
+        },
       };
       const willCompact = this.deps.context.willCompact(buildInput);
       if (willCompact) {
@@ -734,6 +1079,10 @@ export class RunController implements RunControllerContract {
 
       const built = await this.deps.context.build(buildInput);
       if (live.cancelRequested) { await this.finishCancelled(live); return; }
+
+      // Conserva la primera razón de exclusión para vueltas posteriores: después de compactar el
+      // id del mensaje original ya no está en `history`, pero no debe degradarse a "budget".
+      if (built.report.inspection) live.contextAttachments = built.report.inspection.attachments;
 
       if (built.compaction) {
         await this.applyCompaction(live, built.compaction);
@@ -748,8 +1097,21 @@ export class RunController implements RunControllerContract {
         await this.persistRunState(live);
       }
 
-      this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'context.built', budget: built.report });
-      if (!built.report.fits) {
+      const contextReport = {
+        ...built.report,
+        contextLimitSource: live.effectiveConfig.contextLimitSource ?? 'provisional',
+        ...(built.report.inspection ? {
+          inspection: {
+            ...built.report.inspection,
+            limitSource: live.effectiveConfig.contextLimitSource ?? 'provisional',
+          },
+        } : {}),
+      };
+      this.deps.events.append({
+        runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'context.built',
+        budget: contextReport, modelResolution: live.effectiveConfig.modelResolution,
+      });
+      if (!contextReport.fits) {
         await this.fail(live, { code: 'context_overflow', message: 'El contexto no entra ni tras compactar (doc 05 §2.3 paso 12).' });
         return;
       }
@@ -772,6 +1134,7 @@ export class RunController implements RunControllerContract {
       if (chatResult === 'failed') return; // fail() ya se llamó dentro de streamChat
 
       const { assistantMessage } = chatResult;
+      live.generatedResponses += 1;
       live.history.push(assistantMessage);
 
       this.transition(live, 'parsing');
@@ -785,12 +1148,45 @@ export class RunController implements RunControllerContract {
         await this.persistRunState(live);
         continue;
       }
+      // Se captura antes del reset: el fallback de modo Plan no debe convertir una recuperación de
+      // formato en otra generación adicional.
+      const recoveredFromFormatError = live.formatRetries > 0;
       // Doc 07 §7.1 ("nunca dispara durante un reintento de formato"): sin resetear esto tras un
       // parseo exitoso, `live.formatRetries` quedaba en >0 para siempre tras el primer error de
       // formato del run (nunca se reseteaba), lo cual habría bloqueado la compactación en todos los
       // turnos siguientes si se hubiera usado como guarda — se resetea acá para que el contador
       // siga significando "reintentos del turno actual", no "hubo algún reintento en el run".
       live.formatRetries = 0;
+
+      // Frontera de seguridad del runtime: el provider puede devolver tool_calls nativas que nunca
+      // fueron anunciadas, y el transporte text también puede inventar un bloque para una tool que
+      // no pertenece al perfil. Prompt y parser mejoran el comportamiento del modelo, pero no son
+      // autorización. Se valida el conjunto efectivo de ESTE run (perfil + modo + registry) antes
+      // de los atajos de finish/delegate, de registrar permisos o de ejecutar cualquier handler.
+      const allowedToolNames = new Set(availableTools.map((tool) => tool.name));
+      const forbiddenToolNames = [...new Set(parsed.toolCalls
+        .map((call) => call.name)
+        .filter((name) => !allowedToolNames.has(name)))];
+      if (forbiddenToolNames.length > 0) {
+        const quotedNames = forbiddenToolNames.map((name) => `"${name}"`).join(', ');
+        await this.fail(live, {
+          code: 'format',
+          message: `El modelo intentó usar ${forbiddenToolNames.length === 1 ? 'una herramienta no habilitada' : 'herramientas no habilitadas'} para este agente y modo: ${quotedNames}. No se solicitó permiso ni se ejecutó la acción.`,
+        });
+        return;
+      }
+
+      if (this.correctMissingTextTool(live, parsed.toolCalls, parsed.text, availableTools)) {
+        this.returnToQueue(live);
+        await this.persistRunState(live);
+        continue;
+      }
+
+      if (this.correctMissingPlan(live, parsed.toolCalls, parsed.text, recoveredFromFormatError)) {
+        this.returnToQueue(live);
+        await this.persistRunState(live);
+        continue;
+      }
 
       const finishCall = parsed.toolCalls.find((c) => c.name === 'finish');
       if (finishCall) { await this.runFinish(live, protocol, finishCall); return; }
@@ -876,9 +1272,13 @@ export class RunController implements RunControllerContract {
         // A propósito NO se resetea para `chunk.type === 'error'` (si no, un `connection_refused`
         // repetido nunca acumularía racha: cada chunk de error la resetearía a 0 antes de que
         // `retryOrFail` la incremente a 1, y el tope de `MAX_CONNECTION_RETRIES` nunca se alcanzaría).
-        if (chunk.type !== 'error') live.connectionErrorStreak = 0;
+        if (chunk.type !== 'error') {
+          live.connectionErrorStreak = 0;
+          live.serverBusyErrorStreak = 0;
+        }
 
         if (chunk.type === 'content') {
+          if (content.length === 0 && chunk.text.length > 0) this.emitActivity(live, 'answering', 'Redactando la respuesta…');
           content += chunk.text;
           deltaBatcher.push('content', chunk.text);
           if (degeneration.push(chunk.text)) {
@@ -902,7 +1302,7 @@ export class RunController implements RunControllerContract {
           // `message.done` sin haber recibido el texto completo en `message.delta`.
           deltaBatcher.flush();
           const assistantMessage: ChatMessage = {
-            id: assistantMessageId, role: 'assistant', content, thinking: thinking || undefined,
+            id: assistantMessageId, originRunId: live.runId, role: 'assistant', content, thinking: thinking || undefined,
             toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             // Punto 4 del encargo (doc 16 §10.4/§10.9, migración 0003): el modelo que EFECTIVAMENTE
             // generó este mensaje, no el que el chat tenga vigente más adelante — así el badge NUBE
@@ -943,7 +1343,7 @@ export class RunController implements RunControllerContract {
     if (content.length === 0 && thinking.length === 0) return;
     try {
       await this.deps.messages.append(live.chatId, {
-        id, role: 'assistant', content, thinking: thinking || undefined, truncated: true,
+        id, originRunId: live.runId, role: 'assistant', content, thinking: thinking || undefined, truncated: true,
         modelRef: live.effectiveConfig.model,
       });
     } catch (err) {
@@ -951,7 +1351,9 @@ export class RunController implements RunControllerContract {
     }
   }
 
-  private async retryOrFail(live: LiveRun, code: string, message: string, request: ChatRequest): Promise<'retry' | 'failed'> {
+  private async retryOrFail(
+    live: LiveRun, code: string, message: string, request: ChatRequest,
+  ): Promise<'retry' | 'failed' | 'cancelled'> {
     const verdict = live.loopDetector.recordError(code);
     if (verdict === 'nudge') this.pushNudge(live, `Reintento tras error ${code}: probá un enfoque distinto si vuelve a pasar.`);
     // Tarea "carga de modelo/oom_load": antes de cualquier otra cosa, si el modelo no entró en la
@@ -978,7 +1380,19 @@ export class RunController implements RunControllerContract {
       return 'retry';
     }
     if (MUTATING_ERROR_RETRY_CODES.has(code)) { await this.delay(2000); return 'retry'; }
-    if (code === BUSY_RETRY_CODE) { await this.delay(3000); return 'retry'; }
+    if (code === BUSY_RETRY_CODE) {
+      live.serverBusyErrorStreak += 1;
+      if (live.serverBusyErrorStreak > MAX_SERVER_BUSY_RETRIES) {
+        await this.fail(live, {
+          code: 'server_busy',
+          message: `${message} (el proveedor siguió ocupado tras ${MAX_SERVER_BUSY_RETRIES} reintentos de ~3s cada uno)`,
+        });
+        return 'failed';
+      }
+      await this.delay(3000);
+      if (live.cancelRequested || live.abort.signal.aborted) return 'cancelled';
+      return 'retry';
+    }
     await this.fail(live, { code: mapProviderErrorCode(code), message });
     return 'failed';
   }
@@ -992,7 +1406,7 @@ export class RunController implements RunControllerContract {
    *  reversible") y queda pegado a ESTE run (`live.numGpuOverride`, ver `buildChatRequest`) — un
    *  run/chat nuevo vuelve a `numGpu` automático, así que el ajuste nunca queda "para siempre". */
   private async handleOomLoad(live: LiveRun, request: ChatRequest, message: string): Promise<'retry' | 'failed'> {
-    if (live.oomBlockCount === undefined && live.oomGpuRetryStep === 0 && this.deps.modelLayerCountProbe) {
+    if (live.oomBlockCount === undefined && this.deps.modelLayerCountProbe) {
       try {
         live.oomBlockCount = await this.deps.modelLayerCountProbe.getBlockCount(live.effectiveConfig.model);
       } catch (err) {
@@ -1024,6 +1438,9 @@ export class RunController implements RunControllerContract {
     };
     live.effectiveConfig.adjustments.push(adjustment);
     this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'run.adjustment', adjustment });
+    // El ajuste es estado operativo del run: si la app se reinicia durante un permiso posterior,
+    // `resumeAfterRestart` debe retomar con las mismas capas y el siguiente paso de la escalera.
+    await this.deps.runs.update(live.runId, { effectiveConfig: live.effectiveConfig });
     await this.delay(500);
     return 'retry';
   }
@@ -1063,6 +1480,96 @@ export class RunController implements RunControllerContract {
   }
 
   // ── Tool calls: permisos, checkpoint, ejecución (doc 05 §2.5-2.9) ──────
+
+  /**
+   * Corrige una sola vez el rechazo estrecho observado en modelos con TextToolProtocol: el usuario
+   * pidió modificar una ruta concreta, pero la primera respuesta le solicita el contenido que
+   * `read_file` puede obtener. La corrección es un mensaje system efímero y describe honestamente
+   * la intervención del runtime; no suplanta al usuario ni concede permisos a ninguna tool.
+   */
+  private correctMissingTextTool(
+    live: LiveRun,
+    calls: ToolCall[],
+    assistantText: string,
+    availableTools: ToolDefinition[],
+  ): boolean {
+    if (
+      live.mode !== 'agent'
+      || live.effectiveConfig.transport !== 'text'
+      || live.generatedResponses !== 1
+      || live.iteration !== 0
+      || live.textMutationCorrections >= 1
+      || calls.length !== 0
+      || !availableTools.some((tool) => tool.name === 'read_file')
+    ) return false;
+
+    const userMessage = [...live.history].reverse().find((message) => (
+      message.role === 'user'
+      && message.ephemeral !== true
+      && !message.content.trimStart().startsWith('<tool_result')
+    ));
+    if (!userMessage) return false;
+
+    const correction = textMutationCorrectionFor(userMessage.content, assistantText);
+    if (!correction) return false;
+
+    live.textMutationCorrections += 1;
+    live.history.push({
+      id: this.deps.ids.next(),
+      role: 'system',
+      ephemeral: true,
+      content: [
+        'Corrección interna del runtime:',
+        `la respuesta anterior dejó pendiente obtener el contenido de "${correction.path}", aunque read_file está disponible.`,
+        'El usuario ya indicó una modificación concreta. No inventes el contenido ni pidas confirmación:',
+        'llamá ahora a read_file con esa ruta. Esta corrección no concede permisos;',
+        'la llamada seguirá la política normal de permisos de la aplicación.',
+      ].join(' '),
+    });
+    return true;
+  }
+
+  /**
+   * El contrato del modo Plan exige pasos concretos. Si una respuesta final llega como prosa sin
+   * `task_update`, `finish.tasks` ni una lista Markdown explícita, se pide el checklist una sola vez.
+   * La prosa nunca se transforma en tareas; si el segundo intento tampoco trae pasos, el cierre
+   * informa un error explícito. Un plan sin tareas no se presenta como completado.
+   */
+  private correctMissingPlan(
+    live: LiveRun,
+    calls: ToolCall[],
+    assistantText: string,
+    recoveredFromFormatError: boolean,
+  ): boolean {
+    const finishesWithoutTasks = calls.length > 0 && calls.every((call) => {
+      if (call.name !== 'finish') return false;
+      const tasks = (call.args as { tasks?: unknown } | undefined)?.tasks;
+      return !Array.isArray(tasks) || tasks.length === 0;
+    });
+    if (
+      live.mode !== 'plan'
+      || recoveredFromFormatError
+      || live.planCorrections >= 1
+      || (calls.length !== 0 && !finishesWithoutTasks)
+      || planStepsFromText(assistantText).length > 0
+      || this.deps.events.since(live.runId, 0).some((event) => event.type === 'tasks.updated')
+    ) return false;
+
+    live.planCorrections += 1;
+    live.history.push({
+      id: this.deps.ids.next(),
+      // Algunas plantillas locales (Qwen3) omiten system intermedios: el recordatorio debe entrar
+      // como mensaje de conversación. Se identifica como interno y no se persiste como pedido humano.
+      role: 'user',
+      ephemeral: true,
+      content: [
+        'Corrección interna del runtime: la respuesta anterior no incluyó un plan explícito.',
+        'Seguís en modo PLAN. Convertí tu análisis anterior en pasos concretos pendientes, uno por línea: 1. ..., 2. ..., 3. ...',
+        'La respuesta debe contener el plan; no puede quedar vacía. No ejecutes el plan ni repitas sólo la explicación del problema.',
+      ].join(' '),
+    });
+    return true;
+  }
 
   private async handleToolCalls(live: LiveRun, calls: ToolCall[], text: string): Promise<TurnOutcome> {
     // Feedback real v0.2.1 (usuario, modo Agente): "a 'Hola' el run hizo 8+ turnos... y respondió DOS
@@ -1183,14 +1690,16 @@ export class RunController implements RunControllerContract {
     if (decision.decision === 'ask') {
       record = { ...record, status: 'awaiting_permission' };
       await this.deps.toolCalls.upsert(record);
+      // Preparar la espera antes de publicar: una respuesta inmediata no se pierde.
+      const pendingAnswer = new Promise<PermissionAnswer>((resolve) => {
+        live.pendingPermission = { toolCallId: call.id, resolve };
+      });
       this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'tool.permission', request: decision.request });
       this.transition(live, 'awaiting_permission');
       this.emitActivity(live, 'waiting_permission', `Esperando permiso para "${call.name}"…`, call.id);
       await this.persistRunState(live);
 
-      const answer = await new Promise<PermissionAnswer>((resolve) => {
-        live.pendingPermission = { toolCallId: call.id, resolve };
-      });
+      const answer = await pendingAnswer;
       if (live.cancelRequested) return 'cancelled';
 
       return this.afterPermissionAnswered(live, call, record, classification, decision.request, answer);
@@ -1235,6 +1744,8 @@ export class RunController implements RunControllerContract {
     record = { ...record, status: 'approved' };
     await this.deps.toolCalls.upsert(record);
     this.transition(live, 'executing_tool');
+    const activity = this.activityForTool(call.name, call.args);
+    if (activity) this.emitActivity(live, activity.phase, activity.label, call.id);
     await this.persistRunState(live);
     return this.runHandler(live, call, record, classification);
   }
@@ -1408,6 +1919,14 @@ export class RunController implements RunControllerContract {
     // (owner_kind: 'worker', doc 19 §0) si no se indica ninguno. El modelo NUNCA debe poder inventar
     // un targetAgentId que no exista: se verifica contra el resolver real antes de seguir.
     let targetAgentId = args.targetAgentId;
+    if (live.enabledCollaboratorIds) {
+      if (!targetAgentId) {
+        return failWith('delegate: elegí un targetAgentId de la lista de colaboradores habilitados para este chat.');
+      }
+      if (!live.enabledCollaboratorIds.has(targetAgentId)) {
+        return failWith(`delegate: el agente "${targetAgentId}" no está habilitado como colaborador de este chat.`);
+      }
+    }
     if (targetAgentId) {
       const exists = await this.deps.agents.resolve(targetAgentId).catch(() => undefined);
       if (!exists) return failWith(`delegate: no existe el agente "${targetAgentId}".`);
@@ -1437,11 +1956,20 @@ export class RunController implements RunControllerContract {
 
     // Paso 5: arranca el run hijo. `this.start()` deriva `delegationDepth = padre+1` por sí solo a
     // partir de `chats.origin_run_id` (ver `start()` más arriba) — no hace falta pasarlo acá.
-    const { runId: childRunId } = await this.start(childChatId, buildDelegationPrompt(args), 'agent');
+    if (args.budget?.maxIterations !== undefined) {
+      this.delegatedIterationBudgets.set(childChatId, Math.max(1, Math.floor(args.budget.maxIterations)));
+    }
+    let childRunId: string;
+    try {
+      ({ runId: childRunId } = await this.start(childChatId, buildDelegationPrompt(args), 'agent'));
+    } finally {
+      this.delegatedIterationBudgets.delete(childChatId);
+    }
+    live.childRunIds.add(childRunId);
 
     this.deps.events.append({
       runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'run.delegated',
-      parentRunId: live.runId, childRunId, childChatId, targetAgentId, task: args.task,
+      parentRunId: live.runId, childRunId, childChatId, targetAgentId, task: args.task, toolCallId: call.id,
     });
 
     // Paso 6: espera a que el hijo termine (doc 19 §2.5: "el loop de tools ya es síncrono dentro de
@@ -1451,6 +1979,7 @@ export class RunController implements RunControllerContract {
     // cancela el hijo en vez de dejarlo corriendo indefinidamente.
     const timeoutMs = args.budget?.timeoutMs ?? this.deps.defaultToolTimeoutMs ?? 120_000;
     const finalRun = await this.waitForRunTerminal(childRunId, timeoutMs);
+    live.childRunIds.delete(childRunId);
     if (live.cancelRequested) return 'cancelled';
 
     const delegationResult = await this.buildDelegationResult(childChatId, finalRun);
@@ -1497,6 +2026,7 @@ export class RunController implements RunControllerContract {
     const finishMsg = [...assistantMessages].reverse().find((m) => m.toolCalls?.some((tc) => tc.name === 'finish'));
     const finishCall = finishMsg?.toolCalls?.find((tc) => tc.name === 'finish');
     const finishArgs = finishCall?.args as Record<string, unknown> | undefined;
+    const workerContent = finishMsg?.content.trim();
     const rawText = typeof finishArgs?.['summary'] === 'string'
       ? finishArgs['summary'] as string
       : assistantMessages[assistantMessages.length - 1]?.content;
@@ -1506,11 +2036,66 @@ export class RunController implements RunControllerContract {
     }
     try {
       const parsed = DelegationResultSchema.safeParse(JSON.parse(rawText));
-      if (parsed.success) return parsed.data;
+      if (parsed.success) {
+        const summary = workerContent && workerContent !== parsed.data.summary.trim()
+          ? `${parsed.data.summary.trim()}\n\nEntregable del worker:\n${workerContent}`
+          : parsed.data.summary;
+        const verified = await this.verifyDelegationArtifacts(parsed.data.artifacts);
+        const uncertainties = [...(parsed.data.uncertainties ?? []), ...verified.uncertainties];
+        return {
+          ...parsed.data,
+          summary,
+          artifacts: verified.artifacts.length > 0 ? verified.artifacts : undefined,
+          uncertainties: uncertainties.length > 0 ? [...new Set(uncertainties)] : undefined,
+        };
+      }
     } catch {
       // no era JSON — cae a la degradación de texto crudo de abajo.
     }
-    return { status: 'completed', summary: rawText, uncertainties: ['formato no estructurado'] };
+    const summary = workerContent && workerContent !== rawText.trim()
+      ? `${rawText.trim()}\n\nEntregable del worker:\n${workerContent}`
+      : rawText;
+    return { status: 'completed', summary, uncertainties: ['formato no estructurado'] };
+  }
+
+  /** Un artifact declarado por el modelo sólo vuelve al padre si existe como archivo dentro de la
+   *  raíz real del proyecto. `WorkspaceFs.resolve` rechaza absolutos/`..`; `realpath` evita aceptar un
+   *  symlink que lexicalmente está adentro pero apunta afuera. Un path no verificable se excluye y se
+   *  explica como incertidumbre: nunca se afirma que el worker creó algo que no existe. */
+  private async verifyDelegationArtifacts(
+    artifacts: DelegationResult['artifacts'],
+  ): Promise<{ artifacts: NonNullable<DelegationResult['artifacts']>; uncertainties: string[] }> {
+    const verified: NonNullable<DelegationResult['artifacts']> = [];
+    const uncertainties: string[] = [];
+    if (!artifacts || artifacts.length === 0) return { artifacts: verified, uncertainties };
+
+    for (const artifact of artifacts) {
+      const accepted = await this.classifyWorkspaceFile(artifact.path) === 'safe';
+      if (accepted) verified.push(artifact);
+      if (!accepted) {
+        uncertainties.push(`artifact excluido porque no se pudo verificar dentro del proyecto: "${artifact.path}"`);
+      }
+    }
+    return { artifacts: verified, uncertainties };
+  }
+
+  /** Verifica la ruta canónica antes de leer/afirmar un archivo. `WorkspaceFs.resolve` por sí solo
+   * sólo confina lexicalmente: un symlink o junction con nombre inocuo puede apuntar fuera de la
+   * raíz o a `.git`. Este helper también reevalúa rutas protegidas sobre el destino real. */
+  private async classifyWorkspaceFile(relPath: string): Promise<'safe' | 'missing' | 'unsafe'> {
+    const workspaceFs = this.deps.workspaceFs;
+    if (!workspaceFs || workspaceFs.isProtected(relPath)) return 'unsafe';
+    try {
+      const rootReal = await realpath(this.deps.projectRoot);
+      const targetReal = await realpath(workspaceFs.resolve(relPath));
+      const relativeToRoot = relative(rootReal, targetReal);
+      const insideRoot = relativeToRoot === ''
+        || (!isAbsolute(relativeToRoot) && relativeToRoot !== '..' && !relativeToRoot.startsWith(`..${sep}`));
+      if (!insideRoot || workspaceFs.isProtected(relativeToRoot)) return 'unsafe';
+      return (await stat(targetReal)).isFile() ? 'safe' : 'unsafe';
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unsafe';
+    }
   }
 
   /** Hallazgo #3 (parcial, dentro del alcance de agent/): sin esto, un handler colgado (p. ej.
@@ -1562,12 +2147,28 @@ export class RunController implements RunControllerContract {
   // ── Cierre de run (doc 05 §2.14, doc 10 §5.6) ──────────────────────────
 
   private async finishCompleted(live: LiveRun): Promise<void> {
+    if (live.mode === 'plan' && !this.deps.events.since(live.runId, 0).some((event) =>
+      event.type === 'tasks.updated' && event.tasks.length > 0)) {
+      await this.fail(live, {
+        code: 'format',
+        message: 'El modelo no produjo un plan con pasos concretos. No se guardaron tareas de este pedido. Podés volver a pedir el plan o elegir otro modelo.',
+      });
+      return;
+    }
     this.transition(live, 'completed');
     await this.persistRunState(live);
     this.live.delete(live.runId);
   }
 
-  private async finishWithText(live: LiveRun, _text: string): Promise<void> {
+  private async finishWithText(live: LiveRun, text: string): Promise<void> {
+    if (live.mode === 'plan' && !this.deps.events.since(live.runId, 0).some((event) => event.type === 'tasks.updated')) {
+      const steps = planStepsFromText(text);
+      if (steps.length > 0) {
+        await this.deps.taskManager.update(live.chatId, live.runId, steps.map((step, ord) => ({
+          ...step, id: `${live.chatId}:task:${ord}`, ord,
+        })));
+      }
+    }
     await this.finishCompleted(live);
   }
 
@@ -1673,18 +2274,46 @@ export class RunController implements RunControllerContract {
 
   /** Repo map del turno (doc 07 §2): se pide al indexer con el presupuesto de la ContextPolicy.
    *  Nunca hace fallar el run — si el indexer falla, se sigue con un repo map vacío. */
-  private async buildRepoMap(live: LiveRun): Promise<string> {
-    if (!this.deps.repoMap) return '';
+  private async buildRepoMap(live: LiveRun): Promise<{
+    text: string;
+    reason?: ContextInspectionInput['repoMapReason'];
+  }> {
+    if (!this.deps.repoMap) return { text: '', reason: 'not_configured' };
     try {
+      const effectivePolicy = contextPolicyForNumCtx(live.effectiveConfig.numCtx, live.agent.contextPolicy);
       const { text } = await this.deps.repoMap.build(this.deps.projectRoot, {
-        budgetTokens: live.agent.contextPolicy.repoMapTokens,
+        budgetTokens: effectivePolicy.repoMapTokens,
         mentioned: [],
         touched: [],
       });
-      return text;
+      return text.trim().length > 0 ? { text } : { text: '', reason: 'empty' };
     } catch (error) {
       console.warn('[RunController] no se pudo construir el repo map; se sigue sin él', error);
-      return '';
+      return { text: '', reason: 'build_failed' };
+    }
+  }
+
+  /** Lee las instrucciones de raíz con el mismo WorkspaceFs confinado y limitado que usan las
+   * tools. `not_found` es ausencia comprobada; cualquier otra falla se informa sin exponer paths ni
+   * mensajes internos en el evento de contexto. */
+  private async loadProjectInstructions(): Promise<{
+    text?: string;
+    reason?: ContextInspectionInput['projectMemoryReason'];
+  }> {
+    if (!this.deps.workspaceFs) return { reason: 'not_connected' };
+    const classification = await this.classifyWorkspaceFile('SAURIO.md');
+    if (classification === 'missing') return { reason: 'empty' };
+    if (classification !== 'safe') {
+      console.warn('[RunController] SAURIO.md no pasó la validación de confinamiento; se ignora');
+      return { reason: 'build_failed' };
+    }
+    try {
+      const { content } = await this.deps.workspaceFs.readFile('SAURIO.md');
+      return content.trim().length > 0 ? { text: content } : { reason: 'empty' };
+    } catch (error) {
+      if (error instanceof ToolExecutionError && error.code === 'not_found') return { reason: 'empty' };
+      console.warn('[RunController] no se pudo leer SAURIO.md; se sigue sin instrucciones de proyecto', error);
+      return { reason: 'build_failed' };
     }
   }
 
@@ -1698,7 +2327,9 @@ export class RunController implements RunControllerContract {
     return 'native';
   }
 
-  private buildEffectiveConfig(agent: AgentConfig, mode: Mode): EffectiveConfig {
+  private buildEffectiveConfig(
+    agent: AgentConfig, mode: Mode, modelResolution?: ModelResolution,
+  ): EffectiveConfig {
     const adjustments: Adjustment[] = [];
     const transport: EffectiveConfig['transport'] = agent.toolTransport === 'auto'
       ? this.resolveAutoTransport(agent.model.name)
@@ -1707,7 +2338,9 @@ export class RunController implements RunControllerContract {
     const tools = this.deps.tools.list({ names: agent.allowedTools, mode }).map((t) => t.name);
     return {
       model: agent.model, numCtx: agent.contextPolicy.numCtx, think, tools, transport,
+      contextLimitSource: 'provisional',
       promptHash: agent.systemPromptHash, profileId: agent.profileId, adjustments,
+      ...(modelResolution ? { modelResolution } : {}),
     };
   }
 
@@ -1723,6 +2356,7 @@ export class RunController implements RunControllerContract {
     const withSuffix = rendered.systemSuffix
       ? messages.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n${rendered.systemSuffix}` } : m))
       : messages;
+    const effectivePolicy = contextPolicyForNumCtx(live.effectiveConfig.numCtx, live.agent.contextPolicy);
     return {
       model: live.effectiveConfig.model.name,
       messages: withSuffix,
@@ -1730,7 +2364,7 @@ export class RunController implements RunControllerContract {
       options: {
         numCtx: live.effectiveConfig.numCtx,
         temperature: live.agent.temperature,
-        numPredict: live.agent.contextPolicy.reserveForResponse,
+        numPredict: effectivePolicy.reserveForResponse,
         stop: rendered.stop,
         // Tarea "carga de modelo/oom_load": si un turno anterior de ESTE run ya tuvo que bajar
         // `numGpu` tras un oom_load, se repite en todos los turnos siguientes (el modelo no entra
@@ -1743,11 +2377,37 @@ export class RunController implements RunControllerContract {
   }
 }
 
-function buildPlaceholderConfig(agent: AgentConfig): EffectiveConfig {
+function buildPlaceholderConfig(agent: AgentConfig, modelResolution?: ModelResolution): EffectiveConfig {
   return {
     model: agent.model, numCtx: agent.contextPolicy.numCtx, think: false, tools: [],
-    transport: 'native', promptHash: agent.systemPromptHash, adjustments: [],
+    transport: 'native', promptHash: agent.systemPromptHash, adjustments: [], contextLimitSource: 'provisional',
+    ...(modelResolution ? { modelResolution } : {}),
   };
+}
+
+function isResolvedModelSelection(
+  value: ModelRef | { ref: ModelRef; resolution: ModelResolution },
+): value is { ref: ModelRef; resolution: ModelResolution } {
+  return 'ref' in value && 'resolution' in value;
+}
+
+/** Un resolver legado devuelve sólo ModelRef. Se registra procedencia únicamente cuando puede
+ * deducirse sin adivinar qué rama automática eligió. */
+function inferLegacyModelResolution(
+  agent: AgentConfig, chatModelRef: ModelRef | undefined,
+): ModelResolution | undefined {
+  if (chatModelRef) return { source: 'chat_override' };
+  if (agent.modelMode !== 'auto') return { source: 'agent_fixed' };
+  return undefined;
+}
+
+function withCollaboratorPrompt(agent: AgentConfig, collaborators: AgentConfig[]): AgentConfig {
+  const roster = collaborators.length === 0
+    ? '- No hay colaboradores habilitados. Resolvé la tarea directamente y no uses delegate.'
+    : collaborators.map((item) => `- ${item.name} — ${item.role} — ID: ${item.id}`).join('\n');
+  const systemPrompt = `${agent.systemPrompt}\n\nColaboradores habilitados para este chat:\n${roster}\n` +
+    'Si delegás, usá exactamente uno de esos IDs como targetAgentId. No inventes agentes ni delegues a otros perfiles.';
+  return { ...agent, systemPrompt, systemPromptHash: hashSystemPrompt(systemPrompt) };
 }
 
 /** Doc 19 §2.5: el primer mensaje del chat hijo — le pide al worker que cierre con `finish` cuyo
@@ -1761,7 +2421,9 @@ function buildDelegationPrompt(args: DelegationRequest): string {
       'EXACTAMENTE un JSON (sin texto adicional antes o después) con esta forma: ' +
       '{"status":"completed"|"failed"|"needs_input","summary":"texto breve del resultado",' +
       '"artifacts":[{"path":"...","description":"..."}],"uncertainties":["..."],"nextAction":"..."} ' +
-      '(los campos "artifacts"/"uncertainties"/"nextAction" son opcionales).',
+      '(los campos "artifacts"/"uncertainties"/"nextAction" son opcionales). ' +
+      'El campo "summary" debe incluir el entregable concreto completo, no sólo decir que lo hiciste. ' +
+      'Incluí un artifact únicamente si realmente creaste ese archivo dentro del proyecto y confirmaste que existe; no inventes paths.',
   ].join('\n\n');
 }
 

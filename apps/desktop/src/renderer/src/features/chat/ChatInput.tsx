@@ -17,13 +17,14 @@ export interface ChatInputProps {
   onModeChange: (mode: Mode) => void;
   effort: Effort;
   onEffortChange: (effort: Effort) => void;
-  permissionPreset: ChatPermissionPreset;
+  permissionPreset: ChatPermissionPreset | undefined;
+  permissionDisplay?: { label: string; description: string };
   onPermissionPresetChange: (preset: ChatPermissionPreset, confirmed?: boolean) => void;
   /** `true` mientras hay un run activo para este chat (no en estado terminal) — deshabilita el
    *  envío y habilita cancelar (doc 06 §8: el run queda en `awaiting_permission` sin timeout, se
    *  cancela con `run:cancel` en cualquier momento). */
   isRunning: boolean;
-  onSend: (text: string, attachments: Attachment[]) => void;
+  onSend: (text: string, attachments: Attachment[]) => void | Promise<void>;
   onCancel: () => void;
   /** Modelo activo del chat (pasada de diseño #5: nombre del modelo + contador de contexto junto
    *  al botón de enviar, para no tener que mirar la barra de estado para saber con qué modelo se
@@ -35,13 +36,16 @@ export interface ChatInputProps {
 }
 
 export function ChatInput({
-  mode, onModeChange, effort, onEffortChange, permissionPreset, onPermissionPresetChange,
+  mode, onModeChange, effort, onEffortChange, permissionPreset, permissionDisplay, onPermissionPresetChange,
   isRunning, onSend, onCancel, modelName, contextLabel,
 }: ChatInputProps): React.JSX.Element {
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachError, setAttachError] = useState<string | undefined>(undefined);
   const [dragOver, setDragOver] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string>();
+  const sendingRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -55,6 +59,7 @@ export function ChatInput({
   }, [text]);
 
   async function addFiles(files: FileList | File[]): Promise<void> {
+    if (isRunning || sendingRef.current) return;
     setAttachError(undefined);
     const list = Array.from(files);
     const oversized = list.filter((f) => f.size > MAX_ATTACHMENT_BYTES);
@@ -71,13 +76,23 @@ export function ChatInput({
     setAttachments((prev) => prev.filter((_, i) => i !== index));
   }
 
-  function handleSend(): void {
+  async function handleSend(): Promise<void> {
     const trimmed = text.trim();
-    if ((!trimmed && attachments.length === 0) || isRunning) return;
-    onSend(trimmed, attachments);
-    setText('');
-    setAttachments([]);
-    setAttachError(undefined);
+    if ((!trimmed && attachments.length === 0) || isRunning || sendingRef.current) return;
+    sendingRef.current = true;
+    setSending(true);
+    setSendError(undefined);
+    try {
+      await onSend(trimmed, attachments);
+      setText('');
+      setAttachments([]);
+      setAttachError(undefined);
+    } catch (reason) {
+      setSendError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
+    }
   }
 
   // Rediseño del chat, punto 1 (feedback real v0.2.1: "Enter no envía"): Enter solo envía (como
@@ -87,7 +102,7 @@ export function ChatInput({
     if (e.key !== 'Enter') return;
     if (e.shiftKey) return; // línea nueva, comportamiento nativo del textarea
     e.preventDefault();
-    handleSend();
+    void handleSend();
   }
 
   // "también pegar imagen" (punto 1 del encargo): una imagen copiada al portapapeles llega acá como
@@ -126,6 +141,7 @@ export function ChatInput({
               <button
                 type="button"
                 className="chat-input__attachment-remove"
+                disabled={isRunning || sending}
                 onClick={() => removeAttachment(i)}
                 aria-label={`Quitar adjunto ${a.name}`}
               >
@@ -136,6 +152,7 @@ export function ChatInput({
         </ul>
       )}
       {attachError && <p className="chat-input__attach-error" role="alert">{attachError}</p>}
+      {sendError && <p className="chat-input__attach-error" role="alert">{sendError}</p>}
       <textarea
         ref={textareaRef}
         className="chat-input__textarea"
@@ -145,7 +162,7 @@ export function ChatInput({
         onChange={(e) => setText(e.target.value)}
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
-        disabled={isRunning}
+        disabled={isRunning || sending}
         rows={1}
       />
       {dragOver && <div className="chat-input__drop-hint">Soltá para adjuntar</div>}
@@ -155,7 +172,7 @@ export function ChatInput({
           className="chat-input__attach-button"
           title="Adjuntar archivos o imágenes"
           onClick={() => fileInputRef.current?.click()}
-          disabled={isRunning}
+          disabled={isRunning || sending}
         >
           <PaperclipIcon width={14} height={14} />
         </button>
@@ -166,9 +183,15 @@ export function ChatInput({
           className="chat-input__file-input"
           onChange={(e) => { if (e.target.files) void addFiles(e.target.files); e.target.value = ''; }}
         />
-        <ModeMenu mode={mode} disabled={isRunning} onChange={onModeChange} />
-        <EffortMenu effort={effort} disabled={isRunning} onChange={onEffortChange} />
-        <PermissionMenu preset={permissionPreset} disabled={isRunning} onChange={onPermissionPresetChange} />
+        <ModeMenu mode={mode} disabled={isRunning || sending} onChange={onModeChange} />
+        <EffortMenu effort={effort} disabled={isRunning || sending} onChange={onEffortChange} />
+        <PermissionMenu
+          preset={permissionPreset}
+          effectiveLabel={permissionDisplay?.label}
+          effectiveDescription={permissionDisplay?.description}
+          disabled={isRunning || sending}
+          onChange={onPermissionPresetChange}
+        />
         <span className="chat-input__spacer" />
         <span className="chat-input__model" title="Modelo activo de este chat — el contexto es el numCtx real, no el máximo teórico">
           <CpuIcon width={12} height={12} />
@@ -184,10 +207,10 @@ export function ChatInput({
           <button
             type="button"
             className="chat-input__send saurio-btn-primary"
-            onClick={handleSend}
-            disabled={!text.trim() && attachments.length === 0}
+            onClick={() => void handleSend()}
+            disabled={sending || (!text.trim() && attachments.length === 0)}
           >
-            Enviar
+            {sending ? 'Enviando…' : 'Enviar'}
           </button>
         )}
       </div>

@@ -9,16 +9,12 @@ import type {
 
 const SAFETY_MARGIN_BYTES = 512 * 1024 * 1024;
 
-/** Sin instalar el modelo no hay `model_info` (arch/block_count) para la fórmula exacta de KV cache
- *  de `MemoryEstimator` (esa fórmula necesita `/api/show`, que solo responde para modelos ya
- *  presentes localmente — doc 08 §5.2). Acá se usa un margen fijo sobre el tamaño de pesos como
- *  proxy de KV cache + buffers a un contexto moderado (8-16K): 15% del tamaño de pesos, con un piso
- *  de 512 MiB para que un modelo muy chico no salga "gratis". Esto es `[HIPÓTESIS A PROBAR]`
- *  explícito (doc 13 §8 lo permite: "los umbrales exactos, no la lógica") — en cuanto el motor
- *  recibe un modelo ya instalado, debería preferirse `MemoryEstimator.fits()` real en su lugar
- *  (ver `RecommendationEngineOptions.installedFitOverride`). */
-function estimatedTotalBytes(sizeBytes: number): number {
-  return sizeBytes + Math.max(sizeBytes * 0.15, 512 * 1024 * 1024);
+/** Sin instalar el modelo no hay `model_info` para la fórmula de MemoryEstimator. Este proxy escala
+ * el margen con el contexto máximo anunciado y siempre se expone como `estimated`; para instalados
+ * se prefiere el lookup inyectado con ese mismo contexto máximo. */
+function estimatedTotalBytes(sizeBytes: number, contextMax: number): number {
+  const contextScale = Math.max(1, contextMax / 16_384);
+  return sizeBytes + Math.max(sizeBytes * 0.15 * contextScale, 512 * 1024 * 1024);
 }
 
 export interface TestedLookup {
@@ -27,11 +23,15 @@ export interface TestedLookup {
   lookup(catalogEntry: ModelCatalogEntry, hardwareFingerprint: string): Promise<{ tokPerSec: number; testedAt: number } | undefined>;
 }
 
-/** `fits()` real (MemoryEstimator + ModelManager) para un modelo YA instalado, si el host lo tiene a
- *  mano; permite que la recomendación de un modelo instalado use la fórmula exacta en vez del proxy
- *  de `estimatedTotalBytes` (doc 13 §8 regla 2: "usando la misma fórmula que MemoryEstimator"). */
+/** `fits()` de MemoryEstimator para un modelo instalado, siempre al máximo confirmado. Su calidad
+ * sigue siendo `estimated` salvo que un sample/model_compat confirme carga en el mismo equipo y
+ * contexto; hardware medido por sí solo no vuelve medida a la estimación. */
 export interface InstalledFitLookup {
-  fitClassFor(catalogEntry: ModelCatalogEntry): Promise<Recommendation['fitClass'] | undefined>;
+  fitClassFor(catalogEntry: ModelCatalogEntry, contextMax: number, hardwareFingerprint: string): Promise<{
+    fitClass: Recommendation['fitClass'];
+    fitQuality: 'measured' | 'estimated';
+    contextUsed: number;
+  } | undefined>;
 }
 
 export class RecommendationEngine implements RecommendationEngineContract {
@@ -48,11 +48,17 @@ export class RecommendationEngine implements RecommendationEngineContract {
   ): Promise<Recommendation[]> {
     const vramTotal = hardware.gpu?.vramTotalBytes.value ?? 0;
     const vramUsed = hardware.gpu?.vramUsedBytes?.value ?? 0;
-    const vramAvailable = Math.max(vramTotal - vramUsed - SAFETY_MARGIN_BYTES, 0);
+    const ramAvailable = Math.max(hardware.ram.freeBytes.value - SAFETY_MARGIN_BYTES, 0);
+    const integrated = hardware.gpu?.integrated === true;
+    const rawVramAvailable = Math.max(vramTotal - vramUsed - SAFETY_MARGIN_BYTES, 0);
+    // En memoria unificada, la VRAM anunciada es un techo dentro de la RAM compartida. Acotarla por
+    // la RAM libre evita recomendar como GPU-fit algo que el sistema ya no puede reservar.
+    const vramAvailable = integrated ? Math.min(rawVramAvailable, ramAvailable) : rawVramAvailable;
 
     // Doc 13 §8 regla 1: filtra por capabilities requeridas ("coding"/"agent" exige tools; "vision"
     // exige vision"). "chat"/"analysis" no exigen ninguna capability extra.
     const filtered = this.catalog.filter((entry) => {
+      if (entry.cloud) return false;
       if (!entry.suggestedUse.includes(use)) return false;
       if (use === 'coding' && !entry.capabilities.tools) return false;
       if (use === 'vision' && !entry.capabilities.vision) return false;
@@ -60,10 +66,23 @@ export class RecommendationEngine implements RecommendationEngineContract {
     });
 
     const results: Recommendation[] = [];
+    let installedFitAvailable = true;
     for (const entry of filtered) {
-      const overriddenFitClass = await this.installedFit?.fitClassFor(entry);
-      const fitClass = overriddenFitClass ?? this.estimateFitClass(entry, vramAvailable);
-      const usesCpuOffload = fitClass === 'partial_offload' || fitClass === 'no_fit';
+      let installedAssessment: Awaited<ReturnType<InstalledFitLookup['fitClassFor']>>;
+      if (installedFitAvailable) {
+        try {
+          installedAssessment = await this.installedFit?.fitClassFor(entry, entry.contextMax, hardware.fingerprint);
+        } catch {
+          // Un motor apagado no impide recomendar la primera descarga. Evita además repetir el
+          // mismo timeout por cada entrada; esta consulta conserva estimaciones explícitas.
+          installedFitAvailable = false;
+        }
+      }
+      const fitClass = installedAssessment?.fitClass
+        ?? this.estimateFitClass(entry, vramAvailable, ramAvailable, integrated);
+      const fitQuality = installedAssessment?.fitQuality ?? 'estimated';
+      const contextUsed = installedAssessment?.contextUsed ?? entry.contextMax;
+      const usesCpuOffload = fitClass === 'partial_offload';
       const speedHint: Recommendation['speedHint'] =
         fitClass === 'fits_gpu' ? 'fast' : fitClass === 'tight' ? 'medium' : 'slow';
 
@@ -77,28 +96,62 @@ export class RecommendationEngine implements RecommendationEngineContract {
         locality: 'local', // doc 13 §9: el Centro de modelos solo recomienda providers locales en el MVP/v0.3
         speedHint,
         usesCpuOffload,
+        fitQuality,
+        contextUsed,
+        reason: this.reasonFor(entry, fitClass, fitQuality, contextUsed),
         tested: testedRow
           ? { tokPerSec: testedRow.tokPerSec, testedAt: testedRow.testedAt, hardwareFingerprint: hardware.fingerprint }
           : undefined,
       });
     }
 
+    const fitRank: Record<Recommendation['fitClass'], number> = { fits_gpu: 0, tight: 1, partial_offload: 2, no_fit: 3 };
     results.sort((a, b) => {
-      if (goal === 'speed') return a.catalogEntry.sizeBytes - b.catalogEntry.sizeBytes;
+      const byFit = fitRank[a.fitClass] - fitRank[b.fitClass];
+      if (byFit !== 0) return byFit;
+      if (goal === 'speed') {
+        if (a.tested && b.tested && a.tested.tokPerSec !== b.tested.tokPerSec) return b.tested.tokPerSec - a.tested.tokPerSec;
+        return a.catalogEntry.sizeBytes - b.catalogEntry.sizeBytes || (b.contextUsed ?? b.catalogEntry.contextMax) - (a.contextUsed ?? a.catalogEntry.contextMax);
+      }
+      // Un `partial_offload` estimado no confirma que el SO pueda reservar en ese instante todos los
+      // pesos, KV y buffers calculados. Dentro de esa clase conviene dejar margen y elegir primero el
+      // modelo menor. Una medición real de compatibilidad sigue teniendo prioridad sobre la fórmula.
+      if (a.fitClass === 'partial_offload' && b.fitClass === 'partial_offload') {
+        if (a.fitQuality !== b.fitQuality) return a.fitQuality === 'measured' ? -1 : 1;
+        if (a.fitQuality === 'estimated') {
+          return a.catalogEntry.sizeBytes - b.catalogEntry.sizeBytes
+            || (b.contextUsed ?? b.catalogEntry.contextMax) - (a.contextUsed ?? a.catalogEntry.contextMax);
+        }
+      }
       // goal === 'quality': el catálogo de este MVP no trae un `quality_score` curado explícito
       // (doc 13 §8 punto 3 lo permite como fallback); se usa el tamaño de pesos como proxy documentado
       // — mayor tamaño primero — hasta que Benchmark (v0.3) aporte `model_compat.quality_score` real.
-      return b.catalogEntry.sizeBytes - a.catalogEntry.sizeBytes;
+      return b.catalogEntry.sizeBytes - a.catalogEntry.sizeBytes || (b.contextUsed ?? b.catalogEntry.contextMax) - (a.contextUsed ?? a.catalogEntry.contextMax);
     });
     return results;
   }
 
-  private estimateFitClass(entry: ModelCatalogEntry, vramAvailable: number): Recommendation['fitClass'] {
-    if (vramAvailable <= 0) return 'no_fit';
-    const needed = estimatedTotalBytes(entry.sizeBytes);
+  private estimateFitClass(entry: ModelCatalogEntry, vramAvailable: number, ramAvailable: number, integrated: boolean): Recommendation['fitClass'] {
+    const needed = estimatedTotalBytes(entry.sizeBytes, entry.contextMax);
+    const combinedAvailable = integrated ? ramAvailable : vramAvailable + ramAvailable;
     if (needed <= vramAvailable) return 'fits_gpu';
-    if (needed <= vramAvailable * 1.05) return 'tight';
-    if (entry.sizeBytes <= vramAvailable) return 'partial_offload';
+    if (needed <= vramAvailable * 1.05 && needed <= combinedAvailable) return 'tight';
+    if (needed <= combinedAvailable) return 'partial_offload';
     return 'no_fit';
+  }
+
+  private reasonFor(entry: ModelCatalogEntry, fitClass: Recommendation['fitClass'], quality: 'measured' | 'estimated', contextUsed: number): string {
+    const evidence = quality === 'measured' ? 'Carga confirmada' : 'Estimación de memoria';
+    const context = `${Math.round(contextUsed / 1024)}k de contexto`;
+    const tools = entry.capabilities.tools ? 'Compatible con herramientas.' : 'Sin soporte de herramientas.';
+    if (fitClass === 'fits_gpu') return `${tools} ${evidence} para ${context}: entra en GPU.`;
+    if (fitClass === 'tight') return `${tools} ${evidence} para ${context}: entra justo en GPU.`;
+    if (fitClass === 'partial_offload') {
+      const margin = quality === 'estimated'
+        ? ' Entre alternativas con offload estimado se priorizan modelos más chicos para dejar margen de memoria.'
+        : '';
+      return `${tools} ${evidence} para ${context}: requiere offload a RAM/CPU y puede responder más lento.${margin}`;
+    }
+    return `${tools} ${evidence} para ${context}: la memoria disponible no alcanza.`;
   }
 }

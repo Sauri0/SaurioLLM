@@ -22,12 +22,14 @@ import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, createWriteStream, type WriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { execFileHidden } from '../process/spawnHidden.js';
 
 export interface EnsureRunningResult {
   running: boolean;
   startedByApp: boolean;
   /** Código estable para que la UI decida el copy, no un mensaje para mostrar directo:
-   *  'ollama_not_installed' | 'timeout_starting' | texto crudo de un error de SO al spawnear. */
+   *  'ollama_not_installed' | 'external_unavailable' | 'timeout_starting' | texto crudo de un
+   *  error de SO al spawnear. */
   error?: string;
 }
 
@@ -41,10 +43,17 @@ const ATTACH_LOG_RELATIVE_PATH = ['Ollama', 'server.log'];
 
 export interface OllamaProcessManagerOptions {
   baseUrl?: string;
+  /** En modo administrado no se busca ni se ejecuta el Ollama global del usuario. */
+  binaryPath?: () => string | undefined;
+  processEnv?: NodeJS.ProcessEnv;
+  /** Sólo comprueba el endpoint configurado. Nunca busca ni arranca un proceso local. */
+  attachOnly?: boolean;
   /** Inyectable para tests: evita spawnear un proceso real. */
   spawnFn?: typeof spawn;
   /** Inyectable para tests: evita depender de que `ollama` esté instalado en la máquina que corre vitest. */
   execFileFn?: typeof execFile;
+  /** Inyectable para probar la terminación del árbol sin ejecutar `taskkill` real. */
+  execFileHiddenFn?: typeof execFileHidden;
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   /** `hostAdapter.paths.logsDir` (userData/logs) — si se provee, el stdout/stderr del `ollama serve`
@@ -55,17 +64,35 @@ export interface OllamaProcessManagerOptions {
   createLogStream?: (path: string) => WriteStream;
   /** Inyectable para tests: reemplaza `fs/promises.readFile`. */
   readFileFn?: typeof readFile;
+  /** Inyectables para tests del ciclo de vida; producción conserva los tiempos documentados. */
+  startTimeoutMs?: number;
+  pollIntervalMs?: number;
+  stopTimeoutMs?: number;
+}
+
+export interface OllamaProcessConfiguration {
+  baseUrl: string;
+  binaryPath?: () => string | undefined;
+  processEnv?: NodeJS.ProcessEnv;
+  attachOnly?: boolean;
 }
 
 export class OllamaProcessManager {
-  private readonly baseUrl: string;
+  private baseUrl: string;
+  private binaryPath?: () => string | undefined;
+  private processEnv?: NodeJS.ProcessEnv;
+  private attachOnly: boolean;
   private readonly spawnFn: typeof spawn;
   private readonly execFileFn: typeof execFile;
+  private readonly execFileHiddenFn: typeof execFileHidden;
   private readonly platform: NodeJS.Platform;
   private readonly env: NodeJS.ProcessEnv;
   private readonly logsDir: string | undefined;
   private readonly createLogStream: (path: string) => WriteStream;
   private readonly readFileFn: typeof readFile;
+  private readonly startTimeoutMs: number;
+  private readonly pollIntervalMs: number;
+  private readonly stopTimeoutMs: number;
   /** Coalesce: si `ensureRunning()` se llama varias veces en paralelo (arranque de la app + el
    *  usuario clickeando "Iniciar Ollama" a la vez), todas esperan la misma corrida en vez de
    *  spawnear dos procesos `ollama serve` a la vez. */
@@ -73,17 +100,37 @@ export class OllamaProcessManager {
   /** Solo se completa cuando ESTA clase arrancó el proceso — nunca el PID de una instancia ajena
    *  (ver `stop()`, punto 4 del encargo: "detené SOLO el Ollama que la app inició"). */
   private child: ChildProcess | undefined;
+  private stopInFlight: { child: ChildProcess; promise: Promise<boolean> } | undefined;
   private ownLogPath: string | undefined;
+  private childLogCleanup: (() => void) | undefined;
 
   constructor(opts: OllamaProcessManagerOptions = {}) {
     this.baseUrl = opts.baseUrl ?? DEFAULT_BASE_URL;
+    this.binaryPath = opts.binaryPath;
+    this.processEnv = opts.processEnv;
+    this.attachOnly = opts.attachOnly ?? false;
     this.spawnFn = opts.spawnFn ?? spawn;
     this.execFileFn = opts.execFileFn ?? execFile;
+    this.execFileHiddenFn = opts.execFileHiddenFn ?? execFileHidden;
     this.platform = opts.platform ?? process.platform;
     this.env = opts.env ?? process.env;
     this.logsDir = opts.logsDir;
     this.createLogStream = opts.createLogStream ?? ((p) => createWriteStream(p, { flags: 'a' }));
     this.readFileFn = opts.readFileFn ?? readFile;
+    this.startTimeoutMs = opts.startTimeoutMs ?? START_TIMEOUT_MS;
+    this.pollIntervalMs = opts.pollIntervalMs ?? POLL_INTERVAL_MS;
+    this.stopTimeoutMs = opts.stopTimeoutMs ?? 5000;
+  }
+
+  /** Snapshot reversible de la configuración activa. Las funciones y el entorno se conservan por
+   *  referencia para que el coordinador pueda restaurarlos si falla un cambio de motor. */
+  configuration(): OllamaProcessConfiguration {
+    return {
+      baseUrl: this.baseUrl,
+      binaryPath: this.binaryPath,
+      processEnv: this.processEnv,
+      attachOnly: this.attachOnly,
+    };
   }
 
   /** `true` si `GET /api/version` responde 2xx dentro de `timeoutMs` — mismo endpoint que
@@ -109,6 +156,7 @@ export class OllamaProcessManager {
    *  si no se encuentra en ninguno de los dos lugares — la UI lo lleva al asistente de instalación
    *  (OnboardingWizard, ya existente), nunca instala nada acá. */
   async resolveBinaryPath(): Promise<string | undefined> {
+    if (this.binaryPath) return this.binaryPath();
     if (await this.resolveOnPath()) return 'ollama';
     if (this.platform === 'win32') {
       const localAppData = this.env['LOCALAPPDATA'];
@@ -137,6 +185,10 @@ export class OllamaProcessManager {
   private async doEnsureRunning(): Promise<EnsureRunningResult> {
     if (await this.checkHealth()) return { running: true, startedByApp: false };
 
+    if (this.attachOnly) {
+      return { running: false, startedByApp: false, error: 'external_unavailable' };
+    }
+
     const binary = await this.resolveBinaryPath();
     if (!binary) return { running: false, startedByApp: false, error: 'ollama_not_installed' };
 
@@ -156,14 +208,28 @@ export class OllamaProcessManager {
         }
       }
 
-      const child = this.spawnFn(binary, ['serve'], {
-        detached: true,
-        windowsHide: true,
-        stdio: logStream ? ['ignore', 'pipe', 'pipe'] : 'ignore',
-      });
+      let child: ChildProcess;
+      try {
+        child = this.spawnFn(binary, ['serve'], {
+          detached: true,
+          windowsHide: true,
+          env: this.processEnv ?? this.env,
+          stdio: logStream ? ['ignore', 'pipe', 'pipe'] : 'ignore',
+        });
+      } catch (err) {
+        if (logStream) this.endLogStream(logStream);
+        throw err;
+      }
       if (logStream) {
-        child.stdout?.on('data', (chunk: Buffer) => logStream.write(chunk));
-        child.stderr?.on('data', (chunk: Buffer) => logStream.write(chunk));
+        const onStdout = (chunk: Buffer) => logStream.write(chunk);
+        const onStderr = (chunk: Buffer) => logStream.write(chunk);
+        child.stdout?.on('data', onStdout);
+        child.stderr?.on('data', onStderr);
+        this.childLogCleanup = () => {
+          child.stdout?.off('data', onStdout);
+          child.stderr?.off('data', onStderr);
+          this.endLogStream(logStream);
+        };
         this.ownLogPath = logPath;
       }
       // Guardamos la referencia SOLO porque nosotros lo arrancamos — `stop()` la usa para detener
@@ -174,17 +240,102 @@ export class OllamaProcessManager {
       this.child = child;
       child.unref();
       child.on('error', () => { /* superficie por el timeout de abajo (health nunca pasa) */ });
-      child.on('exit', () => { this.child = undefined; });
+      child.on('exit', () => {
+        if (this.child === child) {
+          this.child = undefined;
+          this.closeChildLog();
+        }
+      });
     } catch (err) {
       return { running: false, startedByApp: false, error: err instanceof Error ? err.message : String(err) };
     }
 
-    const deadline = Date.now() + START_TIMEOUT_MS;
+    const deadline = Date.now() + this.startTimeoutMs;
     while (Date.now() < deadline) {
       if (await this.checkHealth(1000)) return { running: true, startedByApp: true };
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs));
     }
+    const timedOutChild = this.child;
+    if (timedOutChild) await this.stopOwnedChildAndWait(timedOutChild);
     return { running: false, startedByApp: true, error: 'timeout_starting' };
+  }
+
+  private endLogStream(stream: WriteStream): void {
+    const maybeEnd = (stream as WriteStream & { end?: () => void }).end;
+    if (typeof maybeEnd === 'function') maybeEnd.call(stream);
+  }
+
+  private closeChildLog(): void {
+    const cleanup = this.childLogCleanup;
+    this.childLogCleanup = undefined;
+    cleanup?.();
+  }
+
+  private stopOwnedChildAndWait(child: ChildProcess): Promise<boolean> {
+    if (this.stopInFlight?.child === child) return this.stopInFlight.promise;
+    const promise = this.doStopOwnedChildAndWait(child).finally(() => {
+      if (this.stopInFlight?.child === child) this.stopInFlight = undefined;
+    });
+    this.stopInFlight = { child, promise };
+    return promise;
+  }
+
+  private async doStopOwnedChildAndWait(child: ChildProcess): Promise<boolean> {
+    if (this.child !== child) return true;
+    if (child.exitCode !== null && child.exitCode !== undefined) {
+      this.child = undefined;
+      this.closeChildLog();
+      return true;
+    }
+    let timeout: NodeJS.Timeout | undefined;
+    let onExit: (() => void) | undefined;
+    const exited = new Promise<boolean>((resolve) => {
+      onExit = () => {
+        if (timeout) clearTimeout(timeout);
+        resolve(true);
+      };
+      child.once('exit', onExit);
+      timeout = setTimeout(() => resolve(false), this.stopTimeoutMs);
+    });
+    // El proceso puede salir naturalmente entre el chequeo de `exitCode` y la instalación del
+    // listener. En ese caso no invocamos taskkill ni fabricamos un error de cierre.
+    if (child.exitCode !== null && child.exitCode !== undefined) onExit?.();
+    this.closeChildLog();
+    let terminationError: unknown;
+    try {
+      if (child.exitCode === null || child.exitCode === undefined) {
+        if (this.platform === 'win32') {
+          const pid = child.pid;
+          if (!Number.isSafeInteger(pid) || (pid ?? 0) <= 0) {
+            throw new Error('El proceso propio de Ollama no informó un PID válido.');
+          }
+          // `/T` incluye únicamente los descendientes del PID que esta instancia spawneó. No se
+          // enumera por nombre, puerto ni ejecutable, así que una instalación ajena queda intacta.
+          await this.execFileHiddenFn(
+            'taskkill.exe',
+            ['/PID', String(pid), '/T', '/F'],
+            { timeout: this.stopTimeoutMs },
+          );
+        } else {
+          child.kill();
+        }
+      }
+    } catch (err) {
+      terminationError = err;
+    }
+    const didExit = await exited;
+    if (onExit) child.off('exit', onExit);
+    if (timeout) clearTimeout(timeout);
+    if (didExit || (child.exitCode !== null && child.exitCode !== undefined)) {
+      if (this.child === child) this.child = undefined;
+      return true;
+    }
+    console.warn(
+      '[OllamaProcessManager] no se pudo detener el árbol de ollama serve que arrancó esta app',
+      terminationError ?? new Error(`El proceso no terminó en ${this.stopTimeoutMs} ms.`),
+    );
+    // Se conserva la referencia: configure()/stop() pueden reintentar exactamente este árbol.
+    return false;
   }
 
   /** Tarea "carga de modelo/oom_load" punto 4: detiene SOLO el proceso que ESTA clase arrancó. Si
@@ -193,14 +344,31 @@ export class OllamaProcessManager {
    *  cumpliendo "nunca matar instancias ajenas" tal como documentaba la versión anterior de este
    *  archivo, ahora de forma explícita en vez de "no guardar el PID de nadie". Se llama desde
    *  `app.on('before-quit', ...)` en `main/index.ts`. */
-  stop(): void {
+  async stop(): Promise<void> {
     if (!this.child) return;
-    try {
-      this.child.kill();
-    } catch (err) {
-      console.warn('[OllamaProcessManager] no se pudo detener el ollama serve que arrancó esta app', err);
+    const child = this.child;
+    if (!(await this.stopOwnedChildAndWait(child))) {
+      throw new Error('El motor local todavía está cerrando. Reintentá en unos segundos.');
     }
-    this.child = undefined;
+  }
+
+  /** El llamador comprueba que no hay runs/descargas antes de cambiar de motor. */
+  async configure(
+    baseUrl: string,
+    binaryPath?: () => string | undefined,
+    processEnv?: NodeJS.ProcessEnv,
+    attachOnly = false,
+  ): Promise<void> {
+    if (this.inFlight) throw new Error('Esperá a que termine el arranque del motor antes de cambiarlo.');
+    const previous = this.child;
+    if (previous && !(await this.stopOwnedChildAndWait(previous))) {
+      throw new Error('El motor anterior todavía está cerrando. Reintentá en unos segundos.');
+    }
+    this.ownLogPath = undefined;
+    this.baseUrl = baseUrl;
+    this.binaryPath = binaryPath;
+    this.processEnv = processEnv;
+    this.attachOnly = attachOnly;
   }
 
   /** Tarea "carga de modelo/oom_load" punto 4: la línea real `msg="inference compute"` que

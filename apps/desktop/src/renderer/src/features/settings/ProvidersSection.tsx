@@ -8,7 +8,10 @@ import type { NonLocalCallAuditEntry, ProviderConfig, ProviderPreset } from '@sa
 import { invoke } from '../../ipc/client.js';
 import { useProvidersStore } from '../../stores/providersStore.js';
 import { localityLabel } from '../models/locality.js';
+import { ProviderUsage } from './ProviderUsage.js';
+import { filterAuditLog, paginateAuditLog } from './auditLogFilters.js';
 import './settings.css';
+import './providersCost.css';
 
 const PRESET_LABEL: Record<ProviderPreset, string> = {
   ollama: 'Ollama (attach)', openai: 'OpenAI', openrouter: 'OpenRouter', anthropic: 'Anthropic', custom: 'OpenAI-compatible personalizado',
@@ -84,13 +87,13 @@ function AddProviderForm(): React.JSX.Element {
             Clave de API
             <input
               type="password" value={apiKey} onChange={(ev) => setApiKey(ev.target.value)}
-              placeholder="Se guarda cifrada (Electron safeStorage); nunca se muestra de nuevo"
+              placeholder="Pegar clave…"
               autoComplete="off"
             />
           </label>
         )}
       </div>
-      {error && <div className="saurio-banner danger">{error}</div>}
+      {error && <div className="saurio-banner danger" role="alert">No se pudo guardar el proveedor: {error}</div>}
       <button type="submit" disabled={saving}>{saving ? 'Agregando…' : 'Agregar proveedor'}</button>
     </form>
   );
@@ -160,12 +163,16 @@ function ProviderRow({ provider }: { provider: ProviderConfig }): React.JSX.Elem
       {result && (
         result.ok
           ? (
-            <div className="saurio-banner success">
-              Conectado{result.version ? ` (versión ${result.version})` : ''}
+            <div className="saurio-banner success" role="status">
+              Conexión confirmada con {provider.baseUrl}{result.version ? ` (versión ${result.version})` : ''}
               {result.modelNames && ` — ${result.modelNames.length} modelo(s): ${result.modelNames.slice(0, 5).join(', ')}${result.modelNames.length > 5 ? '…' : ''}`}
             </div>
           )
-          : <div className="saurio-banner danger">No se pudo conectar: {result.error}</div>
+          : (
+            <div className="saurio-banner danger" role="alert">
+              No se pudo conectar con {provider.baseUrl}. Revisá la URL, la red y la clave. Detalle: {result.error}
+            </div>
+          )
       )}
 
       <div className="saurio-providers-row__key-edit">
@@ -180,16 +187,15 @@ function ProviderRow({ provider }: { provider: ProviderConfig }): React.JSX.Elem
   );
 }
 
-/** Punto 4 del encargo ("visor simple del audit_log de llamadas no locales en Ajustes >
- *  Proveedores"): solo lectura, sin filtros ni paginación — `providers:auditLog` (canal nuevo de
- *  esta tarea) ya trae los últimos 200 registros más recientes primero
- *  (`SqlAuditLogRepository.listNonLocalCalls`, existía y estaba probado desde la sesión anterior,
- *  doc 16 §10.9: "listo para un canal futuro si hace falta"). Nunca muestra la clave del proveedor
- *  (el `audit_log` tampoco la guarda, ver `SqlAuditLogRepository.recordNonLocalCall`). */
 function NonLocalCallAuditLog(): React.JSX.Element {
   const [entries, setEntries] = useState<NonLocalCallAuditEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [providerId, setProviderId] = useState('');
+  const [since, setSince] = useState('');
+  const [until, setUntil] = useState('');
+  const [page, setPage] = useState(0);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -207,6 +213,24 @@ function NonLocalCallAuditLog(): React.JSX.Element {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    setPage(0);
+  }, [query, providerId, since, until]);
+
+  const sinceTimestamp = since ? Date.parse(`${since}T00:00:00`) : undefined;
+  const untilTimestamp = until ? Date.parse(`${until}T23:59:59.999`) : undefined;
+  const filteredEntries = filterAuditLog(entries, { query, providerId, since: sinceTimestamp, until: untilTimestamp });
+  const pageData = paginateAuditLog(filteredEntries, page, 20);
+  const providerIds = [...new Set(entries.map((entry) => entry.providerId))].sort();
+
+  function clearFilters(): void {
+    setQuery('');
+    setProviderId('');
+    setSince('');
+    setUntil('');
+    setPage(0);
+  }
+
   return (
     <section className="saurio-providers-audit">
       <div className="saurio-row__header">
@@ -215,13 +239,31 @@ function NonLocalCallAuditLog(): React.JSX.Element {
           {loading ? 'Actualizando…' : 'Actualizar'}
         </button>
       </div>
-      {error && <div className="saurio-banner danger">{error}</div>}
+      <p className="saurio-row__line--muted">Últimos 200 registros disponibles; este registro no es una factura total.</p>
+      <div className="saurio-providers-audit__filters" aria-label="Filtros del registro de llamadas">
+        <label>Buscar modelo o run<input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="qwen, run…" /></label>
+        <label>Proveedor
+          <select value={providerId} onChange={(event) => setProviderId(event.target.value)}>
+            <option value="">Todos</option>
+            {providerIds.map((id) => <option key={id} value={id}>{id}</option>)}
+          </select>
+        </label>
+        <label>Desde<input type="date" value={since} onChange={(event) => setSince(event.target.value)} /></label>
+        <label>Hasta<input type="date" value={until} onChange={(event) => setUntil(event.target.value)} /></label>
+        <button type="button" className="saurio-btn-ghost" onClick={clearFilters}>Limpiar</button>
+      </div>
+      {error && <div className="saurio-banner danger" role="alert">No se pudo cargar el registro de llamadas: {error}</div>}
+      {loading && <p className="saurio-text-dim" role="status">Cargando registro de llamadas…</p>}
       {!loading && entries.length === 0 && !error && (
         <p className="saurio-empty">Sin llamadas registradas a proveedores fuera de esta PC todavía.</p>
       )}
-      {entries.length > 0 && (
+      {entries.length > 0 && filteredEntries.length === 0 && !loading && !error && (
+        <p className="saurio-empty">No hay registros que coincidan con los filtros.</p>
+      )}
+      {pageData.total > 0 && (
         <div className="saurio-row-list saurio-providers-audit__list">
-          {entries.map((entry) => (
+          <p className="saurio-row__line--muted">{pageData.total} registro{pageData.total === 1 ? '' : 's'} encontrado{pageData.total === 1 ? '' : 's'}</p>
+          {pageData.items.map((entry) => (
             <div key={entry.id} className="saurio-row saurio-providers-audit__row">
               <span className="saurio-mono saurio-providers-audit__ts">{new Date(entry.ts).toLocaleString('es-AR')}</span>
               <span className={`saurio-badge ${entry.locality}`}>{localityLabel(entry.locality)}</span>
@@ -230,6 +272,13 @@ function NonLocalCallAuditLog(): React.JSX.Element {
               <span className="saurio-row__line--muted saurio-mono">run {entry.runId}</span>
             </div>
           ))}
+          {pageData.pageCount > 1 && (
+            <div className="saurio-providers-audit__pagination">
+              <button type="button" disabled={pageData.page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>Anterior</button>
+              <span>Página {pageData.page + 1} de {pageData.pageCount}</span>
+              <button type="button" disabled={pageData.page >= pageData.pageCount - 1} onClick={() => setPage((value) => value + 1)}>Siguiente</button>
+            </div>
+          )}
         </div>
       )}
     </section>
@@ -249,6 +298,9 @@ export function ProvidersSection(): React.JSX.Element {
   return (
     <div>
       {error && <div className="saurio-banner danger">{error}</div>}
+      <p className="providers-cost-note">
+        OpenRouter puede informar el costo por respuesta. Es un total reportado por la API, no una factura final: créditos, descuentos, impuestos o ajustes posteriores pueden diferir.
+      </p>
       <AddProviderForm />
       {loading && providers.length === 0 ? (
         <p className="saurio-empty">Cargando proveedores…</p>
@@ -261,6 +313,7 @@ export function ProvidersSection(): React.JSX.Element {
           {providers.map((provider) => <ProviderRow key={provider.id} provider={provider} />)}
         </div>
       )}
+      <ProviderUsage />
       <NonLocalCallAuditLog />
     </div>
   );

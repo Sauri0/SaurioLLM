@@ -3,7 +3,7 @@
 // tool call de categoría `delegate` (ChatMessageList, en vez de la ToolCallCard genérica): muestra el
 // destino (agente existente o "worker temporal"), la tarea pedida y — cuando el run hijo termina —
 // el resultado estructurado con un link "ver conversación completa".
-import type { ToolCallRecord } from '@saurio/shared';
+import type { RunState, ToolCallRecord } from '@saurio/shared';
 import { UserIcon } from '../../ui/icons.js';
 import './chat.css';
 
@@ -42,18 +42,25 @@ const STATUS_LABEL: Record<string, string> = { completed: 'Completado', failed: 
 
 export interface DelegationCardProps {
   call: ToolCallRecord;
-  /** Doc 19 §2.6: resuelto por el caller a partir de `runStore.childChatIdByRun` (evento
-   *  `run.delegated`) — `undefined` mientras el evento todavía no llegó o no se pudo correlacionar
-   *  con esta tool call puntual (limitación conocida: un run con más de una delegación correlaciona
-   *  por orden de aparición, no por `toolCallId`, porque `run.delegated` no lo lleva). */
+  /** Resuelto por toolCallId para eventos nuevos; replays legacy conservan fallback por orden. */
   childChatId?: string;
+  childRunId?: string;
+  childRunState?: RunState;
+  stopping?: boolean;
+  stopError?: string;
+  onStopChild?: (parentRunId: string, childRunId: string) => void;
   onOpenChat?: (chatId: string) => void;
 }
 
-export function DelegationCard({ call, childChatId, onOpenChat }: DelegationCardProps): React.JSX.Element {
+const TERMINAL_RUN_STATES = new Set<RunState>(['completed', 'cancelled', 'failed', 'interrupted']);
+
+export function DelegationCard({
+  call, childChatId, childRunId, childRunState, stopping = false, stopError, onStopChild, onOpenChat,
+}: DelegationCardProps): React.JSX.Element {
   const args = parseArgs(call.args);
   const result = call.status === 'done' || call.status === 'failed' ? parseResult(call.resultPreview) : undefined;
   const targetLabel = args.targetAgentId ? args.targetAgentId : 'worker temporal';
+  const childActive = childRunState !== undefined && !TERMINAL_RUN_STATES.has(childRunState);
 
   return (
     <div className={`delegation-card status-${call.status}`}>
@@ -63,6 +70,17 @@ export function DelegationCard({ call, childChatId, onOpenChat }: DelegationCard
       </div>
       {args.task && <p className="delegation-card__task"><strong>Tarea:</strong> {args.task}</p>}
       {args.expectedDeliverable && <p className="delegation-card__deliverable"><strong>Entregable esperado:</strong> {args.expectedDeliverable}</p>}
+      {childRunId && childActive && onStopChild && (
+        <button
+          type="button"
+          className="saurio-btn-ghost delegation-card__stop"
+          disabled={stopping}
+          onClick={() => onStopChild(call.runId, childRunId)}
+        >
+          {stopping ? 'Deteniendo…' : 'Detener worker'}
+        </button>
+      )}
+      {stopError && <p className="saurio-text-dim delegation-card__error" role="alert">No se pudo detener: {stopError}</p>}
       {result ? (
         <div className={`delegation-card__result delegation-card__result--${result.status ?? 'unknown'}`}>
           <span className="delegation-card__result-status">{STATUS_LABEL[result.status ?? ''] ?? 'Resultado'}</span>

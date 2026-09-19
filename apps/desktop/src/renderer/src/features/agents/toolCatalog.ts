@@ -9,7 +9,7 @@ export interface ToolCatalogEntry {
   label: string;
 }
 
-/** Las 10 builtins del MVP (doc 04 §4 BuiltinToolName), en el mismo orden que
+/** Las builtins del runtime, en el mismo orden que
  *  `DEFAULT_ALLOWED_TOOLS`. */
 export const BUILTIN_TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'list_files', label: 'Listar archivos' },
@@ -18,6 +18,7 @@ export const BUILTIN_TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'read_output', label: 'Leer salida de comandos' },
   { name: 'edit_file', label: 'Editar archivos' },
   { name: 'write_file', label: 'Crear/sobreescribir archivos' },
+  { name: 'make_dir', label: 'Crear carpetas' },
   { name: 'delete_file', label: 'Borrar archivos' },
   { name: 'run_command', label: 'Ejecutar comandos de terminal' },
   { name: 'task_update', label: 'Actualizar checklist de tareas' },

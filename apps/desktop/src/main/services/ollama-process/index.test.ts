@@ -84,17 +84,132 @@ describe('OllamaProcessManager', () => {
 
   // Tarea "carga de modelo/oom_load" punto 4: captura de stdout/stderr + stop() + lectura de
   // "inference compute" (log propio y modo attach).
-  function makeFakeChild(): EventEmitter & { unref: () => void; kill: () => void; stdout: EventEmitter; stderr: EventEmitter; pid: number } {
+  function makeFakeChild(): EventEmitter & {
+    unref: () => void;
+    kill: () => boolean;
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    pid: number;
+    exitCode: number | null;
+  } {
     const child = new EventEmitter() as EventEmitter & {
-      unref: () => void; kill: () => void; stdout: EventEmitter; stderr: EventEmitter; pid: number;
+      unref: () => void;
+      kill: () => boolean;
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      pid: number;
+      exitCode: number | null;
     };
     child.unref = vi.fn();
-    child.kill = vi.fn();
+    child.exitCode = null;
+    child.kill = vi.fn(() => {
+      child.exitCode = 0;
+      child.emit('exit', 0);
+      return true;
+    });
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.pid = 4242;
     return child;
   }
+
+  function makeTreeKiller(child: ReturnType<typeof makeFakeChild>) {
+    return vi.fn(async () => {
+      child.exitCode = 0;
+      child.emit('exit', 0);
+      return { stdout: '', stderr: '' };
+    });
+  }
+
+  it('attachOnly comprueba el endpoint configurado sin buscar ni arrancar un binario local', async () => {
+    global.fetch = fakeFetchSequence(['throw']);
+    const execFileFn = vi.fn();
+    const spawnFn = vi.fn();
+    const manager = new OllamaProcessManager({
+      baseUrl: 'http://127.0.0.1:22434',
+      attachOnly: true,
+      execFileFn: execFileFn as never,
+      spawnFn: spawnFn as never,
+    });
+
+    await expect(manager.ensureRunning()).resolves.toEqual({
+      running: false,
+      startedByApp: false,
+      error: 'external_unavailable',
+    });
+    expect(execFileFn).not.toHaveBeenCalled();
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+
+  it('configuration() permite restaurar baseUrl, binario, entorno y attachOnly sin perder referencias', async () => {
+    const binaryPath = () => 'C:\\managed\\ollama.exe';
+    const processEnv = { OLLAMA_MODELS: 'C:\\managed\\models' };
+    const manager = new OllamaProcessManager({
+      baseUrl: 'http://127.0.0.1:22434', binaryPath, processEnv, attachOnly: true,
+    });
+
+    expect(manager.configuration()).toEqual({
+      baseUrl: 'http://127.0.0.1:22434', binaryPath, processEnv, attachOnly: true,
+    });
+
+    await manager.configure('http://127.0.0.1:33434', undefined, undefined, false);
+    expect(manager.configuration()).toEqual({
+      baseUrl: 'http://127.0.0.1:33434',
+      binaryPath: undefined,
+      processEnv: undefined,
+      attachOnly: false,
+    });
+  });
+
+  it('si vence el arranque, mata el child propio, espera su salida y cierra el log', async () => {
+    global.fetch = fakeFetchSequence(['throw']);
+    const execFileFn = vi.fn((_cmd, _args, _opts, cb: (err: Error | null) => void) => cb(null));
+    const child = makeFakeChild();
+    const execFileHiddenFn = makeTreeKiller(child);
+    const end = vi.fn();
+    const manager = new OllamaProcessManager({
+      execFileFn: execFileFn as never,
+      spawnFn: vi.fn(() => child) as never,
+      logsDir: 'C:\\fake\\logs',
+      createLogStream: vi.fn(() => ({ write: () => true, end }) as never),
+      startTimeoutMs: 1,
+      pollIntervalMs: 1,
+      stopTimeoutMs: 20,
+      platform: 'win32',
+      execFileHiddenFn,
+    });
+
+    const result = await manager.ensureRunning();
+
+    expect(result).toEqual({ running: false, startedByApp: true, error: 'timeout_starting' });
+    expect(execFileHiddenFn).toHaveBeenCalledWith(
+      'taskkill.exe',
+      ['/PID', '4242', '/T', '/F'],
+      { timeout: 20 },
+    );
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(child.exitCode).toBe(0);
+    expect(end).toHaveBeenCalledTimes(1);
+  });
+
+  it('cierra el log si el spawn falla antes de entregar un child', async () => {
+    global.fetch = fakeFetchSequence(['throw']);
+    const execFileFn = vi.fn((_cmd, _args, _opts, cb: (err: Error | null) => void) => cb(null));
+    const end = vi.fn();
+    const manager = new OllamaProcessManager({
+      execFileFn: execFileFn as never,
+      spawnFn: vi.fn(() => { throw new Error('spawn EACCES'); }) as never,
+      logsDir: 'C:\\fake\\logs',
+      createLogStream: vi.fn(() => ({ write: () => true, end }) as never),
+    });
+
+    await expect(manager.ensureRunning()).resolves.toEqual({
+      running: false,
+      startedByApp: false,
+      error: 'spawn EACCES',
+    });
+    expect(end).toHaveBeenCalledTimes(1);
+  });
 
   it('con logsDir configurado, captura stdout/stderr en ollama-serve.log (append)', async () => {
     global.fetch = fakeFetchSequence(['throw', true]);
@@ -125,23 +240,127 @@ describe('OllamaProcessManager', () => {
   it('stop() detiene SOLO el proceso que esta clase arrancó, nunca una instancia ajena', async () => {
     global.fetch = fakeFetchSequence([true]); // ya responde -> nunca arranca nada
     const spawnFn = vi.fn();
-    const manager = new OllamaProcessManager({ spawnFn: spawnFn as never, execFileFn: vi.fn() as never });
+    const execFileHiddenFn = vi.fn();
+    const manager = new OllamaProcessManager({
+      spawnFn: spawnFn as never,
+      execFileFn: vi.fn() as never,
+      execFileHiddenFn: execFileHiddenFn as never,
+      platform: 'win32',
+    });
     await manager.ensureRunning();
 
-    manager.stop(); // no hay child propio -> no debe explotar ni intentar matar nada
+    await manager.stop(); // no hay child propio -> no debe explotar ni intentar matar nada
     expect(spawnFn).not.toHaveBeenCalled();
+    expect(execFileHiddenFn).not.toHaveBeenCalled();
   });
 
-  it('stop() mata el child real cuando esta clase sí lo arrancó', async () => {
+  it('stop() termina el árbol del PID propio en Windows y espera su salida', async () => {
     global.fetch = fakeFetchSequence(['throw', true]);
     const execFileFn = vi.fn((_cmd, _args, _opts, cb: (err: Error | null) => void) => cb(null));
     const child = makeFakeChild();
     const spawnFn = vi.fn(() => child);
-    const manager = new OllamaProcessManager({ execFileFn: execFileFn as never, spawnFn: spawnFn as never });
+    const execFileHiddenFn = makeTreeKiller(child);
+    const manager = new OllamaProcessManager({
+      execFileFn: execFileFn as never,
+      execFileHiddenFn,
+      spawnFn: spawnFn as never,
+      platform: 'win32',
+      stopTimeoutMs: 20,
+    });
     await manager.ensureRunning();
 
-    manager.stop();
-    expect(child.kill).toHaveBeenCalledTimes(1);
+    await manager.stop();
+
+    expect(execFileHiddenFn).toHaveBeenCalledWith(
+      'taskkill.exe',
+      ['/PID', '4242', '/T', '/F'],
+      { timeout: 20 },
+    );
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it('stop() deduplica pedidos simultáneos sobre el mismo árbol propio', async () => {
+    global.fetch = fakeFetchSequence(['throw', true]);
+    const execFileFn = vi.fn((_cmd, _args, _opts, cb: (err: Error | null) => void) => cb(null));
+    const child = makeFakeChild();
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const execFileHiddenFn = vi.fn(async () => {
+      await waiting;
+      child.exitCode = 0;
+      child.emit('exit', 0);
+      return { stdout: '', stderr: '' };
+    });
+    const manager = new OllamaProcessManager({
+      execFileFn: execFileFn as never,
+      execFileHiddenFn,
+      spawnFn: vi.fn(() => child) as never,
+      platform: 'win32',
+      stopTimeoutMs: 50,
+    });
+    await manager.ensureRunning();
+
+    const first = manager.stop();
+    const second = manager.stop();
+    await vi.waitFor(() => expect(execFileHiddenFn).toHaveBeenCalledTimes(1));
+    release();
+
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+    expect(execFileHiddenFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('si vence el stop conserva el PID propio y permite reintentar exactamente ese árbol', async () => {
+    global.fetch = fakeFetchSequence(['throw', true]);
+    const execFileFn = vi.fn((_cmd, _args, _opts, cb: (err: Error | null) => void) => cb(null));
+    const child = makeFakeChild();
+    let attempt = 0;
+    const execFileHiddenFn = vi.fn(async (_command: string, _args: readonly string[] = []) => {
+      attempt += 1;
+      if (attempt === 2) {
+        child.exitCode = 0;
+        child.emit('exit', 0);
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const manager = new OllamaProcessManager({
+      execFileFn: execFileFn as never,
+      execFileHiddenFn,
+      spawnFn: vi.fn(() => child) as never,
+      platform: 'win32',
+      stopTimeoutMs: 5,
+    });
+    await manager.ensureRunning();
+
+    await expect(manager.stop()).rejects.toThrow('todavía está cerrando');
+    await expect(manager.stop()).resolves.toBeUndefined();
+
+    expect(execFileHiddenFn).toHaveBeenCalledTimes(2);
+    expect(execFileHiddenFn.mock.calls.map((call) => call[1])).toEqual([
+      ['/PID', '4242', '/T', '/F'],
+      ['/PID', '4242', '/T', '/F'],
+    ]);
+  });
+
+  it('una salida natural durante taskkill prevalece sobre su error de carrera', async () => {
+    global.fetch = fakeFetchSequence(['throw', true]);
+    const execFileFn = vi.fn((_cmd, _args, _opts, cb: (err: Error | null) => void) => cb(null));
+    const child = makeFakeChild();
+    const execFileHiddenFn = vi.fn(async () => {
+      child.exitCode = 0;
+      child.emit('exit', 0);
+      throw new Error('ERROR: no se encontró el proceso');
+    });
+    const manager = new OllamaProcessManager({
+      execFileFn: execFileFn as never,
+      execFileHiddenFn,
+      spawnFn: vi.fn(() => child) as never,
+      platform: 'win32',
+      stopTimeoutMs: 20,
+    });
+    await manager.ensureRunning();
+
+    await expect(manager.stop()).resolves.toBeUndefined();
+    expect(execFileHiddenFn).toHaveBeenCalledTimes(1);
   });
 
   it('readInferenceComputeLine lee el log propio primero (línea real de ollama serve)', async () => {
@@ -186,6 +405,41 @@ describe('OllamaProcessManager', () => {
     expect(readFileFn).toHaveBeenCalledWith(
       expect.stringContaining('Ollama\\server.log'), 'utf8',
     );
+  });
+
+  it('al pasar de proceso propio a attach descarta el log propio cerrado y lee la fuente externa', async () => {
+    global.fetch = fakeFetchSequence(['throw', true]);
+    const execFileFn = vi.fn((_cmd, _args, _opts, cb: (err: Error | null) => void) => cb(null));
+    const child = makeFakeChild();
+    const end = vi.fn();
+    const readFileFn = vi.fn(async (p: string) => {
+      if (p.includes('fake') && p.includes('ollama-serve.log')) {
+        return 'msg="inference compute" id=PROPIO total="8.0 GiB"\n';
+      }
+      if (p.includes('Ollama') && p.includes('server.log')) {
+        return 'msg="inference compute" id=EXTERNO total="12.0 GiB"\n';
+      }
+      throw new Error('ENOENT');
+    });
+    const manager = new OllamaProcessManager({
+      execFileFn: execFileFn as never,
+      execFileHiddenFn: makeTreeKiller(child),
+      spawnFn: vi.fn(() => child) as never,
+      platform: 'win32',
+      env: { LOCALAPPDATA: 'C:\\Users\\demo\\AppData\\Local' },
+      logsDir: 'C:\\fake\\logs',
+      createLogStream: vi.fn(() => ({ write: () => true, end }) as never),
+      readFileFn: readFileFn as never,
+      stopTimeoutMs: 20,
+    });
+    await manager.ensureRunning();
+    expect(await manager.readInferenceComputeLine()).toContain('id=PROPIO');
+
+    await manager.configure('http://127.0.0.1:22434', undefined, undefined, true);
+
+    expect(end).toHaveBeenCalledTimes(1);
+    expect(await manager.readInferenceComputeLine()).toContain('id=EXTERNO');
+    expect(readFileFn).toHaveBeenLastCalledWith(expect.stringContaining('Ollama\\server.log'), 'utf8');
   });
 
   it('readInferenceComputeLine devuelve undefined sin ninguna fuente disponible', async () => {

@@ -53,6 +53,37 @@ describe('HuggingFaceClient.listGgufFiles', () => {
     expect(f16.quant).toBe('f16');
   });
 
+  it('reconoce q8_0 minúscula del repo oficial Qwen sin cambiar su grafía', async () => {
+    const realQwenDetail = JSON.stringify({
+      id: 'Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF',
+      siblings: [{
+        rfilename: 'qwen2.5-coder-1.5b-instruct-q8_0.gguf',
+        size: 1_988_884_992,
+      }],
+    });
+    const client = new HuggingFaceClient({ fetchImpl: fakeFetch(realQwenDetail) });
+
+    const files = await client.listGgufFiles('Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF');
+
+    expect(files).toEqual([{
+      filename: 'qwen2.5-coder-1.5b-instruct-q8_0.gguf',
+      sizeBytes: 1_988_884_992,
+      quant: 'q8_0',
+    }]);
+  });
+
+  it('mantiene undefined para sufijos que no son una cuantización conocida', async () => {
+    const unknownDetail = JSON.stringify({
+      id: 'user/repo-GGUF',
+      siblings: [{ rfilename: 'modelo-experimental.gguf', size: 123 }],
+    });
+    const client = new HuggingFaceClient({ fetchImpl: fakeFetch(unknownDetail) });
+
+    const files = await client.listGgufFiles('user/repo-GGUF');
+
+    expect(files[0]).toEqual({ filename: 'modelo-experimental.gguf', sizeBytes: 123, quant: undefined });
+  });
+
   it('el fixture guardado no trae tamaño (sin ?blobs=true): sizeBytes queda undefined, nunca inventado', async () => {
     const client = new HuggingFaceClient({ fetchImpl: fakeFetch(detailFixture) });
     const files = await client.listGgufFiles('bartowski/Qwen2.5-Coder-7B-Instruct-GGUF');
@@ -83,5 +114,16 @@ describe('HuggingFaceClient.buildOllamaRef', () => {
     const client = new HuggingFaceClient();
     expect(client.buildOllamaRef('bartowski/Qwen2.5-Coder-7B-Instruct-GGUF', 'Q4_K_M'))
       .toBe('hf.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M');
+  });
+});
+
+describe('HuggingFaceClient — integridad de importación', () => {
+  it('conserva digest LFS publicado y tamaño para validar antes de importar', async () => {
+    const client = new HuggingFaceClient({ fetchImpl: fakeFetch(JSON.stringify({
+      id: 'user/repo', siblings: [{ rfilename: 'model-q8_0.gguf', lfs: { sha256: 'A'.repeat(64), size: 123 } }],
+    })) });
+    expect(await client.listGgufFiles('user/repo')).toEqual([
+      { filename: 'model-q8_0.gguf', quant: 'q8_0', sizeBytes: 123, sha256: 'a'.repeat(64) },
+    ]);
   });
 });

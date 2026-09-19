@@ -15,12 +15,23 @@ export function createTaskRepository(driver: SqliteDriver): TaskRepository {
   return {
     async upsertMany(chatId: string, tasks: Task[]): Promise<Task[]> {
       const now = Date.now();
-      for (const task of tasks) {
-        driver.prepare(
-          `INSERT INTO tasks (id, chat_id, run_id, ord, title, status, updated_at)
-           VALUES (?, ?, NULL, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET ord = excluded.ord, title = excluded.title, status = excluded.status, updated_at = excluded.updated_at`,
-        ).run(task.id, chatId, task.ord, task.title, task.status, now);
+      // `task_update` entrega el checklist entero vigente para ESTE chat. Borrar antes de
+      // insertar también maneja una lista vacía y evita que sobrevivan pasos omitidos en la nueva
+      // versión. La operación directa del repositorio necesita su propia transacción; la
+      // proyección de eventos ya corre dentro de la de SqliteEventStore.
+      driver.exec('BEGIN IMMEDIATE');
+      try {
+        driver.prepare('DELETE FROM tasks WHERE chat_id = ?').run(chatId);
+        for (const task of tasks) {
+          driver.prepare(
+            `INSERT INTO tasks (id, chat_id, run_id, ord, title, status, updated_at)
+             VALUES (?, ?, NULL, ?, ?, ?, ?)`,
+          ).run(task.id, chatId, task.ord, task.title, task.status, now);
+        }
+        driver.exec('COMMIT');
+      } catch (error) {
+        driver.exec('ROLLBACK');
+        throw error;
       }
       return tasks;
     },

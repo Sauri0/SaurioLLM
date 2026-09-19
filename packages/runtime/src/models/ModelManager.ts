@@ -4,15 +4,19 @@
 // `Provider` que el host/Gateway le inyecta — doc 08 §1: "el ModelManager recibe la lista de
 // providers() DEL GATEWAY, nunca instancia OllamaProvider por su cuenta").
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { statfs } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir, platform as osPlatform } from 'node:os';
 import type { ModelRef, ModelInfo, ModelDescription, LoadedModel, MemoryEstimate } from '@saurio/shared';
 import type { HardwareProbe, ModelManager as ModelManagerContract } from './types.js';
-import { MemoryEstimator, type ModelDescriber, type OverheadCalibrator } from './MemoryEstimator.js';
+import {
+  DEFAULT_MEMORY_OVERHEAD_BYTES, MemoryEstimator, type ModelDescriber, type OverheadCalibrator,
+} from './MemoryEstimator.js';
 import type { CommandRunner } from './CommandRunner.js';
 import { realCommandRunner, POWERSHELL_EXE } from './CommandRunner.js';
+import { ProviderCatalog, type CatalogStorage } from './ProviderCatalog.js';
 
 /** Subconjunto de `Provider` (packages/runtime/src/gateway/Provider.ts) que ModelManager necesita;
  *  se declara localmente en vez de importar el tipo completo para no acoplar este módulo a la
@@ -22,9 +26,9 @@ export interface ModelProvider {
   readonly id: string;
   readonly locality: ModelRef['locality'];
   health(signal?: AbortSignal): Promise<{ ok: boolean; version?: string; error?: string }>;
-  listModels(): Promise<ModelInfo[]>;
+  listModels(signal?: AbortSignal): Promise<ModelInfo[]>;
   describeModel(name: string): Promise<ModelDescription>;
-  listLoaded?(): Promise<LoadedModel[]>;
+  listLoaded?(signal?: AbortSignal): Promise<LoadedModel[]>;
 }
 
 /** Fila de `model_load_samples` (doc 08 §5.1). El repositorio SQLite real vive en
@@ -34,13 +38,14 @@ export interface ModelLoadSample {
   id: string;
   providerId: string;
   modelName: string;
-  modelDigest: string;
+  modelDigest: string | null;
   numCtx: number;
-  size: number;
-  sizeVram: number;
-  contextLength: number;
-  loadMs: number;
+  size: number | null;
+  sizeVram: number | null;
+  contextLength: number | null;
+  loadMs: number | null;
   estimatedVram: number | null;
+  hardwareFingerprint: string | null;
   sampledAt: number;
 }
 
@@ -48,12 +53,15 @@ export interface ModelLoadSamplesRepository {
   insert(sample: ModelLoadSample): Promise<void>;
   /** Últimas N muestras de un modelo, más recientes primero; usadas para calibrar el overhead
    *  de MemoryEstimator con una media móvil exponencial (doc 08 §5.2). */
-  recent(providerId: string, modelName: string, limit: number): Promise<ModelLoadSample[]>;
+  recent(
+    providerId: string, modelName: string, modelDigest: string, numCtx: number,
+    hardwareFingerprint: string, limit: number,
+  ): Promise<ModelLoadSample[]>;
 }
 
 export interface DetectedModelsFolder {
   path: string;
-  source: 'env:user' | 'env:machine' | 'default';
+  source: 'env:user' | 'env:machine' | 'default' | 'managed';
   validated: boolean;
   /** Espacio libre/total del filesystem que contiene `path` (doc 13 §5 punto 1, `fs.statfsSync`
    *  verificado en esta máquina: N: 480.359.034.880 bytes libres). `undefined` si `statfs` no pudo
@@ -91,7 +99,12 @@ export interface ModelManagerOptions {
   idlePollMs?: number;
   /** ms entre polls con actividad (modelo cargado y panel abierto o run activo; doc 08 §4: 5 s). */
   activePollMs?: number;
+  /** Plazo por proveedor para `/api/ps`; evita que uno caído bloquee los demás. */
+  loadedTimeoutMs?: number;
   modelLoadSamplesRepository?: ModelLoadSamplesRepository;
+  catalogStorage?: CatalogStorage;
+  catalogStorageKey?: (providerId: string) => string;
+  idGenerator?: () => string;
   /** Cuántas muestras recientes promediar en la EMA de calibración del overhead. */
   overheadCalibrationSamples?: number;
 }
@@ -116,20 +129,25 @@ export declare interface ModelManager {
  *  instancia (single instance en todo el proceso, inyectada donde haga falta). */
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class ModelManager extends EventEmitter implements ModelManagerContract {
+  private managedModelsFolder?: string;
   private providers: ModelProvider[];
   private readonly probe: HardwareProbe;
   private readonly estimator: MemoryEstimator;
+  private readonly baselineEstimator: MemoryEstimator;
   private readonly runner: CommandRunner;
   private readonly now: () => number;
   private readonly platform: NodeJS.Platform;
   private readonly idlePollMs: number;
   private readonly activePollMs: number;
+  private readonly loadedTimeoutMs: number;
   private readonly loadSamplesRepo?: ModelLoadSamplesRepository;
   private readonly overheadCalibrationSamples: number;
+  private readonly idGenerator: () => string;
+  private readonly providerCatalog: ProviderCatalog;
 
-  private installedCache = new Map<string, ModelInfo[]>();
   private descriptionCache = new Map<string, ModelDescription>();
   private lastLoaded: LoadedModel[] = [];
+  private observedLoadedKeys = new Set<string>();
   private pollTimer: NodeJS.Timeout | undefined;
   private activityHint = false; // panel abierto o run activo (lo fija el host con setActivityHint)
 
@@ -142,14 +160,25 @@ export class ModelManager extends EventEmitter implements ModelManagerContract {
     this.platform = options.platformOverride ?? osPlatform();
     this.idlePollMs = options.idlePollMs ?? 30_000;
     this.activePollMs = options.activePollMs ?? 5_000;
+    this.loadedTimeoutMs = options.loadedTimeoutMs ?? 15_000;
     this.loadSamplesRepo = options.modelLoadSamplesRepository;
     this.overheadCalibrationSamples = options.overheadCalibrationSamples ?? 5;
+    this.idGenerator = options.idGenerator ?? randomUUID;
+    this.providerCatalog = new ProviderCatalog({
+      storage: options.catalogStorage,
+      storageKey: options.catalogStorageKey,
+      now: this.now,
+    });
 
     const describer: ModelDescriber = { describeModel: (ref) => this.describeModel(ref) };
     const calibrator: OverheadCalibrator | undefined = this.loadSamplesRepo
-      ? { getCalibratedOverheadBytes: (ref) => this.calibrateOverhead(ref) }
+      ? { getCalibratedOverheadBytes: (ref, numCtx, fingerprint) =>
+        this.calibrateOverhead(ref, numCtx, fingerprint) }
       : undefined;
     this.estimator = new MemoryEstimator(describer, calibrator);
+    // Las muestras guardan la predicción base comparable entre fechas. Si se midiera con el mismo
+    // calibrador que luego consume la muestra, el feedback mezclaría corrección previa y nueva.
+    this.baselineEstimator = new MemoryEstimator(describer);
   }
 
   /** Cambio aditivo mínimo (encargo de apps/desktop, punto 2: "models:list debe unir los modelos de
@@ -159,6 +188,8 @@ export class ModelManager extends EventEmitter implements ModelManagerContract {
    *  (perdería el poller de `/api/ps` y la caché de `descriptionCache`). */
   setProviders(providers: ModelProvider[]): void {
     this.providers = providers;
+    this.providerCatalog.reset();
+    this.descriptionCache.clear();
   }
 
   private key(ref: ModelRef): string {
@@ -171,30 +202,139 @@ export class ModelManager extends EventEmitter implements ModelManagerContract {
     return provider;
   }
 
-  async listInstalled(refresh = false): Promise<ModelInfo[]> {
+  catalogStatus() {
+    return this.providers.map((provider) => this.providerCatalog.status(provider.id));
+  }
+
+  async updateManualModel(providerId: string, name: string, remove = false): Promise<void> {
+    const provider = this.resolveProvider(providerId);
+    await this.providerCatalog.updateManual({ providerId, name, locality: provider.locality }, remove);
+  }
+
+  async listInstalled(refresh = false, providerId?: string): Promise<ModelInfo[]> {
+    if (providerId !== undefined) this.resolveProvider(providerId);
     const all: ModelInfo[] = [];
-    for (const provider of this.providers) {
-      if (!refresh && this.installedCache.has(provider.id)) {
-        all.push(...(this.installedCache.get(provider.id) ?? []));
-        continue;
-      }
-      const models = await provider.listModels();
-      this.installedCache.set(provider.id, models);
-      all.push(...models);
+    const failures: unknown[] = [];
+    let responding = 0;
+    const providers = this.providers;
+    const results = await Promise.allSettled(providers.map((provider) =>
+      providerId !== undefined && provider.id !== providerId
+        ? this.providerCatalog.cachedOnly(provider.id)
+        : this.providerCatalog.read(provider, refresh)));
+    if (providers !== this.providers) return this.listInstalled();
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        all.push(...result.value);
+        responding += 1;
+      } else failures.push(result.reason);
     }
+    const manualResults = await Promise.allSettled(providers.map((provider) => this.providerCatalog.manualModels(provider.id, provider.locality)));
+    const keys = new Set(all.map((model) => this.key(model.ref)));
+    for (const result of manualResults) {
+      if (result.status === 'rejected') { failures.push(result.reason); continue; }
+      if (result.value.length > 0) responding++;
+      for (const model of result.value) {
+        if (!keys.has(this.key(model.ref))) { all.push(model); keys.add(this.key(model.ref)); }
+        else {
+          const index = all.findIndex((entry) => this.key(entry.ref) === this.key(model.ref));
+          const remote = all[index];
+          if (remote) all[index] = { ...remote, manualDefinition: true };
+        }
+      }
+    }
+    if (providers !== this.providers) return this.listInstalled();
+    if (responding === 0 && failures.length > 0) throw failures[0];
     return all;
   }
 
   async listLoaded(): Promise<LoadedModel[]> {
     const all: LoadedModel[] = [];
-    for (const provider of this.providers) {
-      if (!provider.listLoaded) continue;
-      const loaded = await provider.listLoaded();
+    const currentKeys = new Set<string>();
+    const candidates = this.providers.filter((provider) => provider.listLoaded !== undefined);
+    const results = await Promise.allSettled(candidates.map(async (provider) => ({
+      provider,
+      loaded: await this.listLoadedFromProvider(provider),
+    })));
+    let responding = 0;
+    let firstFailure: unknown;
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index];
+      const provider = candidates[index];
+      if (!result || !provider) continue;
+      if (result.status === 'rejected') {
+        firstFailure ??= result.reason;
+        // No asumir que un timeout descargó modelos: conservar el estado de deduplicación de ese
+        // proveedor hasta que vuelva a responder evita registrar la misma carga como nueva.
+        const prefix = `${provider.id}::`;
+        for (const key of this.observedLoadedKeys) if (key.startsWith(prefix)) currentKeys.add(key);
+        continue;
+      }
+      responding += 1;
+      const loaded = result.value.loaded;
       all.push(...loaded);
+      for (const model of loaded) {
+        const observationKey = this.loadedObservationKey(provider.id, model);
+        currentKeys.add(observationKey);
+        if (!this.loadSamplesRepo || this.observedLoadedKeys.has(observationKey)) continue;
+        // Se marca antes de esperar para que dos consumidores concurrentes del único poller no
+        // dupliquen la misma observación. Si SQLite falla, el próximo poll vuelve a intentarlo.
+        this.observedLoadedKeys.add(observationKey);
+        const observation = { id: this.idGenerator(), sampledAt: this.now() };
+        void this.recordObservedLoad(provider, model, observation).catch(() => {
+          this.observedLoadedKeys.delete(observationKey);
+        });
+      }
       this.emit('models:loaded', { providerId: provider.id, loaded });
     }
+    if (responding === 0 && firstFailure !== undefined) throw firstFailure;
+    this.observedLoadedKeys = currentKeys;
     this.lastLoaded = all;
     return all;
+  }
+
+  private async listLoadedFromProvider(provider: ModelProvider): Promise<LoadedModel[]> {
+    if (!provider.listLoaded) return [];
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error(`El proveedor "${provider.id}" tardó demasiado en informar los modelos cargados.`));
+        }, this.loadedTimeoutMs);
+      });
+      return await Promise.race([provider.listLoaded(controller.signal), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private loadedObservationKey(providerId: string, model: LoadedModel): string {
+    return `${providerId}::${model.name}::${model.digest}::${model.contextLength}::${model.sizeVram}`;
+  }
+
+  /** `/api/ps` confirma tamaño residente y contexto, pero no informa latencia de carga ni tok/s.
+   * Esos campos quedan desconocidos en vez de atribuirle una velocidad inventada a la observación. */
+  private async recordObservedLoad(
+    provider: ModelProvider, model: LoadedModel, observation: { id: string; sampledAt: number },
+  ): Promise<void> {
+    if (!this.loadSamplesRepo) return;
+    const ref: ModelRef = { providerId: provider.id, name: model.name, locality: provider.locality };
+    let estimatedVram: number | null = null;
+    let hardwareFingerprint: string | null = null;
+    try {
+      const hardware = await this.probe.sample();
+      hardwareFingerprint = hardware.fingerprint;
+      estimatedVram = (await this.baselineEstimator.fits(ref, model.contextLength, hardware)).vramNeededBytes;
+    } catch {
+      // La medición de /api/ps sigue siendo válida aunque /api/show o el sondeo de hardware fallen.
+    }
+    await this.loadSamplesRepo.insert({
+      id: observation.id, providerId: provider.id, modelName: model.name,
+      modelDigest: model.digest || null, numCtx: model.contextLength, size: model.size,
+      sizeVram: model.sizeVram, contextLength: model.contextLength, loadMs: null,
+      estimatedVram, hardwareFingerprint, sampledAt: observation.sampledAt,
+    });
   }
 
   async describeModel(ref: ModelRef): Promise<ModelDescription> {
@@ -212,10 +352,17 @@ export class ModelManager extends EventEmitter implements ModelManagerContract {
     return this.estimator.fits(ref, numCtx, hardware);
   }
 
-  private async calibrateOverhead(ref: ModelRef): Promise<number | undefined> {
+  private async calibrateOverhead(
+    ref: ModelRef, numCtx: number, hardwareFingerprint: string,
+  ): Promise<number | undefined> {
     if (!this.loadSamplesRepo) return undefined;
-    const samples = await this.loadSamplesRepo.recent(ref.providerId, ref.name, this.overheadCalibrationSamples);
-    const withEstimate = samples.filter((s) => s.estimatedVram !== null);
+    const description = await this.describeModel(ref);
+    if (!description.digest) return undefined;
+    const samples = await this.loadSamplesRepo.recent(
+      ref.providerId, ref.name, description.digest, numCtx, hardwareFingerprint, this.overheadCalibrationSamples,
+    );
+    const withEstimate = samples.filter((s): s is ModelLoadSample & { estimatedVram: number; sizeVram: number } =>
+      s.estimatedVram !== null && s.sizeVram !== null);
     if (withEstimate.length === 0) return undefined;
     // EMA simple (peso decreciente por antigüedad); `samples` viene ordenado más-reciente-primero.
     const alpha = 0.5;
@@ -223,16 +370,16 @@ export class ModelManager extends EventEmitter implements ModelManagerContract {
     for (let i = withEstimate.length - 1; i >= 0; i -= 1) {
       const sample = withEstimate[i];
       if (!sample) continue;
-      const overheadSample = sample.sizeVram - (sample.estimatedVram ?? 0);
+      // estimated_vram contiene la fórmula base completa (incluido el overhead inicial). La
+      // diferencia contra /api/ps es la corrección, no el overhead total.
+      const overheadSample = DEFAULT_MEMORY_OVERHEAD_BYTES + sample.sizeVram - sample.estimatedVram;
       ema = ema === undefined ? overheadSample : alpha * overheadSample + (1 - alpha) * ema;
     }
-    return ema;
+    return ema === undefined ? undefined : Math.max(ema, 0);
   }
 
-  /** Registra `model_load_samples` tras cada carga real (doc 08 §5.1); lo llama el host/Gateway
-   *  después de un `/api/chat` real o un `ensureLoaded` de precalentamiento, nunca ModelManager por
-   *  su cuenta (ModelManager no llama a /api/chat). No forma parte de la interfaz `ModelManager` de
-   *  ./types.ts (que no declara escritura); es API adicional que expone esta implementación. */
+  /** Registra una muestra provista por el host/Gateway. Además, `listLoaded()` registra por sí mismo
+   * las observaciones reales de `/api/ps`, dejando desconocida la latencia que ese endpoint no da. */
   async recordLoadSample(sample: ModelLoadSample): Promise<void> {
     if (!this.loadSamplesRepo) return;
     await this.loadSamplesRepo.insert(sample);
@@ -270,6 +417,10 @@ export class ModelManager extends EventEmitter implements ModelManagerContract {
   /** Carpeta OLLAMA_MODELS en modo attach (doc 13 §6): variable de usuario, luego de máquina, con
    *  fallback al default de Windows, y validación de solo lectura contra los manifests instalados. */
   async detectedModelsFolder(): Promise<DetectedModelsFolder> {
+    if (this.managedModelsFolder) {
+      return { path: this.managedModelsFolder, source: 'managed', validated: existsSync(this.managedModelsFolder),
+        ...await this.diskSpaceOf(this.managedModelsFolder) };
+    }
     const userValue = await this.readEnvVar('OLLAMA_MODELS', 'User');
     const machineValue = userValue ? undefined : await this.readEnvVar('OLLAMA_MODELS', 'Machine');
     const path = userValue ?? machineValue ?? this.defaultModelsFolder();
@@ -278,6 +429,8 @@ export class ModelManager extends EventEmitter implements ModelManagerContract {
     const space = await this.diskSpaceOf(path);
     return { path, source, validated, ...space };
   }
+
+  setManagedModelsFolder(folder: string | undefined): void { this.managedModelsFolder = folder; }
 
   /** `fs.statfs` sobre `path` (doc 13 §5 punto 1); si `path` todavía no existe (carpeta detectada
    *  por convención pero nunca creada) sube por los ancestros hasta encontrar uno que exista, para

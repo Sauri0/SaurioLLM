@@ -8,13 +8,14 @@
 // lista compacta de una línea por paso, cada una con su propio chevron para el detalle. Sin tarjetas
 // grandes ni colores fuertes en la fila — el detalle sí puede reusar ToolCallCard/DelegationCard
 // (ya truncan/limpian ANSI), pero queda oculto hasta que el usuario lo pide.
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import type { ToolCallRecord } from '@saurio/shared';
 import type { ActivityStep } from './activityGrouping.js';
 import { toolStepLabel } from './stepLabel.js';
 import { ChevronDownIcon } from '../../ui/icons.js';
 import { ToolCallCard } from './ToolCallCard.js';
 import { DelegationCard } from './DelegationCard.js';
+import type { DelegationCardProps } from './DelegationCard.js';
 import './chat.css';
 
 function stepKey(step: ActivityStep, index: number): string {
@@ -24,11 +25,12 @@ function stepKey(step: ActivityStep, index: number): string {
 
 interface ActivityStepRowProps {
   step: ActivityStep;
-  resolveDelegationChatId?: (call: ToolCallRecord) => string | undefined;
+  resolveDelegationTarget?: (call: ToolCallRecord) => Pick<DelegationCardProps, 'childRunId' | 'childChatId' | 'childRunState' | 'stopping' | 'stopError'>;
+  onStopChild?: (parentRunId: string, childRunId: string) => void;
   onOpenChat?: (chatId: string) => void;
 }
 
-function ActivityStepRow({ step, resolveDelegationChatId, onOpenChat }: ActivityStepRowProps): React.JSX.Element | null {
+function ActivityStepRow({ step, resolveDelegationTarget, onStopChild, onOpenChat }: ActivityStepRowProps): React.JSX.Element | null {
   const [open, setOpen] = useState(false);
 
   if (step.kind === 'thinking') {
@@ -60,7 +62,7 @@ function ActivityStepRow({ step, resolveDelegationChatId, onOpenChat }: Activity
   const call = step.toolCall;
   const label = toolStepLabel(call);
   if (call.category === 'delegate') {
-    const childChatId = resolveDelegationChatId?.(call);
+    const target = resolveDelegationTarget?.(call);
     return (
       <div className="activity-step">
         <button type="button" className="activity-step__row" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
@@ -69,7 +71,7 @@ function ActivityStepRow({ step, resolveDelegationChatId, onOpenChat }: Activity
         </button>
         {open && (
           <div className="activity-step__detail">
-            <DelegationCard call={call} childChatId={childChatId} onOpenChat={onOpenChat} />
+            <DelegationCard call={call} {...target} onStopChild={onStopChild} onOpenChat={onOpenChat} />
           </div>
         )}
       </div>
@@ -97,15 +99,28 @@ export interface ActivityBlockProps {
   headerLabel: string;
   live: boolean;
   defaultOpen?: boolean;
-  resolveDelegationChatId?: (call: ToolCallRecord) => string | undefined;
+  resolveDelegationTarget?: ActivityStepRowProps['resolveDelegationTarget'];
+  onStopChild?: (parentRunId: string, childRunId: string) => void;
   onOpenChat?: (chatId: string) => void;
 }
 
 /** `null` si no hay ningún paso interno (turno de solo texto) — ni siquiera se dibuja el renglón, la
  *  respuesta se ve como una conversación normal, sin ningún vestigio de "Actividad". */
-export function ActivityBlock({ steps, headerLabel, live, defaultOpen = false, resolveDelegationChatId, onOpenChat }: ActivityBlockProps): React.JSX.Element | null {
+export function ActivityBlock({ steps, headerLabel, live, defaultOpen = false, resolveDelegationTarget, onStopChild, onOpenChat }: ActivityBlockProps): React.JSX.Element | null {
   const [open, setOpen] = useState(defaultOpen);
-  if (steps.length === 0) return null;
+  const bodyId = `activity-block-body-${useId()}`;
+  if (steps.length === 0 && !live) return null;
+
+  if (steps.length === 0) {
+    return (
+      <div className="activity-block activity-block--live" role="status">
+        <div className="activity-block__header">
+          <span className="activity-block__spinner" aria-hidden="true" />
+          <span className="activity-block__label">{headerLabel}</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={`activity-block${live ? ' activity-block--live' : ''}`}>
@@ -114,6 +129,8 @@ export function ActivityBlock({ steps, headerLabel, live, defaultOpen = false, r
         className="activity-block__header"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
+        aria-live={live ? 'polite' : undefined}
+        aria-controls={bodyId}
       >
         {live && <span className="activity-block__spinner" aria-hidden="true" />}
         <span className="activity-block__label">{headerLabel}</span>
@@ -124,12 +141,13 @@ export function ActivityBlock({ steps, headerLabel, live, defaultOpen = false, r
         />
       </button>
       {open && (
-        <div className="activity-block__body">
+        <div id={bodyId} className="activity-block__body">
           {steps.map((step, index) => (
             <ActivityStepRow
               key={stepKey(step, index)}
               step={step}
-              resolveDelegationChatId={resolveDelegationChatId}
+              resolveDelegationTarget={resolveDelegationTarget}
+              onStopChild={onStopChild}
               onOpenChat={onOpenChat}
             />
           ))}

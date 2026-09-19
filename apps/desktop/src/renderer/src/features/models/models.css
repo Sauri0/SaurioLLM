@@ -67,6 +67,19 @@
 .saurio-inline-action { margin-left: var(--space-2); }
 .saurio-models-title-icon { margin-right: 6px; }
 .saurio-models-folder-row { margin-bottom: var(--space-2); }
+.saurio-models__filters { display: flex; flex-wrap: wrap; align-items: end; gap: var(--space-2); margin-bottom: var(--space-3); }
+.saurio-models__filters input[type="search"] { flex: 1 1 220px; min-width: 160px; }
+.saurio-models__filters select { min-width: 110px; }
+.saurio-models__filters label { display: inline-flex; align-items: center; gap: 4px; min-height: 34px; }
+.saurio-models__filters label select { margin-left: 4px; }
+.saurio-models__filter-count { color: var(--text-muted); font-size: var(--text-xs); align-self: center; }
+.saurio-models__visibility-action { margin-top: var(--space-2); }
+.saurio-manual-models { margin: 0 0 var(--space-3); padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-1); }
+.saurio-manual-models h3 { margin: 0 0 var(--space-1); font-size: var(--text-sm); }
+.saurio-manual-models__form { display: flex; flex-wrap: wrap; align-items: end; gap: var(--space-2); }
+.saurio-manual-models__form label { display: flex; flex: 1 1 180px; flex-direction: column; gap: 4px; font-size: var(--text-xs); color: var(--text-secondary); }
+.saurio-manual-models__form input, .saurio-manual-models__form select { min-height: 32px; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-2); color: var(--text-primary); }
+.saurio-manual-models__list { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); }
 
 /* Punto 4 del encargo (doc 16, "modelos con X / sin compatibilidad para descargar"): checkbox
    "Mostrar modelos en la nube" — mismo look de `.saurio-filter-chip`, con la casilla alineada. */
@@ -170,6 +183,16 @@
 .saurio-explore__by-name-input { flex: 1; padding: 4px 8px; border-radius: var(--radius-md); border: 1px solid var(--border); background: var(--bg-1); color: var(--text-primary); }
 
 .saurio-explore__hf-files { margin-top: var(--space-2); padding-top: var(--space-2); border-top: 1px dashed var(--border-subtle); }
+.saurio-explore__hf-filter-row { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-2); }
+.saurio-explore__hf-filter-row input { flex: 1 1 180px; min-width: 0; }
+.saurio-explore__hf-filter-row select { min-width: 150px; }
+
+/* El catálogo principal lista familias; las variantes se montan sólo al expandir la familia. Esto
+   mantiene la lista acotada incluso con catálogos de cientos de tags. */
+.saurio-explore__family { padding: var(--space-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-1); }
+.saurio-explore__family-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.saurio-explore__family-variants { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); padding-top: var(--space-2); border-top: 1px solid var(--border-subtle); }
+.saurio-explore__variant { background: var(--bg-2); }
 
 /* Ficha lateral de variantes (punto 5 del encargo: "ficha lateral con variantes, selector de
    contexto"). Panel fijo a la derecha en pantallas anchas; se apila abajo en angostas. */

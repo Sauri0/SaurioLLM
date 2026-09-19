@@ -19,8 +19,8 @@ export interface MatchFailure {
   reason: string;
   /** Doc 16 §4 ítem 6 ("edit_file ambiguo devuelve las coincidencias numeradas"): línea (1-based) y
    *  una vista previa de cada ocurrencia, para que el modelo pueda agregar contexto sin adivinar
-   *  cuál de las coincidencias es la que quiere tocar. Solo se completa cuando `occurrences > 1`
-   *  (ambiguo); en "no encontrado" (`occurrences === 0`) queda `undefined`. */
+   *  cuál de las coincidencias es la que quiere tocar. También orienta cuando sólo existe una
+   *  coincidencia aproximada que no es segura para reemplazar automáticamente. */
   candidates?: { line: number; preview: string }[];
 }
 
@@ -257,6 +257,13 @@ export function replaceAtCascade(content: string, needle: string, replacement: s
   if (!replaceAll) {
     const res = matchCascade(content, needle);
     if (res.level === null) return res;
+    // Una distancia pequeña no garantiza el mismo bloque: una función completa en una línea
+    // puede parecerse a una cabecera sin cuerpo. Nunca aplicar ese reemplazo destructivo.
+    if (res.level === 'fuzzy') return {
+      level: null, occurrences: 1,
+      reason: 'old_string sólo tiene una coincidencia aproximada; no se modificó el archivo. Usá read_file y copiá el bloque real completo en old_string, sin resumirlo ni cambiar sus nombres',
+      candidates: candidatesFromOffsets(content, [res.start]),
+    };
     return { content: content.slice(0, res.start) + replacement + content.slice(res.end), level: res.level, count: 1 };
   }
   // replace_all: exige match exacto (múltiples ocurrencias); niveles tolerantes no aplican a "todas"

@@ -105,6 +105,17 @@ describe('gateway/providers/ollama/provider', () => {
     }
   });
 
+  it('chat(): serializa num_thread y num_gpu sólo cuando llegaron en la request local', async () => {
+    fetchMock.mockImplementationOnce(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { options: { num_thread?: number; num_gpu?: number } };
+      expect(body.options.num_thread).toBe(6);
+      expect(body.options.num_gpu).toBe(0);
+      return mockStreamResponse(STREAM_NORMAL_LINES);
+    });
+    const provider = new OllamaProvider({ id: 'ollama', baseUrl: 'http://127.0.0.1:11434' });
+    await collect(provider.chat({ ...BASE_CHAT_REQ, options: { ...BASE_CHAT_REQ.options, numThreads: 6, numGpu: 0 } }, new AbortController().signal));
+  });
+
   it('chat(): thinking y content se emiten como ChatChunk separados', async () => {
     fetchMock.mockResolvedValueOnce(mockStreamResponse(STREAM_THINKING_LINES));
     const provider = new OllamaProvider({ id: 'ollama', baseUrl: 'http://127.0.0.1:11434' });

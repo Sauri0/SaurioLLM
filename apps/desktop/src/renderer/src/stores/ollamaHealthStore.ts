@@ -8,9 +8,7 @@
 // `provider:health` al mismo tiempo). Este store centraliza un ÚNICO poll (arranca con el primer
 // `subscribe()`, nunca se duplica) que cualquier componente puede leer con `useOllamaHealthStore`.
 //
-// `layout/StatusBar.tsx` sigue con su propio poll local (no se tocó para no arriesgar una regresión
-// fuera del alcance de esta tarea puntual) — duplicación menor y conocida, documentada en la salida
-// estructurada de la tarea.
+// La barra inferior y los selectores comparten este estado del motor local.
 import { create } from 'zustand';
 import { invoke } from '../ipc/client.js';
 import { isDemoMode } from '../demo/demoState.js';
@@ -31,7 +29,7 @@ let subscriberCount = 0;
 
 function checkHealthOnce(set: (patch: Partial<OllamaHealthState>) => void): void {
   invoke('provider:health', undefined)
-    .then((health) => set({ ok: health.every((h) => h.ok) }))
+    .then((health) => set({ ok: health.find((h) => h.providerId === 'ollama')?.ok ?? false }))
     .catch(() => set({ ok: false }));
 }
 

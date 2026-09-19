@@ -41,6 +41,12 @@ describe('ProjectRepository — recientes/remove/rename', () => {
     expect(recent.map((r) => r.project.id)).toEqual(['p2', 'p1']);
     expect(recent.find((r) => r.project.id === 'p1')?.chatCount).toBe(2);
     expect(recent.find((r) => r.project.id === 'p2')?.chatCount).toBe(0);
+    const moved = await projects.relocate!('p1', '/fake/moved');
+    expect(moved).toMatchObject({ id: 'p1', path: '/fake/moved', name: 'P1', createdAt: 1 });
+    expect((await chats.listByProject('p1')).map((chat) => chat.id).sort()).toEqual(['c1', 'c2']);
+    expect((await projects.listRecent()).find((row) => row.project.id === 'p1')?.chatCount).toBe(2);
+    await expect(projects.relocate!('p1', '/fake/p2')).rejects.toThrow();
+    expect((await projects.get('p1'))?.path).toBe('/fake/moved');
   });
 
   it('un chat soft-deleted no cuenta en chatCount', async () => {

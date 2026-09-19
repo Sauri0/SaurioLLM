@@ -29,6 +29,20 @@ export const ModelRefSchema = z.object({
 });
 export type ModelRef = z.infer<typeof ModelRefSchema>;
 
+/** Procedencia persistible de la selección efectiva de modelo. Los datos de fit son estimaciones de
+ * MemoryEstimator; nunca se presentan como una prueba real de ejecución. Ausente en runs legacy. */
+export const ModelResolutionSchema = z.object({
+  source: z.enum([
+    'chat_override', 'agent_fixed', 'automatic_recommendation',
+    'automatic_loaded', 'automatic_profile', 'builtin_fallback',
+  ]),
+  contextMax: z.number().int().positive().optional(),
+  fitClass: z.enum(['fits_gpu', 'tight', 'partial_offload']).optional(),
+  fitQuality: z.literal('estimated').optional(),
+  inheritedFromRunId: z.string().optional(),
+});
+export type ModelResolution = z.infer<typeof ModelResolutionSchema>;
+
 /** Métricas de una respuesta. Los duration_ns de Ollama son measured; providers /v1 sin
  *  duraciones caen a estimated [VERIFICADO EN DOC OFICIAL: api.md Metrics]. Doc 04 §3.
  *  Movido arriba de `ChatMessageSchema` (antes vivía después) para que `ChatMessageSchema.metrics`
@@ -36,6 +50,8 @@ export type ModelRef = z.infer<typeof ModelRefSchema>;
  *  proveedor lo informe") pueda referenciarlo — ya se persistía en `messages.response_metrics_json`
  *  desde antes de esta tarea (`events/projections/messages.ts`), pero `ChatMessage` no lo exponía. */
 export const ResponseMetricsSchema = z.object({
+  costUsd: z.number().finite().nonnegative().optional(),
+  costSource: z.enum(['reported', 'estimated', 'unavailable']).optional(),
   promptTokens: z.number().optional(),
   cachedPromptTokens: z.number().optional(),
   evalTokens: z.number().optional(),
@@ -78,6 +94,9 @@ export type ToolResult = z.infer<typeof ToolResultSchema>;
 
 export const ChatMessageSchema = z.object({
   id: z.string(),
+  /** Ejecución que produjo este mensaje. Se conserva al rehidratar el historial para que la UI
+   *  pueda vincular una respuesta con acciones como "Regenerar", sin adivinarlo por posición. */
+  originRunId: z.string().optional(),
   role: ChatRole,
   content: z.string(),
   thinking: z.string().optional(),
@@ -159,6 +178,9 @@ export const ChatSchema = z.object({
   title: z.string().optional(),
   mode: Mode,
   modelRef: ModelRefSchema.optional(),
+  /** Origen del modelo del chat. Ausente en filas legacy significa `explicit`: sólo los chats
+   * creados expresamente en automático permiten que el runtime elija por rol/hardware. */
+  modelSelection: z.enum(['auto', 'explicit']).optional(),
   profileId: z.string().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
@@ -331,6 +353,16 @@ export const ModelCapabilitiesSchema = z.object({
 export type ModelCapabilities = z.infer<typeof ModelCapabilitiesSchema>;
 
 export const ModelInfoSchema = z.object({
+  pricing: z.object({
+    promptUsdPerToken: z.number().finite().nonnegative().optional(),
+    completionUsdPerToken: z.number().finite().nonnegative().optional(),
+    requestUsd: z.number().finite().nonnegative().optional(),
+    imageUsd: z.number().finite().nonnegative().optional(),
+  }).optional(),
+  metadataSource: z.enum(['openrouter', 'manual']).optional(),
+  /** Permite quitar una definición manual aunque el proveedor también publique el mismo ID. */
+  manualDefinition: z.boolean().optional(),
+  metadataCheckedAt: z.number().optional(),
   ref: ModelRefSchema,
   digest: z.string(),
   sizeBytes: z.number(),
@@ -365,6 +397,10 @@ export type LoadedModel = z.infer<typeof LoadedModelSchema>;
 export const MemoryEstimateSchema = z.object({
   vramNeededBytes: z.number(),
   vramAvailableBytes: z.number(),
+  /** RAM libre utilizable después del margen. En equipos sin GPU permite distinguir ejecución CPU
+   * viable de `no_fit`; en iGPU no se suma otra vez a la VRAM porque es memoria compartida. */
+  ramAvailableBytes: z.number().optional(),
+  combinedAvailableBytes: z.number().optional(),
   fitClass: z.enum(['fits_gpu', 'tight', 'partial_offload', 'no_fit']),
   quality: Quality,      // 'estimated' salvo que exista ModelCompat -> 'measured'
   source: z.enum(['formula', 'model_compat']),
@@ -476,7 +512,7 @@ export type AttachWarning = z.infer<typeof AttachWarningSchema>;
 
 export const ModelsFolderInfoSchema = z.object({
   path: z.string(),
-  source: z.enum(['env:user', 'env:machine', 'default']),
+  source: z.enum(['env:user', 'env:machine', 'default', 'managed']),
   validated: z.boolean(),
   freeBytes: z.number().optional(),
   totalBytes: z.number().optional(),
@@ -530,7 +566,7 @@ export type ModelTier = z.infer<typeof ModelTierSchema>;
  *  SQL nueva). El Centro de modelos (pestaña "Explorar") consume esto en vez del catálogo crudo. */
 export const CatalogItemSchema = z.object({
   entry: ModelCatalogEntrySchema,
-  status: z.enum(['not_installed', 'downloading', 'installed_untested', 'installed_tested', 'loaded']),
+  status: z.enum(['unknown', 'not_installed', 'downloading', 'installed_untested', 'installed_tested', 'loaded']),
   downloadId: z.string().optional(),
   /** `undefined` solo si no se pudo muestrear el hardware al armar la respuesta (nunca por diseño:
    *  el handler de `models:catalog` siempre lo intenta, doc 13 §2 "para priorizar calidad"). */
@@ -539,6 +575,9 @@ export const CatalogItemSchema = z.object({
 export type CatalogItem = z.infer<typeof CatalogItemSchema>;
 
 export const RecommendationSchema = z.object({
+  fitQuality: z.enum(['measured', 'estimated']).optional(),
+  contextUsed: z.number().positive().optional(),
+  reason: z.string().optional(),
   catalogEntry: ModelCatalogEntrySchema,
   fitClass: z.enum(['fits_gpu', 'tight', 'partial_offload', 'no_fit']),
   locality: Locality,
@@ -613,6 +652,7 @@ export const ResolveModelByNameResultSchema = z.object({
 export type ResolveModelByNameResult = z.infer<typeof ResolveModelByNameResultSchema>;
 
 export const DownloadJobSchema = z.object({
+  phase: z.enum(['downloading', 'verifying', 'importing']).optional(),
   id: z.string(),
   providerId: z.string(),
   modelName: z.string(),
@@ -799,6 +839,11 @@ export const AgentProfileSchema = z.object({
   systemPrompt: z.string(),
   allowedTools: z.array(z.string()),
   permissionPreset: PermissionPreset,
+  /** Alcance elegido para la memoria del agente. Ausente en perfiles históricos cuya política no
+   * quedó persistida: la UI debe tratarlo como desconocido, nunca asumir alcance global. */
+  memoryScope: z.enum(['global', 'project']).optional(),
+  /** Proyecto asociado al alcance `project`, cuando fue elegido al crear o configurar el agente. */
+  projectId: z.string().optional(),
   createdAt: z.number(),
   archivedAt: z.number().optional(),
 });
@@ -823,9 +868,10 @@ export const AgentMemorySchema = z.object({
 export type AgentMemory = z.infer<typeof AgentMemorySchema>;
 
 /** Doc 19 §1.2: "sin plantilla obligatoria... todos los campos salvo `name` tienen default sensato"
- *  (R01 — usar la app sin crear agentes sigue siendo el camino por defecto). `memoryScope`/`projectId`
- *  solo orientan dónde cae la PRIMERA fila de memoria que el agente llegue a escribir; no son columnas
- *  de `agents` (la privacidad real vive en `agent_memories.project_id`, por fila, doc 19 §1.7). */
+ *  (R01 — usar la app sin crear agentes sigue siendo el camino por defecto). `memoryScope` y
+ *  `projectId` se persisten como la política declarada del perfil para poder reabrirlo, editarlo y
+ *  duplicarlo sin cambiar su alcance. La privacidad de cada memoria continúa definida por
+ *  `agent_memories.project_id` (doc 19 §1.7). */
 export const AgentCreateInputSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
@@ -837,7 +883,7 @@ export const AgentCreateInputSchema = z.object({
   systemPrompt: z.string().optional(),
   allowedTools: z.array(z.string()).optional(),
   permissionPreset: PermissionPreset.default('balanced'),
-  memoryScope: z.enum(['global', 'project']).default('global'),
+  memoryScope: z.enum(['global', 'project']).optional(),
   projectId: z.string().optional(),
 });
 export type AgentCreateInput = z.infer<typeof AgentCreateInputSchema>;
@@ -873,3 +919,12 @@ export const DelegationResultSchema = z.object({
   nextAction: z.string().optional(),
 });
 export type DelegationResult = z.infer<typeof DelegationResultSchema>;
+
+export const ProviderCatalogStatusSchema = z.object({
+  providerId: z.string(),
+  state: z.enum(['unknown', 'loading', 'ready', 'stale', 'error']),
+  updatedAt: z.number().optional(),
+  error: z.string().optional(),
+  count: z.number().int().nonnegative(),
+});
+export type ProviderCatalogStatus = z.infer<typeof ProviderCatalogStatusSchema>;

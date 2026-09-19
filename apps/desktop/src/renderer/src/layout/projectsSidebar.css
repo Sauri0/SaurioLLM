@@ -1,0 +1,23 @@
+.saurio-project-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
+.saurio-project-search input { width: 100%; box-sizing: border-box; margin-top: var(--space-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: var(--space-2); color: var(--text-primary); background: var(--bg-2); }
+.saurio-project-list { max-height: 13rem; overflow-y: auto; margin-top: var(--space-2); }
+.saurio-project-row { position: relative; display: flex; align-items: center; border-radius: var(--radius-sm); }
+.saurio-project-row.active { background: var(--bg-3); }
+.saurio-project-row__open { min-width: 0; flex: 1; display: flex; gap: var(--space-2); align-items: center; border: 0; padding: var(--space-2); color: var(--text-primary); background: transparent; text-align: left; cursor: pointer; }
+.saurio-project-row__open span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.saurio-project-row__menu { flex: 0 0 32px; min-width: 32px; min-height: 32px; border: 0; border-radius: var(--radius-sm); color: var(--text-muted); background: transparent; cursor: pointer; font-size: 1.1rem; line-height: 1; }
+.saurio-project-row__menu:hover, .saurio-project-row__menu:focus-visible { color: var(--text-primary); background: var(--bg-4); }
+.saurio-project-menu { position: absolute; z-index: 4; right: 0; top: calc(100% - 2px); display: grid; min-width: 12rem; max-width: min(18rem, calc(100vw - var(--space-6))); padding: var(--space-1); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-2); box-shadow: var(--shadow-lg); }
+.saurio-project-menu button { min-height: 32px; border: 0; padding: var(--space-2); color: var(--text-primary); background: transparent; text-align: left; cursor: pointer; }
+.saurio-project-menu button:hover { background: var(--bg-3); }
+.saurio-chat-menu { right: var(--space-1); }
+.saurio-sidebar-archived { margin-top: var(--space-2); color: var(--text-muted); }
+.saurio-sidebar-archived summary { cursor: pointer; }
+.saurio-sidebar-archived .saurio-sidebar-item { display: block; width: 100%; border: 0; text-align: left; background: transparent; color: var(--text-muted); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+/* Menus stay within the viewport, independently of the scrollable lists. */
+.saurio-project-menu { position: fixed; z-index: 100; right: auto; top: 0; left: 0; max-height: calc(100vh - 16px); overflow-y: auto; }
+
+.saurio-sidebar-chats > .saurio-sidebar-item { position: relative; padding-right: 42px; }
+.saurio-sidebar-item > .saurio-project-row__menu { position: absolute; top: 6px; right: 4px; width: 32px; }

@@ -85,10 +85,34 @@ export class AnthropicClient {
     return response;
   }
 
-  async listModels(signal?: AbortSignal): Promise<AnthropicModelsResponse> {
-    const response = await this.request('/v1/models', { method: 'GET' }, signal);
+  async listModels(signal?: AbortSignal, afterId?: string): Promise<AnthropicModelsResponse> {
+    const path = afterId === undefined ? '/v1/models' : `/v1/models?after_id=${encodeURIComponent(afterId)}`;
+    const response = await this.request(path, { method: 'GET' }, signal);
     const json: unknown = await response.json();
     return AnthropicModelsResponseSchema.parse(json);
+  }
+
+  /** Cursor contract: https://platform.claude.com/docs/en/api/models/list.
+   * A broken proxy must fail visibly instead of silently returning a partial catalog. */
+  async listAllModels(signal?: AbortSignal): Promise<AnthropicModelsResponse['data']> {
+    const deadline = AbortSignal.timeout(15_000);
+    const boundedSignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline]);
+    const models = new Map<string, AnthropicModelsResponse['data'][number]>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 100; page++) {
+      boundedSignal.throwIfAborted();
+      const result = await this.listModels(boundedSignal, cursor);
+      for (const model of result.data) models.set(model.id, model);
+      if (!result.has_more) return [...models.values()];
+      const next = result.last_id;
+      if (!next || cursors.has(next) || result.data.length === 0) {
+        throw new Error('El catálogo de Anthropic devolvió una paginación inválida. Reintentá actualizarlo.');
+      }
+      cursors.add(next);
+      cursor = next;
+    }
+    throw new Error('El catálogo de Anthropic superó el límite de páginas. No se puede confirmar que esté completo.');
   }
 
   /** Streaming de `/v1/messages`. Los errores mid-stream llegan como evento SSE `event: error`

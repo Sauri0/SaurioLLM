@@ -300,6 +300,7 @@ export const modelLoadSamples = sqliteTable('model_load_samples', {
   contextLength: integer('context_length'),
   loadMs: integer('load_ms'),
   estimatedVram: integer('estimated_vram'),
+  hardwareFingerprint: text('hardware_fingerprint'),
   sampledAt: integer('sampled_at').notNull(),
 });
 

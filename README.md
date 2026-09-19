@@ -2,17 +2,17 @@
 
 SaurioLLM es un asistente de código estilo "agente" para Windows: una app de escritorio (Electron +
 React) que lee y edita archivos de tu proyecto, corre comandos en una terminal integrada y responde en
-un chat, usando un modelo de lenguaje local (con [Ollama](https://ollama.com/), gratis y privado) o un
-proveedor por API (OpenAI-compatible o Anthropic) si preferís no correr modelos en tu máquina.
+un chat, usando un modelo local preparado por SaurioLLM o una instalación existente de
+[Ollama](https://ollama.com/) (gratis y privado), o un proveedor por API (OpenAI-compatible o Anthropic)
+si preferís no correr modelos en tu máquina.
 
 ![Chat con tool calls, checkpoint y checklist de tareas](docs/capturas/01-chat-overview.png)
 
 ## ¿Ya tenés el instalador o querés bajarlo?
 
 - **Descargar y probar la app:** guía completa en [`docs/INSTALAR.md`](docs/INSTALAR.md) — bajar el
-  instalador desde [Releases](../../releases), qué hacer con el aviso de Windows SmartScreen (el
-  instalador no está firmado digitalmente: es un proyecto sin certificado de firma de código pago, no
-  significa que sea inseguro), y primer arranque.
+  instalador desde [Releases](../../releases), revisar el aviso de Windows SmartScreen (el instalador no tiene una
+  firma digital reconocida por Windows) y completar el primer arranque.
 - **Usar la app día a día** (modos plan/agent, permisos, checkpoints, Centro de modelos, etc.):
   [`docs/MANUAL.md`](docs/MANUAL.md).
 - **Arquitectura completa** (decisiones, estructura de carpetas, estado real de la implementación):
@@ -21,8 +21,10 @@ proveedor por API (OpenAI-compatible o Anthropic) si preferís no correr modelos
 
 ## Requisitos para usar la app
 
-- Windows 11 (target principal de esta versión).
-- Para modelos locales (gratis, privado): [Ollama](https://ollama.com/download) instalado y corriendo.
+- Windows x64 (Windows 11 es el target principal; Windows limpio todavía no fue validado).
+- Internet y espacio libre para la primera preparación/descarga del motor administrado y los modelos.
+- Ollama instalado y corriendo solo si querés usar una instalación existente; también podés usar el
+  motor administrado por SaurioLLM.
 - Para modelos por API en vez de locales: una clave de API de un proveedor compatible con OpenAI o con
   Anthropic (con costo según el proveedor).
 

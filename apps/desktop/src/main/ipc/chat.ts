@@ -56,7 +56,7 @@ async function enforceLocalityGate(
 
 export function registerChatHandlers(host: RuntimeHost): void {
   registerHandler('chat:create', ipc['chat:create'], async (input) => {
-    await enforceLocalityGate(host, input.projectId, input.modelRef, input.confirmed);
+    if (input.modelRef) await enforceLocalityGate(host, input.projectId, input.modelRef, input.confirmed);
     const now = Date.now();
     return host.chatRepository.create({
       id: `chat_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
@@ -64,6 +64,7 @@ export function registerChatHandlers(host: RuntimeHost): void {
       agentId: input.agentId,
       mode: input.mode,
       modelRef: input.modelRef,
+      modelSelection: input.modelSelection ?? 'explicit',
       createdAt: now,
       updatedAt: now,
       archived: false,
@@ -71,6 +72,7 @@ export function registerChatHandlers(host: RuntimeHost): void {
   });
 
   registerHandler('chat:list', ipc['chat:list'], async (input) => host.chatRepository.listByProject(input.projectId));
+  registerHandler('chat:search', ipc['chat:search'], async (input) => host.searchChats(input));
 
   // Punto 3 del encargo: cambiar modelo/modo de un chat existente desde la cabecera del chat, sin
   // recrearlo. `ChatRepository.update` ya soportaba un patch parcial (persistence/types.ts); solo
@@ -81,7 +83,9 @@ export function registerChatHandlers(host: RuntimeHost): void {
     const chat = await host.chatRepository.get(input.chatId);
     if (!chat) throw new Error(`saurio: no existe el chat "${input.chatId}"`);
     await enforceLocalityGate(host, chat.projectId, input.modelRef, input.confirmed);
-    return host.chatRepository.update(input.chatId, { modelRef: input.modelRef, updatedAt: Date.now() });
+    return host.chatRepository.update(input.chatId, {
+      modelRef: input.modelRef, modelSelection: 'explicit', updatedAt: Date.now(),
+    });
   });
 
   registerHandler('chat:setMode', ipc['chat:setMode'], async (input) =>
@@ -135,6 +139,18 @@ export function registerChatHandlers(host: RuntimeHost): void {
       host.checkpointRepository.listByChat(input.chatId),
       host.taskRepository.listByChat(input.chatId),
     ]);
-    return { messages, toolCalls: toolCallsByRun.flat(), checkpoints, tasks };
+    const latestRun = runs.at(-1);
+    const modelResolution = latestRun?.effectiveConfig?.modelResolution;
+    return {
+      messages, toolCalls: toolCallsByRun.flat(), checkpoints, tasks,
+      ...(latestRun ? {
+        lastRun: {
+          id: latestRun.id,
+          state: latestRun.state,
+          ...(latestRun.error ? { error: latestRun.error } : {}),
+        },
+      } : {}),
+      ...(modelResolution ? { modelResolution } : {}),
+    };
   });
 }

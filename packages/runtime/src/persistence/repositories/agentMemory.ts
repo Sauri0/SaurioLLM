@@ -52,28 +52,44 @@ export interface AgentMemoryUpsertInput {
   invalidatedAt?: number;
 }
 
+export interface AgentMemoryListOptions {
+  /** Sólo para un perfil con alcance `project`: no incorpora las filas globales del mismo agente. */
+  includeGlobal?: boolean;
+}
+
 export interface AgentMemoryRepository {
+  get(id: string): Promise<AgentMemory | undefined>;
   /** Doc 19 §1.7 (T09): sin `projectId`, devuelve solo las memorias GLOBALES del agente
-   *  (`project_id IS NULL`) — nunca "todas, de cualquier proyecto". Excluye filas invalidadas. */
-  list(agentId: string, projectId?: string): Promise<AgentMemory[]>;
+   *  (`project_id IS NULL`) — nunca "todas, de cualquier proyecto". Excluye filas invalidadas y expiradas. */
+  list(agentId: string, projectId?: string, options?: AgentMemoryListOptions): Promise<AgentMemory[]>;
   upsert(input: AgentMemoryUpsertInput): Promise<AgentMemory>;
   delete(id: string): Promise<void>;
 }
 
 export function createAgentMemoryRepository(driver: SqliteDriver): AgentMemoryRepository {
   return {
-    async list(agentId: string, projectId?: string): Promise<AgentMemory[]> {
+    async get(id: string): Promise<AgentMemory | undefined> {
+      const row = driver.prepare<AgentMemoryRow>('SELECT * FROM agent_memories WHERE id = ?').get(id);
+      return row ? rowToMemory(row) : undefined;
+    },
+
+    async list(agentId: string, projectId?: string, options: AgentMemoryListOptions = {}): Promise<AgentMemory[]> {
+      const now = Date.now();
+      const activeClause = 'invalidated_at IS NULL AND (expires_at IS NULL OR expires_at > ?)';
       if (projectId) {
+        const scopeClause = options.includeGlobal === false
+          ? 'project_id = ?'
+          : '(project_id = ? OR project_id IS NULL)';
         return driver.prepare<AgentMemoryRow>(
           `SELECT * FROM agent_memories
-           WHERE agent_id = ? AND (project_id = ? OR project_id IS NULL) AND invalidated_at IS NULL
+           WHERE agent_id = ? AND ${scopeClause} AND ${activeClause}
            ORDER BY updated_at DESC`,
-        ).all(agentId, projectId).map(rowToMemory);
+        ).all(agentId, projectId, now).map(rowToMemory);
       }
       return driver.prepare<AgentMemoryRow>(
-        `SELECT * FROM agent_memories WHERE agent_id = ? AND project_id IS NULL AND invalidated_at IS NULL
+        `SELECT * FROM agent_memories WHERE agent_id = ? AND project_id IS NULL AND ${activeClause}
          ORDER BY updated_at DESC`,
-      ).all(agentId).map(rowToMemory);
+      ).all(agentId, now).map(rowToMemory);
     },
 
     async upsert(input: AgentMemoryUpsertInput): Promise<AgentMemory> {

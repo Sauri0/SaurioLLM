@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from 'react';
 import type { DownloadJob } from '@saurio/shared';
 import { invoke, onEvent } from '../../ipc/client.js';
 import { formatBytes } from './format.js';
+import { mergeDownloadSnapshot, retryRequest, upsertDownloadJob, visibleDownloadError } from './downloadUi.js';
 
 const STATUS_LABELS: Record<DownloadJob['status'], string> = {
   queued: 'en cola', running: 'descargando', paused: 'pausada',
@@ -17,10 +18,12 @@ const STATUS_LABELS: Record<DownloadJob['status'], string> = {
 export function DownloadsTab(): React.JSX.Element {
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      setJobs(await invoke('models:downloads', undefined));
+      const snapshot = await invoke('models:downloads', undefined);
+      setJobs((current) => mergeDownloadSnapshot(current, snapshot));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -28,14 +31,41 @@ export function DownloadsTab(): React.JSX.Element {
 
   useEffect(() => {
     void refresh();
-    const offProgress = onEvent('download:progress', (job) =>
-      setJobs((prev) => (prev.some((j) => j.id === job.id) ? prev.map((j) => (j.id === job.id ? job : j)) : [job, ...prev])));
-    const offDone = onEvent('download:done', (job) =>
-      setJobs((prev) => prev.map((j) => (j.id === job.id ? job : j))));
-    const offFailed = onEvent('download:failed', ({ downloadId, error: err }) =>
-      setJobs((prev) => prev.map((j) => (j.id === downloadId ? { ...j, status: 'failed', error: err } : j))));
+    const offProgress = onEvent('download:progress', (job) => setJobs((prev) => upsertDownloadJob(prev, job)));
+    const offDone = onEvent('download:done', (job) => setJobs((prev) => upsertDownloadJob(prev, job)));
+    const offFailed = onEvent('download:failed', (job) => setJobs((prev) => upsertDownloadJob(prev, job)));
     return () => { offProgress(); offDone(); offFailed(); };
   }, [refresh]);
+
+  const retry = useCallback(async (job: DownloadJob) => {
+    setRetryingId(job.id);
+    setError(null);
+    try {
+      const request = retryRequest(job);
+      if (request.channel === 'models:pullExternal') {
+        await invoke(request.channel, request.input);
+      } else {
+        await invoke(request.channel, request.input);
+      }
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRetryingId(null);
+    }
+  }, [refresh]);
+
+  const cancel = useCallback(async (job: DownloadJob) => {
+    setRetryingId(job.id);
+    setError(null);
+    try {
+      await invoke('models:pullCancel', { downloadId: job.id });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRetryingId(null);
+    }
+  }, []);
 
   if (jobs.length === 0) {
     return (
@@ -58,7 +88,9 @@ export function DownloadsTab(): React.JSX.Element {
                 <strong className="saurio-mono saurio-row__title">{job.modelName}</strong>
                 <span className="saurio-row__badges">
                   <span className={`saurio-badge ${job.status === 'done' ? 'measured' : job.status === 'failed' || job.status === 'insufficient_space' ? 'unavailable' : ''}`}>
-                    {STATUS_LABELS[job.status]}
+                    {job.status === 'running' && job.phase === 'verifying' ? 'verificando archivo'
+                      : job.status === 'running' && job.phase === 'importing' ? 'preparando modelo'
+                        : STATUS_LABELS[job.status]}
                   </span>
                 </span>
               </div>
@@ -67,10 +99,24 @@ export function DownloadsTab(): React.JSX.Element {
               </div>
               <div className="saurio-row__line">
                 {formatBytes(job.completedBytes)} / {formatBytes(job.totalBytes)} ({pct}%)
-                {job.bytesPerSec !== undefined && job.bytesPerSec > 0 && ` · ${formatBytes(job.bytesPerSec)}/s`}
-                {job.etaMs !== undefined && ` · ETA ${Math.ceil(job.etaMs / 1000)}s`}
+                {job.phase !== 'importing' && job.phase !== 'verifying' && job.bytesPerSec !== undefined && job.bytesPerSec > 0 && ` · ${formatBytes(job.bytesPerSec)}/s`}
+                {job.phase !== 'importing' && job.phase !== 'verifying' && job.etaMs !== undefined && ` · ETA ${Math.ceil(job.etaMs / 1000)}s`}
               </div>
-              {job.error && <div className="saurio-row__line saurio-row__line--danger">{job.error}</div>}
+              {job.error && <div className="saurio-row__line saurio-row__line--danger">{visibleDownloadError(job.error)}</div>}
+              {(job.status === 'queued' || job.status === 'running') && (
+                <div className="saurio-row__line">
+                  <button type="button" disabled={retryingId === job.id} onClick={() => void cancel(job)}>
+                    {retryingId === job.id ? 'Cancelando…' : 'Cancelar'}
+                  </button>
+                </div>
+              )}
+              {(job.status === 'failed' || job.status === 'insufficient_space' || job.status === 'cancelled') && (
+                <div className="saurio-row__line">
+                  <button type="button" disabled={retryingId === job.id} onClick={() => void retry(job)}>
+                    {retryingId === job.id ? 'Reintentando…' : 'Reintentar'}
+                  </button>
+                </div>
+              )}
             </div>
           );
         })}

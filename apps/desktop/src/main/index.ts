@@ -19,6 +19,8 @@ import { registerMetricsHandlers } from './ipc/metrics.js';
 import { registerSettingsHandlers } from './ipc/settings.js';
 import { registerBenchHandlers } from './ipc/bench.js';
 import { registerOllamaHandlers } from './ipc/ollama.js';
+import { registerEngineHandlers } from './ipc/engine.js';
+import { ManagedOllamaInstaller, MANAGED_OLLAMA_URL } from './services/ollama-process/ManagedOllamaInstaller.js';
 import { OllamaProcessManager } from './services/ollama-process/index.js';
 import { registerTerminalHandlers, type TerminalPortOpener } from './ipc/terminal.js';
 import { registerFilesHandlers, closeAllFileWatchers, type FilesChangeEmitter } from './ipc/files.js';
@@ -33,7 +35,7 @@ import { SqlMetricsMinuteRepository } from './services/metrics/SqlMetricsMinuteR
 import { MetricsTicker } from './services/metrics/MetricsTicker.js';
 import { createSmokeRecorder, isSmokeRun } from './smoke.js';
 import { startAutoUpdater } from './services/updater/index.js';
-import { createShutdown } from './host/shutdown.js';
+import { createSafeShutdownController, createShutdown, type SafeShutdownController } from './host/shutdown.js';
 
 app.setName('SaurioLLM');
 
@@ -53,7 +55,14 @@ app.setName('SaurioLLM');
  * diálogo pero armado por nosotros (mismo criterio que Electron, sin depender de su listener interno).
  */
 let isQuitting = false;
-app.on('before-quit', () => { isQuitting = true; });
+let safeShutdownController: SafeShutdownController | undefined;
+app.on('before-quit', (event) => {
+  if (!safeShutdownController) {
+    isQuitting = true;
+    return;
+  }
+  safeShutdownController.handleBeforeQuit(event);
+});
 
 process.removeAllListeners('uncaughtException');
 process.on('uncaughtException', (error) => {
@@ -189,7 +198,15 @@ function createMainWindow(): BrowserWindow {
   });
 
   win.once('ready-to-show', () => win.show());
-  win.on('close', () => saveWindowState(win));
+  win.on('close', (event) => {
+    saveWindowState(win);
+    // Al cerrar con la X todavía no hubo `before-quit`: conservar la ventana mientras se consulta
+    // por runs activos evita que "Seguir trabajando" deje un proceso sin interfaz.
+    if (safeShutdownController && !safeShutdownController.isFinalizing()) {
+      event.preventDefault();
+      void safeShutdownController.requestQuit();
+    }
+  });
 
   if (process.env['SAURIO_SMOKE'] === '1') {
     win.webContents.on('did-finish-load', () => console.log('[main][smoke] did-finish-load'));
@@ -418,6 +435,11 @@ app.whenReady().then(async () => {
   registerAppHandlers();
 
   const hostAdapter = createHostAdapter();
+  const engineSettings = new LocalSettingsStore(path.join(hostAdapter.paths.userDataDir, 'settings.local.json'));
+  const engineInstaller = new ManagedOllamaInstaller(hostAdapter.paths.userDataDir);
+  const managedEngine = !process.env['SAURIO_OLLAMA_URL'] && engineSettings.get('engine.mode') === 'managed';
+  const engineUrl = managedEngine ? MANAGED_OLLAMA_URL : process.env['SAURIO_OLLAMA_URL'];
+  const engineExecutable = engineInstaller.executablePath();
 
   // Tarea "carga de modelo/oom_load" punto 4: se crea ANTES de `createGlobalRuntime` (antes vivía
   // más abajo, junto a `registerOllamaHandlers`) para poder pasarle `readInferenceComputeLine()` a
@@ -426,7 +448,11 @@ app.whenReady().then(async () => {
   // clase lo arranca (`userData/logs/ollama-serve.log`); `SAURIO_OLLAMA_URL` (punto 5, solo pruebas)
   // apunta el health-check a un puerto vacío para simular "apagado" sin tocar Ollama real.
   const ollamaProcessManager = new OllamaProcessManager({
-    baseUrl: process.env['SAURIO_OLLAMA_URL'],
+    baseUrl: engineUrl,
+    attachOnly: Boolean(process.env['SAURIO_OLLAMA_URL']),
+    binaryPath: managedEngine ? () => engineExecutable : undefined,
+    processEnv: managedEngine ? { ...process.env, OLLAMA_HOST: '127.0.0.1:11435', OLLAMA_MODELS: engineInstaller.modelsDir,
+      OLLAMA_NUM_PARALLEL: '1', OLLAMA_MAX_LOADED_MODELS: '1' } : undefined,
     logsDir: hostAdapter.paths.logsDir,
   });
 
@@ -441,6 +467,8 @@ app.whenReady().then(async () => {
     // la instancia ya armada para que createRuntime.test.ts siga sin depender de Electron).
     const secureKeyStore = new SecureKeyStore(path.join(hostAdapter.paths.userDataDir, 'provider-keys.enc.json'), safeStorage);
     runtime = createGlobalRuntime(hostAdapter, {
+      ollamaBaseUrl: engineUrl,
+      managedModelsFolder: managedEngine ? engineInstaller.modelsDir : undefined,
       secureKeyStore,
       inferenceComputeSource: { read: () => ollamaProcessManager.readInferenceComputeLine() },
     });
@@ -448,7 +476,7 @@ app.whenReady().then(async () => {
     console.error('[main] no se pudo inicializar el runtime (persistencia/gateway)', error);
   }
 
-  const host = new RuntimeHost(hostAdapter, { runtime, defaultWorkingDir: app.getPath('home') });
+  const host = new RuntimeHost(hostAdapter, { runtime, defaultWorkingDir: app.getPath('home'), onProjectChanged: closeAllFileWatchers });
   let recovered;
   try {
     recovered = await host.init();
@@ -486,6 +514,7 @@ app.whenReady().then(async () => {
   // encontrar y arrancar un `ollama serve` REAL (bind al puerto real de Ollama, ignorando la URL de
   // prueba), justo lo que esta variable existe para evitar.
   registerOllamaHandlers(ollamaProcessManager);
+  registerEngineHandlers(engineInstaller, ollamaProcessManager, host.settings, runtime);
   if (process.env['SAURIO_OLLAMA_URL']) {
     console.log('[main] SAURIO_OLLAMA_URL seteada: se salta el arranque automático de ollama serve (simulación de "apagado")');
   } else {
@@ -567,7 +596,7 @@ app.whenReady().then(async () => {
         if (!win.isDestroyed()) win.webContents.send('download:done', job);
       });
     },
-    onFailed: (job, error) => { if (!win.isDestroyed()) win.webContents.send('download:failed', { downloadId: job.id, error }); },
+    onFailed: (job) => { if (!win.isDestroyed()) win.webContents.send('download:failed', job); },
   });
   win.on('closed', () => unsubscribeDownloads());
 
@@ -575,13 +604,11 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
 
-  startAutoUpdater({ host });
-
   // Apagado único, ordenado e idempotente (bug real v0.2.0: diálogo nativo "The database connection
   // is not open" al cerrar — ver ./host/shutdown.ts para la causa raíz y el orden correcto). Se
   // registra acá, al final del arranque, porque recién acá existen todas las piezas a apagar — pero
   // el ORDEN de apagado real lo decide `createShutdown`, no el orden de estas líneas.
-  app.on('before-quit', createShutdown({
+  const finalizeShutdown = createShutdown({
     stopTickers: () => metricsTicker.dispose(),
     cleanupExtras: () => {
       terminalService.closeAll();
@@ -590,8 +617,56 @@ app.whenReady().then(async () => {
       unsubscribeDownloads();
     },
     closePersistence: () => host.dispose(),
-    stopOwnOllama: () => ollamaProcessManager.stop(),
-  }));
+    stopOwnOllama: async () => {
+      engineInstaller.cancel();
+      await ollamaProcessManager.stop();
+    },
+  });
+  const showMessageBox = (options: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> => {
+    const owner = BrowserWindow.getFocusedWindow() ?? (win.isDestroyed() ? undefined : win);
+    return owner ? dialog.showMessageBox(owner, options) : dialog.showMessageBox(options);
+  };
+  safeShutdownController = createSafeShutdownController({
+    listActiveRuns: () => host.listActiveRuns(),
+    confirmActiveRuns: async (count) => {
+      const result = await showMessageBox({
+        type: 'warning',
+        title: 'Hay trabajo en curso',
+        message: count === 1 ? 'Hay una tarea activa.' : `Hay ${count} tareas activas.`,
+        detail: 'Podés seguir trabajando o detener las tareas y cerrar cuando sus últimos eventos queden guardados.',
+        buttons: ['Seguir trabajando', 'Detener y cerrar'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      return result.response === 1 ? 'stop_and_quit' : 'continue_working';
+    },
+    cancelActiveRunsAndWait: () => host.cancelAllActiveRunsAndWait(),
+    showShutdownError: async (error) => {
+      console.error('[main] no se pudo completar el cierre seguro', error);
+      const message = error instanceof Error ? error.message : String(error);
+      const result = await showMessageBox({
+        type: 'error',
+        title: 'No se pudo cerrar de forma segura',
+        message: 'SaurioLLM sigue abierto para no perder trabajo.',
+        detail: `${message}\n\nPodés reintentar o seguir trabajando.`,
+        buttons: ['Seguir trabajando', 'Reintentar'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      return result.response === 1 ? 'retry' : 'continue_working';
+    },
+    finalize: finalizeShutdown,
+    onFinalizing: () => { isQuitting = true; },
+    // Segunda pasada: el controlador ya marcó `finalizing`, por lo que before-quit y close dejan
+    // avanzar a Electron. electron-updater mantiene autoInstallOnAppQuit para el camino "Más tarde".
+    resumeQuit: () => app.quit(),
+  });
+
+  // El actualizador se inicia después de instalar la puerta de cierre; su "Reiniciar ahora" queda
+  // sujeto a la misma comprobación y, además, ActiveRunTracker ya posterga el aviso con runs activos.
+  startAutoUpdater({ host });
 });
 
 app.on('window-all-closed', () => {

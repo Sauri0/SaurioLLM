@@ -48,7 +48,7 @@ export function ModelLoadingBanner(
   return (
     <div className="model-loading-banner" role="status" aria-live="polite">
       <span className="model-loading-banner__spinner" aria-hidden="true" />
-      <span>Cargando modelo… {formatElapsed(Date.now() - startedAt)}</span>
+      <span>{runState === 'generating' ? 'Esperando la primera respuesta…' : runState === 'queued' ? 'En cola…' : 'Preparando el chat…'} {formatElapsed(Date.now() - startedAt)}</span>
       <button type="button" className="saurio-btn-ghost model-loading-banner__cancel" onClick={onCancel}>
         Cancelar
       </button>

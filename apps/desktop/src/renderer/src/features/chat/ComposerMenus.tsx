@@ -3,6 +3,7 @@
 // fila de controles sueltos". apps/desktop/src/renderer/src/features/chat/ComposerMenus.tsx.
 import { useEffect, useRef, useState } from 'react';
 import type { ChatPermissionPreset, Effort, Mode } from '@saurio/shared';
+import { CHAT_PERMISSION_INFO } from './chatPermissionDisplay.js';
 import { ChevronDownIcon } from '../../ui/icons.js';
 
 /** Menú desplegable genérico: botón disparador + panel que se cierra solo (click afuera / Escape).
@@ -131,33 +132,30 @@ export function EffortMenu({ effort, disabled, onChange }: { effort: Effort; dis
   );
 }
 
-const PERMISSION_INFO: Record<ChatPermissionPreset, { label: string; description: string; risk: 'low' | 'medium' | 'high' }> = {
-  ask: { label: 'Preguntar siempre', description: 'Pide tu confirmación antes de cualquier lectura o cambio.', risk: 'low' },
-  edit_in_folder: { label: 'Editar en la carpeta', description: 'Lee y edita archivos del proyecto sin preguntar; comandos y borrados siguen pidiendo permiso.', risk: 'medium' },
-  full_in_folder: { label: 'Acceso total en la carpeta', description: 'Lee, edita, borra y ejecuta comandos dentro del proyecto sin preguntar.', risk: 'medium' },
-  unrestricted: { label: 'Sin límites', description: 'Sin restricciones, ni siquiera fuera de la carpeta del proyecto. Requiere confirmación explícita.', risk: 'high' },
-};
 const PERMISSION_ORDER: ChatPermissionPreset[] = ['ask', 'edit_in_folder', 'full_in_folder', 'unrestricted'];
 
-export function PermissionMenu({ preset, disabled, onChange }: {
-  preset: ChatPermissionPreset;
+export function PermissionMenu({ preset, effectiveLabel, effectiveDescription, disabled, onChange }: {
+  preset: ChatPermissionPreset | undefined;
+  effectiveLabel?: string;
+  effectiveDescription?: string;
   disabled?: boolean;
   /** `confirmed` es `true` cuando el usuario ya confirmó el diálogo de "Sin límites" acá mismo — el
    *  caller lo reenvía tal cual a `chat:setPermissionPreset` (el handler lo exige para `unrestricted`). */
   onChange: (p: ChatPermissionPreset, confirmed?: boolean) => void;
 }): React.JSX.Element {
   return (
-    <Dropdown disabled={disabled} trigger={<span className="composer-menu__trigger-label">{PERMISSION_INFO[preset].label}</span>}>
+    <Dropdown disabled={disabled} trigger={<span className="composer-menu__trigger-label" title={effectiveDescription}>{effectiveLabel ?? (preset ? CHAT_PERMISSION_INFO[preset].label : 'Permisos heredados')}</span>}>
       {(close) => (
         <>
-          <div className="composer-menu__heading">Permisos de este chat</div>
+          <div className="composer-menu__heading">{preset ? 'Permisos de este chat' : 'Permisos heredados · elegir un override'}</div>
+          {effectiveDescription && <div className="composer-menu__option-desc">{effectiveDescription}</div>}
           {PERMISSION_ORDER.map((p) => (
             <MenuOption
               key={p}
               active={p === preset}
-              title={PERMISSION_INFO[p].label}
-              description={PERMISSION_INFO[p].description}
-              risk={PERMISSION_INFO[p].risk}
+              title={CHAT_PERMISSION_INFO[p].label}
+              description={CHAT_PERMISSION_INFO[p].description}
+              risk={CHAT_PERMISSION_INFO[p].risk}
               onClick={() => {
                 if (p === 'unrestricted') {
                   const confirmed = window.confirm(

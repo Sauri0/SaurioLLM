@@ -30,6 +30,7 @@ const HfSearchResponseSchema = z.array(HfSearchItemSchema);
 const HfSiblingSchema = z.object({
   rfilename: z.string(),
   size: z.number().optional(),
+  lfs: z.object({ sha256: z.string().regex(/^[a-f0-9]{64}$/i), size: z.number().optional() }).optional(),
 });
 const HfModelDetailSchema = z.object({
   id: z.string(),
@@ -50,6 +51,8 @@ export interface HuggingFaceSearchResult {
 export interface HuggingFaceGgufFile {
   filename: string;
   sizeBytes?: number;
+  /** Digest publicado por HF para verificar el archivo completo antes de importarlo. */
+  sha256?: string;
   /** `undefined` si el nombre del archivo no sigue la convención `<...>-<QUANT>.gguf` reconocible
    *  (ej. un README.md incluido en el listado de siblings, o un .gguf sin sufijo de cuantización) —
    *  nunca se inventa un valor, el llamador decide si igual lo ofrece (con el nombre completo). */
@@ -58,10 +61,12 @@ export interface HuggingFaceGgufFile {
 
 /** "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf" -> "Q4_K_M"; "...-IQ3_XS.gguf" -> "IQ3_XS"; "...-f16.gguf"
  *  -> "f16". Cubre las familias de cuantización de llama.cpp/GGUF vistas en los fixtures reales
- *  (`Q\d`, `IQ\d`, `f16`/`F16`, `bf16`). No matchea archivos sin ese patrón (`.imatrix`, `README.md`,
- *  `.gitattributes`) — quedan con `quant: undefined`. */
+ *  (`Q\d`, `IQ\d`, `f16`/`F16`, `bf16`) sin asumir mayúsculas: repos oficiales también publican
+ *  sufijos como `q8_0`. Devuelve la grafía original del filename. No matchea archivos sin una familia
+ *  conocida (`.imatrix`, `README.md`, `.gitattributes` o `-experimental.gguf`), que conservan
+ *  `quant: undefined`. */
 function parseQuantFromFilename(filename: string): string | undefined {
-  const m = /-((?:I?Q\d[\w]*|[Ff]16|[Bb][Ff]16))\.gguf$/.exec(filename);
+  const m = /-((?:I?Q\d[\w]*|F16|BF16))\.gguf$/i.exec(filename);
   return m ? m[1] : undefined;
 }
 
@@ -76,8 +81,12 @@ export class HuggingFaceClient {
     this.fetchImpl = opts.fetchImpl ?? fetch;
   }
 
-  private async fetchJson<T>(url: string): Promise<T> {
-    const response = await this.fetchImpl(url, { headers: { accept: 'application/json' } });
+  private async fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+    const timeout = AbortSignal.timeout(30_000);
+    const response = await this.fetchImpl(url, {
+      headers: { accept: 'application/json' },
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status} para ${url}`);
     return (await response.json()) as T;
   }
@@ -102,12 +111,15 @@ export class HuggingFaceClient {
   /** Lista los archivos `.gguf` de un repo con tamaño real (`?blobs=true` — confirmado en vivo esta
    *  sesión) y la cuantización parseada del nombre. Un repo sin ningún `.gguf` devuelve `[]` (no es un
    *  error: el llamador decide qué mostrar, p. ej. "este repo no tiene variantes GGUF"). */
-  async listGgufFiles(modelId: string): Promise<HuggingFaceGgufFile[]> {
+  async listGgufFiles(modelId: string, signal?: AbortSignal): Promise<HuggingFaceGgufFile[]> {
     const url = `${HF_API_BASE}/models/${modelId}?blobs=true`;
-    const detail = HfModelDetailSchema.parse(await this.fetchJson<unknown>(url));
+    const detail = HfModelDetailSchema.parse(await this.fetchJson<unknown>(url, signal));
     return (detail.siblings ?? [])
       .filter((s) => s.rfilename.toLowerCase().endsWith('.gguf'))
-      .map((s) => ({ filename: s.rfilename, sizeBytes: s.size, quant: parseQuantFromFilename(s.rfilename) }));
+      .map((s) => ({
+        filename: s.rfilename, sizeBytes: s.size ?? s.lfs?.size, quant: parseQuantFromFilename(s.rfilename),
+        ...(s.lfs ? { sha256: s.lfs.sha256.toLowerCase() } : {}),
+      }));
   }
 
   /** [VERIFICADO EN DOC OFICIAL: huggingface.co/docs/hub/en/ollama] Formato vigente de referencia que

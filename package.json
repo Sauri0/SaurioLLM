@@ -1,7 +1,7 @@
 {
   "name": "saurio",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "SaurioLLM — monorepo raíz (workspace pnpm); sin dependencias de runtime propias (doc 02 §4.1)",
   "author": "Sauri0",
   "license": "MIT",
@@ -13,7 +13,8 @@
     "dev": "pnpm --filter @saurio/desktop run dev",
     "build": "pnpm --filter @saurio/desktop run build",
     "typecheck": "tsc --build",
-    "test": "pnpm --filter @saurio/runtime --filter @saurio/repomap --filter @saurio/desktop run test",
+    "test": "pnpm test:eval:unit && pnpm --filter @saurio/runtime --filter @saurio/repomap --filter @saurio/desktop run test",
+    "test:eval:unit": "vitest run eval/runWatcher.test.ts eval/harnessAssertions.test.ts",
     "test:eval": "tsx eval/harness.ts",
     "db:rebuild": "pnpm --filter @saurio/runtime run db:rebuild",
     "build:model-catalog": "node scripts/build-model-catalog.mjs",

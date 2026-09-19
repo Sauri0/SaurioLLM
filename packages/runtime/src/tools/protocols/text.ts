@@ -25,10 +25,21 @@ export class TextToolProtocol implements ToolProtocol {
       '</tool_call>',
       '',
       'No hay tool_calls nativos en este modelo: cualquier llamada tiene que ir en ese formato exacto,',
-      'sin texto antes ni después del bloque salvo que sea tu respuesta final (sin tool call).',
+      'sin texto antes ni después del bloque.',
+      'Una respuesta sin <tool_call> se considera tu respuesta final y termina este run.',
+      'Si el pedido concreto requiere leer, buscar o modificar el proyecto y una tool puede obtener lo necesario,',
+      'no respondas en prosa ni le pidas al usuario que copie o confirme contenido o permisos: emití ahora la primera tool necesaria.',
+      'Si el usuario nombró una ruta que todavía no leíste en este run, usá read_file antes de editarla.',
+      'Respondé directamente con texto sólo para conversación o preguntas que no requieren tools,',
+      'o si falta una decisión del usuario que ninguna tool disponible puede obtener.',
       '',
       'Tools:',
       list,
+      '',
+      'REGLA OPERATIVA FINAL: ante un pedido de modificación que nombra una ruta, si todavía no recibiste',
+      'un <tool_result name="read_file"> para esa ruta en este run, tu próxima respuesta DEBE ser exclusivamente',
+      'la llamada a read_file. Nunca le pidas al usuario que proporcione o confirme el contenido del archivo.',
+      'Esta regla no aplica a saludos ni a preguntas generales que pueden responderse sin inspeccionar el proyecto.',
     ].join('\n');
     return { systemSuffix, stop: ['</tool_call>'] };
   }

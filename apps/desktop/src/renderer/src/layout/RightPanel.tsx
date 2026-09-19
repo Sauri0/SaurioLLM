@@ -27,6 +27,7 @@ const TABS: { id: ContextTabId; icon: typeof FileIcon }[] = [
 export interface RightPanelProps {
   projectId: string | null;
   chatId: string | null;
+  onClose?: () => void;
 }
 
 /** Franja angosta que reemplaza al panel cuando está oculto (punto 2: "botón para ocultarlo") — un
@@ -45,7 +46,7 @@ export function ContextPanelRail(): React.JSX.Element {
   );
 }
 
-export function RightPanel({ projectId, chatId }: RightPanelProps): React.JSX.Element {
+export function RightPanel({ projectId, chatId, onClose }: RightPanelProps): React.JSX.Element {
   const tab = useUiNavStore((s) => s.contextTab);
   const setTab = useUiNavStore((s) => s.setContextTab);
   const setContextOpen = useUiNavStore((s) => s.setContextOpen);
@@ -54,28 +55,40 @@ export function RightPanel({ projectId, chatId }: RightPanelProps): React.JSX.El
   return (
     <section className="saurio-right-panel" aria-label="Panel de archivos, cambios y terminal" style={{ width }}>
       <div className="saurio-tabs" role="tablist">
-        {TABS.map(({ id, icon: Icon }) => (
-          <div
+        {TABS.map(({ id, icon: Icon }, index) => (
+          <button
             key={id}
+            type="button"
             role="tab"
+            tabIndex={tab === id ? 0 : -1}
             aria-selected={tab === id}
+            aria-controls="saurio-context-tab-body"
             className={`saurio-tab${tab === id ? ' active' : ''}`}
             onClick={() => setTab(id)}
+            onKeyDown={(event) => {
+              if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+              event.preventDefault();
+              const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? TABS.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + TABS.length) % TABS.length;
+              const next = TABS[nextIndex]!;
+              setTab(next.id);
+              event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIndex]?.focus();
+            }}
           >
             <Icon width={15} height={15} />
             <span className="saurio-tab__label">{id}</span>
-          </div>
+          </button>
         ))}
         <button
           type="button"
           className="saurio-context-panel__close"
           title="Ocultar panel"
-          onClick={() => setContextOpen(false)}
+          aria-label="Ocultar panel de archivos, cambios y terminal"
+          onClick={() => (onClose ? onClose() : setContextOpen(false))}
         >
           <CloseIcon width={14} height={14} />
         </button>
       </div>
-      <div className="saurio-tab-body">
+      <div id="saurio-context-tab-body" className="saurio-tab-body" role="tabpanel" aria-label={tab}>
         {tab === 'Archivos' && <FilesPanel projectId={projectId} />}
         {tab === 'Cambios' && <DiffPanel chatId={chatId} />}
         {tab === 'Terminal' && (

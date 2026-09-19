@@ -18,6 +18,7 @@ import { getDemoRightPanelTab, isDemoMode } from '../demo/demoState.js';
 
 /** Las seis secciones de la barra de navegación izquierda (punto 1 del encargo de rediseño). */
 export type SectionId = 'inicio' | 'chats' | 'modelos' | 'agentes' | 'rendimiento' | 'ajustes';
+export type SettingsTabId = 'local' | 'providers' | 'context' | 'app';
 
 /** Pestañas del panel CONTEXTUAL de la vista Chats (punto 2): solo lo que acompaña a un chat
  *  puntual. "Cambios" es el nombre completo de lo que antes era la pestaña abreviada "Diff". */
@@ -109,6 +110,8 @@ interface UiNavState {
   contextWidth: number;
   contextTab: ContextTabId;
   onboardingOpen: boolean;
+  settingsTab: SettingsTabId;
+  setSettingsTab: (tab: SettingsTabId) => void;
   setSection: (section: SectionId) => void;
   /** Compatibilidad con el vocabulario de pestaña anterior al rediseño (ver comentario de arriba). */
   requestTab: (tab: RightPanelTabId) => void;
@@ -128,6 +131,8 @@ export const useUiNavStore = create<UiNavState>()(
       contextTab: initialContext().tab,
       contextWidth: CONTEXT_WIDTH_DEFAULT,
       onboardingOpen: false,
+      settingsTab: 'local',
+      setSettingsTab: (settingsTab) => set({ settingsTab }),
 
       setSection: (section) => set({ section }),
 
@@ -143,7 +148,9 @@ export const useUiNavStore = create<UiNavState>()(
 
       toggleContext: () => set((s) => ({ contextOpen: !s.contextOpen })),
       setContextOpen: (open) => set({ contextOpen: open }),
-      setContextTab: (tab) => set({ contextTab: tab, contextOpen: true }),
+      // Cambiar la pestaña del panel visible no cambia la preferencia de escritorio: también se
+      // usa en la vista compacta. Para solicitar abrir el panel desde otra sección está requestTab.
+      setContextTab: (tab) => set({ contextTab: tab }),
       setContextWidth: (width) => set({ contextWidth: clampContextWidth(width) }),
 
       openOnboarding: () => set({ onboardingOpen: true }),
@@ -156,10 +163,11 @@ export const useUiNavStore = create<UiNavState>()(
       // de una corrida anterior sobre la misma máquina — cada captura tiene que partir del estado que
       // pide su propio `?demoState=`, no del último `localStorage` que haya quedado.
       skipHydration: isDemoMode(),
-      // Sin `partialize`: persist ya descarta las funciones al serializar con `JSON.stringify` (no
-      // son serializables), así que solo los cuatro campos de datos (`section`/`contextOpen`/
-      // `contextTab`/`contextWidth`) terminan en `localStorage`; al rehidratar, el `merge` default de
-      // zustand (`{ ...creado, ...persistido }`) los combina con las funciones del store recién creado.
+      partialize: (state) => ({ section: state.section, contextOpen: state.contextOpen,
+        contextTab: state.contextTab, contextWidth: state.contextWidth }),
+      // Una versión anterior persistía también el modal transitorio. Su apertura se decide desde
+      // onboarding.completed o por una acción explícita, nunca desde un modal viejo en localStorage.
+      merge: (persisted, current) => ({ ...current, ...(persisted as Partial<UiNavState>), onboardingOpen: false }),
     },
   ),
 );

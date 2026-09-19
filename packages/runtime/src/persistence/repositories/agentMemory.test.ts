@@ -79,6 +79,23 @@ describe('AgentMemoryRepository — privacidad por proyecto (T09)', () => {
     expect(await repo.list(agentId, 'proj-A')).toHaveLength(0);
   });
 
+  it('el alcance de proyecto puede excluir memorias globales del mismo agente', async () => {
+    const repo = createAgentMemoryRepository(driver);
+    await repo.upsert({ agentId, content: 'global', sourceKind: 'user_stated', confidence: 'confirmed' });
+    await repo.upsert({ agentId, projectId: 'proj-A', content: 'sólo A', sourceKind: 'user_stated', confidence: 'confirmed' });
+
+    expect((await repo.list(agentId, 'proj-A', { includeGlobal: false })).map((memory) => memory.content)).toEqual(['sólo A']);
+  });
+
+  it('una memoria expirada no aparece en list()', async () => {
+    const repo = createAgentMemoryRepository(driver);
+    await repo.upsert({
+      agentId, projectId: 'proj-A', content: 'ya no válida', sourceKind: 'user_stated', confidence: 'confirmed',
+      expiresAt: Date.now() - 1,
+    });
+    expect(await repo.list(agentId, 'proj-A')).toEqual([]);
+  });
+
   it('una memoria invalidada no aparece en list()', async () => {
     const repo = createAgentMemoryRepository(driver);
     const created = await repo.upsert({ agentId, projectId: 'proj-A', content: 'obsoleta', sourceKind: 'user_stated', confidence: 'confirmed' });

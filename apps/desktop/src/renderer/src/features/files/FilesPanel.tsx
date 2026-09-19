@@ -12,6 +12,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import type { FileTreeNode } from '@saurio/shared';
 import { invoke, onEvent } from '../../ipc/client.js';
 import { isDemoMode } from '../../demo/demoState.js';
+import { FileSearchPanel } from './FileSearchPanel.js';
 
 const FileViewer = lazy(() => import('./FileViewer.js').then((m) => ({ default: m.FileViewer })));
 
@@ -51,6 +52,14 @@ export function formatSize(bytes: number | undefined): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+export function acceptsFileResponse(currentProjectId: string | null, requestProjectId: string, currentPath: string | null, requestPath?: string): boolean {
+  return currentProjectId === requestProjectId && (requestPath === undefined || currentPath === requestPath);
+}
+
+export function fileTreeRowKey(projectId: string, relPath: string): string {
+  return `${projectId}:${relPath}`;
+}
+
 interface TreeRowProps {
   node: FileTreeNode;
   depth: number;
@@ -59,38 +68,45 @@ interface TreeRowProps {
   demoChildren?: DemoNode[];
   loadChildren: (relPath: string) => Promise<FileTreeNode[]>;
   onSelectFile: (relPath: string) => void;
+  revision: number;
 }
 
-function TreeRow({ node, depth, selected, dirty, demoChildren, loadChildren, onSelectFile }: TreeRowProps): React.JSX.Element {
+function TreeRow({ node, depth, selected, dirty, demoChildren, loadChildren, onSelectFile, revision }: TreeRowProps): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [children, setChildren] = useState<FileTreeNode[] | null>(demoChildren ?? null);
+  const childrenRequestRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const isDir = node.kind === 'dir';
   const isDirty = node.externallyModified || dirty.has(node.relPath);
 
-  const toggle = useCallback(async () => {
-    if (!isDir) return;
-    if (open) { setOpen(false); return; }
-    setOpen(true);
-    if (children !== null) return; // ya cargados (perezoso: solo se pide una vez por carpeta)
+  const toggle = useCallback(() => { if (isDir) setOpen((current) => !current); }, [isDir]);
+
+  useEffect(() => {
+    if (!isDir || !open || demoChildren !== undefined) return;
+    const request = ++childrenRequestRef.current;
     setLoading(true);
     setError(null);
-    try {
-      setChildren(await loadChildren(node.relPath));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [isDir, open, children, loadChildren, node.relPath]);
+    void loadChildren(node.relPath).then((nextChildren) => {
+      if (childrenRequestRef.current === request) setChildren(nextChildren);
+    }).catch((err: unknown) => {
+      if (childrenRequestRef.current === request) setError(err instanceof Error ? err.message : String(err));
+    }).finally(() => {
+      if (childrenRequestRef.current === request) setLoading(false);
+    });
+    return () => { childrenRequestRef.current += 1; };
+  }, [demoChildren, isDir, loadChildren, node.relPath, open, revision]);
 
   return (
     <div>
       <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={isDir ? open : undefined}
         className={`saurio-sidebar-item${selected === node.relPath ? ' active' : ''}`}
         style={{ paddingLeft: 10 + depth * 14 }}
         onClick={() => (isDir ? void toggle() : onSelectFile(node.relPath))}
+        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); if (isDir) toggle(); else onSelectFile(node.relPath); } }}
         title={node.relPath}
       >
         {isDir ? (open ? '▾ ' : '▸ ') : '  '}
@@ -116,6 +132,7 @@ function TreeRow({ node, depth, selected, dirty, demoChildren, loadChildren, onS
           demoChildren={(child as DemoNode).children}
           loadChildren={loadChildren}
           onSelectFile={onSelectFile}
+          revision={revision}
         />
       ))}
     </div>
@@ -135,43 +152,75 @@ export function FilesPanel({ projectId }: FilesPanelProps): React.JSX.Element {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dirty, setDirty] = useState<Set<string>>(new Set());
+  const [treeRevision, setTreeRevision] = useState(0);
   const projectIdRef = useRef(projectId);
+  const selectedRef = useRef(selected);
+  const onSelectFileRef = useRef<(relPath: string) => void>(() => undefined);
+  const requestRevisionRef = useRef(0);
+  const fileRequestRevisionRef = useRef(0);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   projectIdRef.current = projectId;
+  selectedRef.current = selected;
 
   const loadRoot = useCallback(async () => {
     if (!projectId) return;
     if (demo) { setTree(DEMO_TREE); return; }
+    const requestProjectId = projectId;
+    const requestRevision = ++requestRevisionRef.current;
     setLoading(true);
     setError(null);
     try {
-      setTree(await invoke('files:tree', { projectId }));
+      const nextTree = await invoke('files:tree', { projectId: requestProjectId });
+      if (projectIdRef.current !== requestProjectId || requestRevisionRef.current !== requestRevision) return;
+      setTree(nextTree);
+      setTreeRevision((revision) => revision + 1);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (projectIdRef.current === requestProjectId && requestRevisionRef.current === requestRevision) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setLoading(false);
+      if (projectIdRef.current === requestProjectId && requestRevisionRef.current === requestRevision) setLoading(false);
     }
   }, [projectId, demo]);
 
   useEffect(() => {
+    setTree([]);
     void loadRoot();
     setSelected(null);
     setFileContent(null);
     setDirty(new Set());
   }, [loadRoot]);
 
-  // "Modificado externamente" en vivo (fs.watch de main, doc 04 §16 `files:changed`): el badge se
-  // actualiza sin tener que volver a pedir el árbol de esa carpeta.
+  // "Modificado externamente" en vivo (fs.watch de main, doc 04 §16 `files:changed`): vuelve a
+  // pedir el árbol con debounce y marca el archivo. No hay botón manual: el proyecto se mantiene
+  // actualizado mientras la app está abierta.
   useEffect(() => {
+    fileRequestRevisionRef.current += 1;
     if (demo) return;
-    return onEvent('files:changed', (event) => {
+    const unsubscribe = onEvent('files:changed', (event) => {
       if (event.projectId !== projectIdRef.current) return;
+      if (event.relPath === selectedRef.current) {
+        if (event.kind === 'removed') {
+          setFileContent(null);
+          setFileError('El archivo fue quitado del proyecto.');
+          setSelected(null);
+        } else {
+          onSelectFileRef.current(event.relPath);
+        }
+      }
       setDirty((prev) => {
         const next = new Set(prev);
         if (event.kind === 'removed') next.delete(event.relPath); else next.add(event.relPath);
         return next;
       });
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(() => void loadRoot(), 120);
     });
-  }, [demo]);
+    return () => {
+      unsubscribe();
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    };
+  }, [demo, loadRoot]);
 
   const loadChildren = useCallback(async (relPath: string): Promise<FileTreeNode[]> => {
     if (!projectId) return [];
@@ -179,13 +228,18 @@ export function FilesPanel({ projectId }: FilesPanelProps): React.JSX.Element {
   }, [projectId]);
 
   const onSelectFile = useCallback(async (relPath: string) => {
+    const requestRevision = ++fileRequestRevisionRef.current;
+    const sameSelection = selectedRef.current === relPath;
+    selectedRef.current = relPath;
     setSelected(relPath);
-    setFileContent(null);
+    if (!sameSelection) setFileContent(null);
     setFileError(null);
     if (!projectId) return;
     if (demo) { setFileContent(`// modo demo: contenido de ejemplo\n// ${relPath}\n`); return; }
+    const requestProjectId = projectId;
     try {
-      const result = await invoke('files:read', { projectId, relPath });
+      const result = await invoke('files:read', { projectId: requestProjectId, relPath });
+      if (fileRequestRevisionRef.current !== requestRevision || !acceptsFileResponse(projectIdRef.current, requestProjectId, selectedRef.current, relPath)) return;
       setFileContent(result.content);
       setDirty((prev) => {
         if (!prev.has(relPath)) return prev;
@@ -194,9 +248,12 @@ export function FilesPanel({ projectId }: FilesPanelProps): React.JSX.Element {
         return next;
       });
     } catch (err) {
-      setFileError(err instanceof Error ? err.message : String(err));
+      if (fileRequestRevisionRef.current === requestRevision && acceptsFileResponse(projectIdRef.current, requestProjectId, selectedRef.current, relPath)) {
+        setFileError(`No se pudo leer ${relPath}: ${err instanceof Error ? err.message : String(err)}. Intentá abrirlo de nuevo.`);
+      }
     }
   }, [projectId, demo]);
+  onSelectFileRef.current = onSelectFile;
 
   if (!projectId) return <p className="saurio-empty">Abrí un proyecto para ver su árbol de archivos.</p>;
 
@@ -204,15 +261,16 @@ export function FilesPanel({ projectId }: FilesPanelProps): React.JSX.Element {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
         <strong>Archivos</strong>
-        <button onClick={() => void loadRoot()} disabled={loading}>{loading ? 'Actualizando…' : 'Actualizar'}</button>
+        <span className="saurio-row__meta">{loading ? 'Actualizando…' : 'Actualización automática'}</span>
       </div>
+      <FileSearchPanel key={projectId} projectId={projectId} onSelectFile={onSelectFile} />
       {error && <div className="saurio-banner danger">{error}</div>}
       <div style={{ display: 'flex', gap: 8, flex: 1, minHeight: 0 }}>
         <div style={{ flex: selected ? '0 0 45%' : '1 1 auto', overflow: 'auto' }}>
           {tree.length === 0 && !loading && !error && <p className="saurio-empty">Sin archivos indexados.</p>}
           {tree.map((node) => (
             <TreeRow
-              key={node.relPath}
+              key={fileTreeRowKey(projectId, node.relPath)}
               node={node}
               depth={0}
               selected={selected}
@@ -220,6 +278,7 @@ export function FilesPanel({ projectId }: FilesPanelProps): React.JSX.Element {
               demoChildren={(node as DemoNode).children}
               loadChildren={loadChildren}
               onSelectFile={onSelectFile}
+              revision={treeRevision}
             />
           ))}
         </div>

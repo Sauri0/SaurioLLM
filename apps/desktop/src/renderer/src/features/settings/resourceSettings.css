@@ -1,0 +1,12 @@
+.resource-settings { display: flex; flex-direction: column; gap: var(--space-3); }
+.resource-settings__header { display: flex; justify-content: space-between; gap: var(--space-3); align-items: flex-start; }
+.resource-settings__header h3 { margin: 0; }
+.resource-settings__header p { margin: var(--space-1) 0 0; color: var(--text-secondary); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.resource-settings__controls { display: grid; gap: var(--space-2); border: 0; padding: 0; margin: 0; }
+.resource-settings__controls legend, .resource-settings__legend { font-size: var(--text-sm); font-weight: 600; margin-top: var(--space-1); }
+.resource-settings__presets { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-3); }
+.resource-settings__presets label { color: var(--text-secondary); font-size: var(--text-sm); }
+.resource-settings__threads { display: grid; gap: var(--space-1); max-width: 440px; color: var(--text-secondary); font-size: var(--text-sm); }
+.resource-settings__threads input { width: 100%; }
+.resource-settings__scope { margin: 0; color: var(--text-muted); font-size: var(--text-xs); line-height: 1.45; }
+@media (max-width: 640px) { .resource-settings__header { flex-direction: column; } }

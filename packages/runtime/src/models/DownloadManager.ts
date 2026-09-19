@@ -28,6 +28,7 @@ interface ActiveJob {
   layers: Map<string, LayerState>;
   speedSamples: { t: number; completed: number }[];
   status: DownloadJob['status'];
+  phase?: DownloadJob['phase'];
   error?: string;
   /** Todas las capas del manifest que todavía no estaban en `blobs/` al arrancar (doc 13 §5.2); se
    *  usa para "cerrar" a 100% las capas chiquitas (config/template/license) que Ollama escribe sin
@@ -57,6 +58,7 @@ function toJob(job: ActiveJob): DownloadJob {
     providerId: job.providerId,
     modelName: job.modelName,
     status: job.status,
+    phase: job.phase,
     totalBytes: job.totalBytes,
     completedBytes,
     bytesPerSec,
@@ -266,6 +268,13 @@ export class DownloadManager extends EventEmitter implements DownloadManagerCont
     this.active.set(downloadId, job);
     await this.persist(job);
 
+    // Publicar el alta antes de iniciar el stream. Un pull puede fallar al resolver el manifest
+    // remoto, sin emitir ningún chunk (caso real: HF/Xet rechazado por Ollama); sin este snapshot el
+    // renderer sólo recibía `failed` para un id que todavía no conocía y la fila desaparecía.
+    const startedJob = toJob(job);
+    this.opts.onProgress?.(startedJob);
+    this.emit('progress', startedJob);
+
     void this.runPull(job);
     return { downloadId };
   }
@@ -300,6 +309,9 @@ export class DownloadManager extends EventEmitter implements DownloadManagerCont
   private async runPull(job: ActiveJob): Promise<void> {
     try {
       for await (const chunk of this.provider.pull!(job.modelName, job.controller.signal)) {
+        job.phase = chunk.status === 'verifying sha256 digest' ? 'verifying'
+          : chunk.status === 'uploading blob' || chunk.status === 'creating model' ? 'importing'
+            : 'downloading';
         if (chunk.digest !== undefined) {
           const total = chunk.total ?? job.layers.get(chunk.digest)?.total ?? 0;
           const completed = chunk.completed ?? job.layers.get(chunk.digest)?.completed ?? 0;
@@ -328,6 +340,9 @@ export class DownloadManager extends EventEmitter implements DownloadManagerCont
       if (job.controller.signal.aborted) {
         job.status = 'cancelled';
         await this.persist(job, { finished: true });
+        const cancelledJob = toJob(job);
+        this.opts.onProgress?.(cancelledJob);
+        this.emit('progress', cancelledJob);
         // Sin evento onFailed: una cancelación pedida por el usuario no es un error (doc 13 §5.3).
         return;
       }

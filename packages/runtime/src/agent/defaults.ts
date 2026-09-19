@@ -63,6 +63,15 @@ function nearestNumCtxTier(numCtx: number): NumCtxTier {
   ));
 }
 
+function scaledTierFields(numCtx: number): Pick<ContextPolicy, 'reserveForResponse' | 'repoMapTokens'> {
+  const tier = nearestNumCtxTier(numCtx);
+  const scale = (value: number): number => Math.max(0, Math.round((value * numCtx) / tier.numCtx));
+  return {
+    reserveForResponse: scale(tier.reserveForResponse),
+    repoMapTokens: scale(tier.repoMapTokens),
+  };
+}
+
 /** `ContextPolicy` completa para un `numCtx` arbitrario: escala `reserveForResponse`/`repoMapTokens`
  *  proporcionalmente al tier de referencia más cercano (8k/16k/32k+, doc 07 §5) en vez de heredar
  *  ciegamente los valores tuneados para 8192 cuando el modelo pide otro tamaño — mismo criterio que
@@ -71,13 +80,19 @@ function nearestNumCtxTier(numCtx: number): NumCtxTier {
  *  `ContextPolicy` (ratios, límites de tools de exploración) no depende del tamaño de `numCtx`. */
 export function contextPolicyForNumCtx(numCtx: number, base: ContextPolicy = DEFAULT_CONTEXT_POLICY): ContextPolicy {
   if (numCtx === base.numCtx) return base;
-  const tier = nearestNumCtxTier(numCtx);
-  const scale = (value: number): number => Math.max(0, Math.round((value * numCtx) / tier.numCtx));
+  const target = scaledTierFields(numCtx);
+  const baseReference = scaledTierFields(base.numCtx);
+  // Conserva la intención de una policy ya ajustada (por ejemplo `effort: fast/deep` o una reserva
+  // personalizada): aplica al tier destino la misma proporción que la policy base tenía respecto del
+  // tier de su propio numCtx. Sin esto, cambiar 8k -> 40k restauraba siempre la reserva `balanced`.
+  const preserveRatio = (targetValue: number, baseValue: number, referenceValue: number): number => (
+    referenceValue > 0 ? Math.max(0, Math.round(targetValue * (baseValue / referenceValue))) : targetValue
+  );
   return {
     ...base,
     numCtx,
-    reserveForResponse: scale(tier.reserveForResponse),
-    repoMapTokens: scale(tier.repoMapTokens),
+    reserveForResponse: preserveRatio(target.reserveForResponse, base.reserveForResponse, baseReference.reserveForResponse),
+    repoMapTokens: preserveRatio(target.repoMapTokens, base.repoMapTokens, baseReference.repoMapTokens),
   };
 }
 
@@ -94,6 +109,8 @@ export const DEFAULT_SYSTEM_PROMPT = [
   'Respondé siempre en español, con explicaciones cortas y concretas.',
   'Usá las tools disponibles para leer y modificar archivos en vez de suponer su contenido.',
   'Antes de editar un archivo, leelo. Cuando termines la tarea, llamá a la tool `finish`.',
+  'En edit_file copiá old_string del contenido leído, sin resumirlo ni inventarlo. Conservá las exportaciones, firmas y funciones ajenas al cambio pedido.',
+  'Después de editar, releé el archivo modificado y comprobá que resolviste el pedido sin dejar código anterior duplicado o incompleto. Ejecutá las pruebas disponibles cuando corresponda; si no pudiste verificar algo, indicá esa limitación al terminar.',
   'No inventes rutas, funciones ni resultados de comandos: verificá con las tools.',
   // Doc 16 §4 ítem 6 ("agent: instrucción clara sobre old_string ambiguo"): sin esto, un modelo de
   // 7-8B tiende a repetir la misma llamada ambigua sin agregar contexto (hallazgo real del

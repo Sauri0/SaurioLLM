@@ -58,6 +58,39 @@ describe('gateway/providers/openai-compat/provider', () => {
     });
   });
 
+  it('listModels(): sólo el host oficial de OpenRouter incorpora precio, contexto y capabilities publicados', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      data: [{
+        id: 'openai/gpt-4', context_length: 8192,
+        pricing: { prompt: '0.00003', completion: '0.00006', request: '0', image: '0' },
+        architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+        supported_parameters: ['tools', 'reasoning'],
+      }],
+    }), { status: 200 }));
+    const provider = new OpenAICompatProvider({ id: 'router-proxy', baseUrl: 'https://openrouter.ai/api' });
+    const [model] = await provider.listModels();
+
+    expect(model).toMatchObject({
+      contextMax: 8192,
+      pricing: { promptUsdPerToken: 0.00003, completionUsdPerToken: 0.00006, requestUsd: 0, imageUsd: 0 },
+      metadataSource: 'openrouter',
+      capabilities: { tools: true, thinking: true, vision: true, embedding: false },
+    });
+    expect(model?.metadataCheckedAt).toEqual(expect.any(Number));
+  });
+
+  it('listModels(): no atribuye metadata de OpenRouter a un host compatible que la imite', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      data: [{ id: 'modelo', pricing: { prompt: '1' }, supported_parameters: ['reasoning'] }],
+    }), { status: 200 }));
+    const provider = new OpenAICompatProvider({ id: 'custom', baseUrl: 'https://openrouter.ai.ejemplo.test/v1' });
+    const [model] = await provider.listModels();
+
+    expect(model?.pricing).toBeUndefined();
+    expect(model?.metadataSource).toBeUndefined();
+    expect(model?.capabilities).toEqual({ tools: true, thinking: false, vision: false, embedding: false });
+  });
+
   it('describeModel(): modelo no listado degrada a capabilities asumidas sin lanzar', async () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: [] }), { status: 200 }));
     const provider = new OpenAICompatProvider({ id: 'lmstudio', baseUrl: 'http://127.0.0.1:1234' });
@@ -81,7 +114,37 @@ describe('gateway/providers/openai-compat/provider', () => {
       expect(done.metrics.quality).toBe('estimated');
       expect(done.metrics.promptTokens).toBe(12);
       expect(done.metrics.evalTokens).toBe(8);
+      expect(done.metrics.costSource).toBe('unavailable');
     }
+  });
+
+  it('chat(): preserva usage.cost=0 reportado por OpenRouter desde el último SSE', async () => {
+    const costLines = [
+      JSON.stringify({ choices: [{ index: 0, delta: { content: 'gratis' }, finish_reason: 'stop' }] }),
+      JSON.stringify({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 4, cost: 0 } }),
+      '[DONE]',
+    ];
+    fetchMock.mockResolvedValueOnce(mockSseResponse(costLines));
+    const provider = new OpenAICompatProvider({ id: 'openrouter', baseUrl: 'https://openrouter.ai/api' });
+    const chunks = await collect(provider.chat(BASE_CHAT_REQ, new AbortController().signal));
+    const done = chunks.at(-1);
+
+    expect(done).toMatchObject({ type: 'done', metrics: { costUsd: 0, costSource: 'reported', quality: 'estimated' } });
+  });
+
+  it('chat(): no toma usage.cost de un OpenAI-compatible que no es OpenRouter oficial', async () => {
+    const costLines = [
+      JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+      JSON.stringify({ choices: [], usage: { cost: 0.42 } }),
+      '[DONE]',
+    ];
+    fetchMock.mockResolvedValueOnce(mockSseResponse(costLines));
+    const provider = new OpenAICompatProvider({ id: 'custom', baseUrl: 'https://router-proxy.example/v1' });
+    const chunks = await collect(provider.chat(BASE_CHAT_REQ, new AbortController().signal));
+    const done = chunks.at(-1);
+
+    expect(done).toMatchObject({ type: 'done', metrics: { costSource: 'unavailable' } });
+    if (done?.type === 'done') expect(done.metrics.costUsd).toBeUndefined();
   });
 
   it('chat(): tool call partido en varios deltas se reensambla en un único ChatChunk tool_call', async () => {
@@ -149,7 +212,7 @@ describe('gateway/providers/openai-compat/provider', () => {
 
 // ── Integración opcional (solo si hay OPENAI_API_KEY/OPENROUTER_API_KEY en el entorno) ──────────
 const openaiKey = process.env.OPENAI_API_KEY;
-describe.skipIf(openaiKey === undefined || openaiKey.length === 0)('gateway/providers/openai-compat/provider (integración real con OpenAI, opcional)', () => {
+describe.skipIf(process.env.SAURIO_TEST_EXTERNAL !== '1' || openaiKey === undefined || openaiKey.length === 0)('gateway/providers/openai-compat/provider (integración real con OpenAI, opcional)', () => {
   it('chat() contra la API real de OpenAI produce al menos un chunk de contenido y un done', async () => {
     vi.unstubAllGlobals(); // esta prueba SÍ debe usar fetch real, no el mock del resto del archivo
     const provider = new OpenAICompatProvider({ id: 'openai', baseUrl: 'https://api.openai.com', getApiKey: async () => openaiKey });
@@ -165,7 +228,7 @@ describe.skipIf(openaiKey === undefined || openaiKey.length === 0)('gateway/prov
 });
 
 const openrouterKey = process.env.OPENROUTER_API_KEY;
-describe.skipIf(openrouterKey === undefined || openrouterKey.length === 0)('gateway/providers/openai-compat/provider (integración real con OpenRouter, opcional)', () => {
+describe.skipIf(process.env.SAURIO_TEST_EXTERNAL !== '1' || openrouterKey === undefined || openrouterKey.length === 0)('gateway/providers/openai-compat/provider (integración real con OpenRouter, opcional)', () => {
   it('chat() contra la API real de OpenRouter produce al menos un chunk de contenido y un done', async () => {
     vi.unstubAllGlobals();
     const provider = new OpenAICompatProvider({

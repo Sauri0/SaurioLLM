@@ -92,8 +92,8 @@ describe('MemoryEstimator', () => {
     expect(estimate.fitClass).toBe('fits_gpu');
   });
 
-  it('no_fit cuando los pesos solos ya superan la VRAM disponible', async () => {
-    const describer: ModelDescriber = { describeModel: async () => denseDescription(20 * GIB) };
+  it('no_fit cuando el total supera VRAM y RAM combinadas', async () => {
+    const describer: ModelDescriber = { describeModel: async () => denseDescription(30 * GIB) };
     const estimator = new MemoryEstimator(describer);
     const estimate = await estimator.fits(ref, 8192, hardware(8));
     expect(estimate.fitClass).toBe('no_fit');
@@ -155,12 +155,42 @@ describe('MemoryEstimator', () => {
     expect(integrated.vramAvailableBytes).toBeLessThan(dedicated.vramAvailableBytes);
   });
 
-  it('sin GPU (vramTotal 0): vramAvailable es 0 y modelos con peso > 0 son no_fit', async () => {
+  it('sin GPU usa RAM libre y clasifica CPU-only viable como partial_offload', async () => {
     const describer: ModelDescriber = { describeModel: async () => denseDescription(1 * GIB) };
     const estimator = new MemoryEstimator(describer);
     const cpuOnly: HardwareProfile = { ...hardware(0), gpu: undefined };
     const estimate = await estimator.fits(ref, 2048, cpuOnly);
     expect(estimate.vramAvailableBytes).toBe(0);
+    expect(estimate.ramAvailableBytes).toBeCloseTo(15.5 * GIB, -5);
+    expect(estimate.combinedAvailableBytes).toBe(estimate.ramAvailableBytes);
+    expect(estimate.fitClass).toBe('partial_offload');
+  });
+
+  it('sin GPU sigue siendo no_fit cuando la RAM libre no alcanza al contexto máximo', async () => {
+    const describer: ModelDescriber = { describeModel: async () => denseDescription(20 * GIB) };
+    const cpuOnly: HardwareProfile = { ...hardware(0), gpu: undefined };
+    const estimate = await new MemoryEstimator(describer).fits(ref, 32768, cpuOnly);
+    expect(estimate.fitClass).toBe('no_fit');
+  });
+
+  it('iGPU no suma VRAM compartida y RAM como si fueran dos pools', async () => {
+    const describer: ModelDescriber = { describeModel: async () => denseDescription(16 * GIB) };
+    const estimate = await new MemoryEstimator(describer).fits(ref, 8192, integratedGpuHardware(18, 17.2));
+    expect(estimate.combinedAvailableBytes).toBe(estimate.ramAvailableBytes);
+    expect(estimate.fitClass).toBe('no_fit');
+  });
+
+  it('iGPU limita la VRAM anunciada por la RAM libre real', async () => {
+    const describer: ModelDescriber = { describeModel: async () => denseDescription(6 * GIB) };
+    const scarceRam: HardwareProfile = {
+      ...integratedGpuHardware(16, 14),
+      ram: {
+        totalBytes: { value: 32 * GIB, quality: 'measured', source: 'os.totalmem', sampledAt: 1 },
+        freeBytes: { value: 2 * GIB, quality: 'measured', source: 'os.freemem', sampledAt: 1 },
+      },
+    };
+    const estimate = await new MemoryEstimator(describer).fits(ref, 8192, scarceRam);
+    expect(estimate.vramAvailableBytes).toBeCloseTo(1.5 * GIB, -5);
     expect(estimate.fitClass).toBe('no_fit');
   });
 });

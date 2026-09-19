@@ -15,7 +15,7 @@ const DEFAULT_KV_CACHE_TYPE: KvCacheType = 'f16';
 type KvCacheType = 'f16' | 'q8_0' | 'q4_0';
 const BYTES_PER_ELEM: Record<KvCacheType, number> = { f16: 2, q8_0: 1.0625, q4_0: 0.5625 };
 
-const DEFAULT_OVERHEAD_BYTES = 1 * GIB;
+export const DEFAULT_MEMORY_OVERHEAD_BYTES = 1 * GIB;
 const SAFETY_MARGIN_BYTES = 512 * MIB;
 
 /** Hallazgo real (equipo #2, Intel Core Ultra 9 288V + Arc 140V iGPU, sesión 2026-09-18): gemma4:26b
@@ -44,8 +44,10 @@ export interface ModelDescriber {
 
 export interface OverheadCalibrator {
   /** EMA de (size_vram_medido - weights - kv_teórico) para este modelo; undefined si aún no hay
-   *  muestras de model_load_samples para calibrar (usa DEFAULT_OVERHEAD_BYTES). */
-  getCalibratedOverheadBytes(ref: ModelRef): Promise<number | undefined>;
+   *  muestras de model_load_samples para calibrar (usa DEFAULT_MEMORY_OVERHEAD_BYTES). */
+  getCalibratedOverheadBytes(
+    ref: ModelRef, numCtx: number, hardwareFingerprint: string,
+  ): Promise<number | undefined>;
 }
 
 interface ArchInfo {
@@ -124,7 +126,8 @@ export class MemoryEstimator implements MemoryEstimatorContract {
     const weights = description.sizeBytes;
     const arch = parseArchInfo(description.modelInfo);
     const kvBytes = arch ? computeKvBytes(arch, numCtx, this.kvCacheType) : 0;
-    const overhead = (await this.calibrator?.getCalibratedOverheadBytes(ref)) ?? DEFAULT_OVERHEAD_BYTES;
+    const overhead = (await this.calibrator?.getCalibratedOverheadBytes(ref, numCtx, hardware.fingerprint))
+      ?? DEFAULT_MEMORY_OVERHEAD_BYTES;
     // Doc 13 §7 / hallazgo real equipo #2: modelos con visión necesitan más margen del que sugiere la
     // simple suma de bytes (ver comentario de `VISION_OVERHEAD_BYTES`).
     const visionOverhead = description.capabilities.vision ? VISION_OVERHEAD_BYTES : 0;
@@ -137,20 +140,34 @@ export class MemoryEstimator implements MemoryEstimatorContract {
     const safetyMarginBytes = hardware.gpu?.integrated
       ? Math.max(SAFETY_MARGIN_BYTES, Math.round(vramTotal * INTEGRATED_GPU_SAFETY_MARGIN_RATIO))
       : SAFETY_MARGIN_BYTES;
-    const vramAvailableBytes = Math.max(vramFree - safetyMarginBytes, 0);
+    const ramAvailableBytes = Math.max(hardware.ram.freeBytes.value - SAFETY_MARGIN_BYTES, 0);
+    const rawVramAvailableBytes = Math.max(vramFree - safetyMarginBytes, 0);
+    // En una iGPU la VRAM reportada sale del mismo pool físico que la RAM. Aunque el driver anuncie
+    // un techo gráfico alto, no puede usar más que la RAM que sigue libre en este instante.
+    const vramAvailableBytes = hardware.gpu?.integrated
+      ? Math.min(rawVramAvailableBytes, ramAvailableBytes)
+      : rawVramAvailableBytes;
+    // Una iGPU usa RAM unificada: sumar su "VRAM" a la RAM libre contaría los mismos bytes dos
+    // veces. En GPU dedicada sí son pools distintos y Ollama puede repartir capas entre ambos.
+    const combinedAvailableBytes = hardware.gpu?.integrated
+      ? ramAvailableBytes
+      : vramAvailableBytes + ramAvailableBytes;
+    const hasGpu = hardware.gpu !== undefined && vramTotal > 0;
 
     const fitClass: MemoryEstimate['fitClass'] =
-      vramNeededBytes <= vramAvailableBytes
+      hasGpu && vramNeededBytes <= vramAvailableBytes
         ? 'fits_gpu'
-        : vramNeededBytes <= vramAvailableBytes * 1.05
+        : hasGpu && vramNeededBytes <= vramAvailableBytes * 1.05
           ? 'tight'
-          : weights <= vramAvailableBytes
+          : vramNeededBytes <= combinedAvailableBytes
             ? 'partial_offload'
             : 'no_fit';
 
     return {
       vramNeededBytes,
       vramAvailableBytes,
+      ramAvailableBytes,
+      combinedAvailableBytes,
       fitClass,
       quality: 'estimated', // nunca 'measured' acá (doc 08 §5.4): eso lo escribe model_compat (v0.3)
       source: 'formula',

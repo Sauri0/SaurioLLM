@@ -130,7 +130,8 @@ export type OllamaThinkValue = z.infer<typeof OllamaThinkValueSchema>;
 
 /** `options` viaja como bag suelto en la API (doc: "map[string]any"); acá se tipan solo los campos
  *  que el runtime realmente manda (numCtx SIEMPRE explícito, ADR-7/condición 12.b) — el resto del
- *  bag de defaults de Ollama (num_batch, num_gpu, etc.) no lo tocamos desde SaurioLLM en el MVP. */
+ *  bag de defaults de Ollama no lo tocamos desde SaurioLLM salvo las preferencias explícitas por
+ *  request (`num_gpu`/`num_thread`), que nunca cambian la configuración global del motor. */
 export const OllamaChatOptionsSchema = z.object({
   num_ctx: z.number(),
   temperature: z.number().optional(),
@@ -143,6 +144,8 @@ export const OllamaChatOptionsSchema = z.object({
   // baja tras un oom_load real (options.numGpu en ChatRequest, ver gateway/types.ts). `undefined`
   // deja el default de Ollama (todo lo que entre), comportamiento previo sin cambios.
   num_gpu: z.number().optional(),
+  // API oficial de Ollama: hilos de cómputo del request; `undefined` deja la detección automática.
+  num_thread: z.number().int().positive().optional(),
 });
 export type OllamaChatOptions = z.infer<typeof OllamaChatOptionsSchema>;
 

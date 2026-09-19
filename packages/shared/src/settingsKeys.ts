@@ -8,6 +8,12 @@
 export const NUM_CTX_SETTINGS_KEY = 'models.numCtxDefaults';
 export const NUM_CTX_GLOBAL_DEFAULT = 8192; // medido en esta máquina para qwen3:8b/qwen2.5-coder:7b (docs/MANUAL.md §7)
 
+/** Política actual: máximo informado; sin metadatos, presupuesto provisional explícito. */
+export function maximumContextOrFallback(contextMax: number | undefined): number {
+  return contextMax !== undefined && Number.isSafeInteger(contextMax) && contextMax > 0
+    ? contextMax : NUM_CTX_GLOBAL_DEFAULT;
+}
+
 export type NumCtxDefaults = Record<string, number>;
 
 export function isNumCtxDefaults(value: unknown): value is NumCtxDefaults {

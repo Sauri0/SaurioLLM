@@ -7,7 +7,7 @@
 // `RunControllerDeps.projectRoot` y `WorkspaceFs` se fijan al construirse.
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
-import type { PermissionAnswer, Project, RunEvent, ToolCallRecord } from '@saurio/shared';
+import type { PermissionAnswer, Project, RunEvent, ToolCallRecord, IpcInput, IpcOutput } from '@saurio/shared';
 import type { RunController } from '@saurio/runtime/agent/types';
 import type { EventStore } from '@saurio/runtime/persistence/types';
 import type {
@@ -23,6 +23,7 @@ import type { Provider } from '@saurio/runtime/gateway/Provider';
 import type { CheckpointService } from '@saurio/runtime/checkpoint/types';
 import type { RunRecord } from '@saurio/runtime/agent/ports';
 import { LocalSettingsStore } from '../services/settings/LocalSettingsStore.js';
+import { migrateLegacyBootSettings } from '../services/settings/settingsAccess.js';
 import {
   createProjectRuntime, initGlobalRuntime, type GlobalRuntime, type ProjectRuntime,
 } from './createRuntime.js';
@@ -60,6 +61,7 @@ export interface RuntimeHostDeps {
   /** Directorio de trabajo por defecto del agente builtin mientras no haya proyecto abierto. */
   defaultWorkingDir?: string;
   profileRepository?: ProfileRepository;
+  onProjectChanged?: () => void;
 }
 
 export class RuntimeNotWiredError extends Error {
@@ -127,7 +129,9 @@ export class RuntimeHost {
     ensureHostDataDirs(this.hostAdapter.paths);
     this.settings.load();
     if (!this.deps.runtime) return undefined;
-    return initGlobalRuntime(this.deps.runtime, this.deps.defaultWorkingDir ?? this.hostAdapter.paths.userDataDir);
+    const recovered = await initGlobalRuntime(this.deps.runtime, this.deps.defaultWorkingDir ?? this.hostAdapter.paths.userDataDir);
+    await migrateLegacyBootSettings({ settings: this.settings, settingsRepository: this.settingsRepository });
+    return recovered;
   }
 
   /** Cierra la base al salir de la app. Idempotente (ver comentario de `disposed` arriba) — llamarla
@@ -159,23 +163,97 @@ export class RuntimeHost {
       await this.cancelActiveRunsOf(this.projectRuntime);
     }
     if (this.projectRuntime?.projectId !== project.id) {
-      this.projectRuntime = createProjectRuntime(this.runtime, this.hostAdapter, project);
+      const next = createProjectRuntime(this.runtime, this.hostAdapter, project);
+      this.deps.onProjectChanged?.();
+      this.projectRuntime = next;
     }
     return this.projectRuntime;
   }
 
+  async closeProject(): Promise<void> {
+    if (!this.projectRuntime) return;
+    await this.cancelActiveRunsOf(this.projectRuntime);
+    this.deps.onProjectChanged?.();
+    this.projectRuntime = undefined;
+  }
+
   private async cancelActiveRunsOf(previous: ProjectRuntime): Promise<void> {
     if (!this.deps.runtime) return;
-    try {
-      const { chats, runs } = this.deps.runtime.persistence.repositories;
-      const [chatsOfProject, activeRuns] = await Promise.all([chats.listByProject(previous.projectId), runs.listActive()]);
-      const chatIds = new Set(chatsOfProject.map((c) => c.id));
-      const toCancel = activeRuns.filter((run) => chatIds.has(run.chatId));
-      await Promise.all(toCancel.map((run) => previous.runController.cancel(run.id).catch((error: unknown) => {
-        console.error(`[host] no se pudo cancelar el run "${run.id}" al cambiar de proyecto`, error);
-      })));
-    } catch (error) {
-      console.error('[host] no se pudieron listar/cancelar los runs activos del proyecto anterior', error);
+    const { chats, runs } = this.deps.runtime.persistence.repositories;
+    const [chatsOfProject, activeRuns] = await Promise.all([chats.listByProject(previous.projectId), runs.listActive()]);
+    const chatIds = new Set(chatsOfProject.map((c) => c.id));
+    const toCancel = activeRuns.filter((run) => chatIds.has(run.chatId));
+    const outcomes = await Promise.allSettled(toCancel.map((run) => previous.runController.cancel(run.id)));
+    const failures = outcomes
+      .filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
+      .map((outcome) => outcome.reason);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `saurio: no se pudieron cancelar ${failures.length} run(s) activos del proyecto antes de cerrarlo.`);
+    }
+  }
+
+  /** Vista persistida usada por el cierre seguro. Una lista vacía implica que los estados terminales
+   * ya se escribieron; no alcanza con que `RunController.cancel()` haya retornado. */
+  async listActiveRuns(): Promise<RunRecord[]> {
+    if (!this.deps.runtime) return [];
+    return this.deps.runtime.persistence.repositories.runs.listActive();
+  }
+
+  /** Cancela padres e hijos y espera a que la proyección de runs quede terminal antes de permitir
+   * que main cierre SQLite. Si algún run no pertenece al controlador vivo, vence con error visible
+   * en vez de forzar el cierre mientras todavía podría escribir. */
+  async cancelAllActiveRunsAndWait(options: { timeoutMs?: number; pollMs?: number } = {}): Promise<void> {
+    const timeoutMs = options.timeoutMs ?? 10_000;
+    const pollMs = options.pollMs ?? 25;
+    const deadline = Date.now() + timeoutMs;
+    const requested = new Set<string>();
+
+    const beforeDeadline = async <T>(operation: Promise<T>): Promise<T> => {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(`SaurioLLM esperó ${timeoutMs} ms, pero todavía hay tareas activas.`);
+      }
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          operation,
+          new Promise<T>((_resolve, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error(`SaurioLLM esperó ${timeoutMs} ms, pero todavía hay tareas activas.`)),
+              remainingMs,
+            );
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    };
+
+    for (;;) {
+      const activeRuns = await beforeDeadline(this.listActiveRuns());
+      if (activeRuns.length === 0) return;
+      if (!this.projectRuntime) {
+        throw new Error('SaurioLLM no puede detener tareas activas porque ya no hay un proyecto abierto.');
+      }
+
+      const pendingCancellation = activeRuns.filter((run) => !requested.has(run.id));
+      for (const run of pendingCancellation) requested.add(run.id);
+      // Padres e hijos se solicitan juntos. `allSettled` mantiene observadas las promesas aun si la
+      // carrera contra el plazo vence, evitando rechazos tardíos sin manejar.
+      const outcomes = await beforeDeadline(Promise.allSettled(
+        pendingCancellation.map((run) => this.projectRuntime!.runController.cancel(run.id)),
+      ));
+      const failures = outcomes
+        .filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
+        .map((outcome) => outcome.reason);
+      if (failures.length > 0) {
+        throw new AggregateError(failures, `SaurioLLM no pudo detener ${failures.length} tarea(s) activa(s).`);
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error(`SaurioLLM esperó ${timeoutMs} ms, pero todavía hay tareas activas.`);
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
     }
   }
 
@@ -309,6 +387,10 @@ export class RuntimeHost {
 
   get chatRepository(): ChatRepository {
     return this.runtime.persistence.repositories.chats;
+  }
+
+  searchChats(input: IpcInput<'chat:search'>): Promise<IpcOutput<'chat:search'>> {
+    return this.runtime.persistence.repositories.chats.search(input);
   }
 
   get messageRepository(): MessageRepository {

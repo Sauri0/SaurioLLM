@@ -11,7 +11,6 @@
 // por proyecto) y se concatena en `context-builder.ts` DESPUÉS del system prompt del agente, en el
 // mismo punto donde ya vive el sufijo de modo plan — sigue siendo estable DENTRO de un run (no cambia
 // turno a turno, solo entre proyectos), así que no rompe el cacheo de prefijo de la sesión.
-import os from 'node:os';
 import { resolveShell } from '../tools/builtin/run_command.js';
 
 function describePlatform(): string {

@@ -30,6 +30,7 @@
 
 .saurio-home__title { font-size: var(--text-lg); font-weight: 600; color: var(--text-primary); margin: 0; }
 .saurio-home__hint { font-size: var(--text-sm); color: var(--text-muted); max-width: 420px; line-height: var(--leading-normal); margin: 0; }
+.saurio-home__error { max-width: 36rem; }
 
 .saurio-home__actions {
   display: flex;

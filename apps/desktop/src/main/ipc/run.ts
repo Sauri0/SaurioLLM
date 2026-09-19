@@ -51,6 +51,13 @@ export function registerRunHandlers(host: RuntimeHost): void {
     await host.runController.cancel(input.runId);
   });
 
+  registerHandler('run:cancelChild', ipc['run:cancelChild'], async (input) => {
+    await host.runController.cancelChild(input.parentRunId, input.childRunId);
+  });
+
   registerHandler('run:continue', ipc['run:continue'], async (input) =>
     host.runController.continueRun(input.runId, input.extraIterations));
+
+  registerHandler('run:regenerate', ipc['run:regenerate'], async (input) =>
+    host.runController.regenerate(input.runId));
 }

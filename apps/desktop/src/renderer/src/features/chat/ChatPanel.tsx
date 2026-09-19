@@ -6,7 +6,7 @@
 // que había a la izquierda del chat. Esa configuración vive ahora en la única barra lateral
 // (`layout/Sidebar.tsx`); acá solo queda la conversación, a todo el ancho del centro.
 import { useEffect, useState } from 'react';
-import type { Attachment, Chat, ChatPermissionPreset, Effort, Mode, ModelRef } from '@saurio/shared';
+import type { Attachment, Chat, ChatPermissionPreset, Effort, Mode, ModelRef, PermissionPreset } from '@saurio/shared';
 import { invoke } from '../../ipc/client.js';
 import { useChatStore } from '../../stores/chatStore.js';
 import { useModelsStore } from '../../stores/modelsStore.js';
@@ -15,13 +15,16 @@ import { ChatIcon } from '../../ui/icons.js';
 import { formatContextPair } from '../../ui/formatTokens.js';
 import { findActiveRunId } from './runStatus.js';
 import { ChatMessageList } from './ChatMessageList.js';
+import { CostSummary } from './CostSummary.js';
+import { ContextInspector } from './ContextInspector.js';
 import { ChatInput } from './ChatInput.js';
 import { ModelLoadingBanner } from './ModelLoadingBanner.js';
+import { displayedModelForChat, isModelInstalled } from './effectiveChatModel.js';
+import { resolveChatPermissionDisplay } from './chatPermissionDisplay.js';
 import './chat.css';
 
 const DEFAULT_MODE: Mode = 'agent';
 const DEFAULT_EFFORT: Effort = 'balanced';
-const DEFAULT_PERMISSION_PRESET: ChatPermissionPreset = 'ask';
 
 export interface ChatPanelProps {
   projectId: string;
@@ -46,16 +49,19 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
   const mode = useChatStore((s) => (currentChatId ? (s.modeByChat[currentChatId] ?? DEFAULT_MODE) : DEFAULT_MODE));
   const setMode = useChatStore((s) => s.setMode);
   const draftModelRef = useChatStore((s) => s.draftModelRefByProject[projectId] ?? defaultModelRef);
-  // Compositor (rediseño del chat, punto 1): potencia y permisos son del CHAT (`chat:setEffort`/
-  // `chat:setPermissionPreset`, contrato aditivo), no un draft por proyecto como el modelo/modo de
-  // un chat todavía no creado — `chat?.effort`/`chat?.permissionPreset` ya vienen resueltos por el
-  // handler cuando existen; `undefined` (chats de antes de esta migración) cae al default más
-  // conservador, igual que hace el propio runtime.
+  // El esfuerzo tiene default de chat. En permisos, `undefined` NO equivale a `ask`: el runtime
+  // conserva la policy del agente hasta que el usuario fija un override para este chat.
   const effort = chat?.effort ?? DEFAULT_EFFORT;
-  const permissionPreset = chat?.permissionPreset ?? DEFAULT_PERMISSION_PRESET;
+  const chatAgentId = chat?.agentId;
+  const chatPermissionPreset = chat?.permissionPreset;
   const setChatEffort = useChatStore((s) => s.setChatEffort);
   const setChatPermissionPreset = useChatStore((s) => s.setChatPermissionPreset);
   const [composerError, setComposerError] = useState<string | undefined>(undefined);
+  const [agentPermission, setAgentPermission] = useState<{
+    agentId: string;
+    preset?: PermissionPreset;
+    state: 'loading' | 'ready' | 'failed';
+  }>({ agentId: '', state: 'loading' });
 
   // Ya no dispara `models:list`/`models:loaded` (eso ahora lo hace `layout/Sidebar.tsx`, doc de la
   // pasada de diseño #1); acá solo se lee `installed` para resolver el `contextMax` del modelo
@@ -65,9 +71,39 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
   const runStates = useRunStore((s) => s.runStates);
   const runChatIds = useRunStore((s) => s.runChatIds);
   const runStartedAt = useRunStore((s) => s.runStartedAt);
-  const streaming = useRunStore((s) => s.streaming);
   const messages = useRunStore((s) => (currentChatId ? s.messagesByChat[currentChatId] : undefined));
   const metricsByMessage = useRunStore((s) => s.metricsByMessage);
+
+  useEffect(() => {
+    if (!chatAgentId || chatPermissionPreset) return;
+    if (chatAgentId === defaultAgentId) {
+      setAgentPermission({ agentId: chatAgentId, preset: 'balanced', state: 'ready' });
+      return;
+    }
+    let cancelled = false;
+    setAgentPermission({ agentId: chatAgentId, state: 'loading' });
+    void invoke('agents:list', { projectId, includeArchived: true })
+      .then((profiles) => {
+        if (cancelled) return;
+        const profile = profiles.find((candidate) => candidate.id === chatAgentId);
+        setAgentPermission(profile
+          ? { agentId: chatAgentId, preset: profile.permissionPreset, state: 'ready' }
+          : { agentId: chatAgentId, state: 'failed' });
+      })
+      .catch(() => {
+        if (!cancelled) setAgentPermission({ agentId: chatAgentId, state: 'failed' });
+      });
+    return () => { cancelled = true; };
+  }, [chatAgentId, chatPermissionPreset, defaultAgentId, projectId]);
+
+  const permissionLookup: { agentId: string; preset?: PermissionPreset; state: 'loading' | 'ready' | 'failed' } = agentPermission.agentId === chat?.agentId
+    ? agentPermission
+    : { agentId: chat?.agentId ?? '', state: 'loading' as const };
+  const permissionDisplay = resolveChatPermissionDisplay(
+    chatPermissionPreset,
+    permissionLookup.preset,
+    permissionLookup.state,
+  );
 
   useEffect(() => {
     if (currentChatId && !historyLoaded) {
@@ -83,8 +119,6 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
     setCurrentChat(created.id);
   }
 
-  const [sendError, setSendError] = useState<string | undefined>(undefined);
-
   // Punto 2 del encargo ("nunca permitir enviar a un modelo no instalado — validación antes de
   // crear el run con error accionable"): un modelo LOCAL puede haberse desinstalado (Centro de
   // modelos, u otro proceso) después de que este chat ya lo tuviera asignado — sin este chequeo,
@@ -95,11 +129,9 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
   async function handleSend(text: string, attachments: Attachment[]): Promise<void> {
     if (!currentChatId) return;
     const modelRef = chat?.modelRef;
-    if (modelRef?.locality === 'local' && !installedModels.some((m) => m.ref.name === modelRef.name)) {
-      setSendError(`El modelo "${modelRef.name}" ya no está instalado en este equipo. Elegí otro modelo arriba antes de enviar.`);
-      return;
+    if (modelRef?.locality === 'local' && !isModelInstalled(modelRef, installedModels)) {
+      throw new Error(`El modelo "${modelRef.name}" ya no está instalado en este equipo. Elegí otro modelo arriba antes de enviar.`);
     }
-    setSendError(undefined);
     await invoke('run:start', { chatId: currentChatId, text, mode, attachments: attachments.length > 0 ? attachments : undefined });
   }
 
@@ -128,24 +160,40 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
     }
   }
 
-  const activeModelName = chat?.modelRef?.name ?? draftModelRef?.name;
+  const activeModelRef = displayedModelForChat(chat, messages ?? []);
+  // Un borrador pertenece al próximo chat. En uno automático sin ejecuciones todavía no hay modelo
+  // efectivo que afirmar: se muestra el modo hasta que el runtime deje evidencia en el historial.
+  const activeModelName = currentChatId
+    ? (chat?.modelSelection === 'auto' ? (activeModelRef?.name ?? 'Automático') : activeModelRef?.name)
+    : draftModelRef?.name;
   // Rediseño del chat, punto 1 ("indicador de contexto REAL, nunca el máximo teórico del modelo"):
   // `contextBudgetByChat` guarda el `effectiveNumCtx` real del último `context.built` de ESTE chat
   // (runStore.ts); mientras no hubo ningún run todavía no hay valor real que mostrar, así que se
   // omite el máximo en vez de mostrar `contextMax` del modelo (que puede ser 10x-30x más grande que
   // lo que de verdad se manda).
   const contextBudget = useRunStore((s) => (currentChatId ? s.contextBudgetByChat[currentChatId] : undefined));
+  const modelResolution = useRunStore((s) => (currentChatId ? s.modelResolutionByChat[currentChatId] : undefined));
   const effectiveContextMax = contextBudget?.effectiveNumCtx ?? contextBudget?.numCtx;
   const lastMessageId = messages && messages.length > 0 ? messages[messages.length - 1]!.id : undefined;
   const lastMetrics = lastMessageId ? metricsByMessage[lastMessageId] : undefined;
   const contextUsed = lastMetrics?.promptTokens !== undefined && lastMetrics.evalTokens !== undefined
     ? lastMetrics.promptTokens + lastMetrics.evalTokens
     : undefined;
-  const contextLabel = formatContextPair(contextUsed, effectiveContextMax);
+  // `contextLimitSource` es opcional para que historiales/eventos anteriores sigan cargando. Si
+  // falta, el presupuesto puede ser útil para orientar el uso, pero no debe presentarse como el
+  // máximo confirmado por el modelo/proveedor.
+  const contextLimitSource = contextBudget?.contextLimitSource;
+  const contextLimitDisclosure = contextLimitSource === 'reported'
+    ? ''
+    : contextLimitSource === 'provisional'
+      ? ' (provisional; límite sin confirmar)'
+      : ' (límite sin confirmar)';
+  const contextLabel = contextBudget
+    ? `Contexto ≈ ${formatContextPair(contextBudget.totalUsed, effectiveContextMax)} tokens${contextLimitDisclosure}`
+    : contextUsed !== undefined ? `Último uso: ${formatContextPair(contextUsed, undefined)} tokens` : 'Contexto: se calcula al enviar';
   // Tarea "carga de modelo/oom_load": "cargando" = el run activo no tiene ningún `message.delta`
   // todavía (ningún `streaming` cuyo `runId` sea este) — ver ModelLoadingBanner.
-  const hasFirstChunk = activeRunId !== undefined
-    && Object.values(streaming).some((m) => m.runId === activeRunId);
+  const hasFirstChunk = useRunStore((s) => activeRunId !== undefined && s.firstChunkByRun?.[activeRunId] === true);
 
   return (
     <div className="chat-panel">
@@ -156,31 +204,34 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
               <ChatMessageList
                 chatId={currentChatId}
                 onOpenDiff={onOpenDiff}
-                currentModelLocality={chat?.modelRef?.locality}
+                currentModelLocality={activeModelRef?.locality}
                 currentModelName={activeModelName}
               />
             </div>
+            <CostSummary metrics={(messages ?? []).filter((message) => message.role === 'assistant'
+              && (message.modelRef?.locality !== 'local' || message.metrics?.costUsd !== undefined))
+              .map((message) => metricsByMessage[message.id] ?? message.metrics ?? { quality: 'unavailable' as const })} />
             <ModelLoadingBanner
               runState={activeRunId ? runStates[activeRunId] : undefined}
               startedAt={activeRunId ? runStartedAt[activeRunId] : undefined}
               hasFirstChunk={hasFirstChunk}
               onCancel={() => void handleCancel()}
             />
-            {sendError && (
-              <div className="saurio-banner danger chat-panel__send-error" role="alert">{sendError}</div>
-            )}
             {composerError && (
               <div className="saurio-banner danger chat-panel__send-error" role="alert">{composerError}</div>
             )}
+            <ContextInspector key={`context-${currentChatId}`} report={contextBudget} modelResolution={modelResolution} />
             <ChatInput
+              key={currentChatId}
               mode={mode}
               onModeChange={(m) => setMode(currentChatId, m)}
               effort={effort}
               onEffortChange={(e) => void handleEffortChange(e)}
-              permissionPreset={permissionPreset}
+              permissionPreset={permissionDisplay.chatPreset}
+              permissionDisplay={permissionDisplay}
               onPermissionPresetChange={(p, confirmed) => void handlePermissionPresetChange(p, confirmed)}
               isRunning={activeRunId !== undefined}
-              onSend={(text, attachments) => void handleSend(text, attachments)}
+              onSend={handleSend}
               onCancel={() => void handleCancel()}
               modelName={activeModelName ?? '(sin modelo)'}
               contextLabel={contextLabel}

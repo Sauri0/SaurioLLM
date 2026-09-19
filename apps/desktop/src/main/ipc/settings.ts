@@ -8,21 +8,15 @@ import { ipc } from '@saurio/shared';
 import { NotImplementedYetError } from '../host/RuntimeHost.js';
 import type { RuntimeHost } from '../host/RuntimeHost.js';
 import { registerHandler } from './registerHandler.js';
+import { readSetting, writeSetting } from '../services/settings/settingsAccess.js';
 
 export function registerSettingsHandlers(host: RuntimeHost): void {
   registerHandler('settings:get', ipc['settings:get'], async (input) => {
-    const repo = host.settingsRepository;
-    if (repo) return repo.get(input.key, input.projectId);
-    return host.settings.get(input.key, input.projectId);
+    return readSetting(host, input.key, input.projectId);
   });
 
   registerHandler('settings:set', ipc['settings:set'], async (input) => {
-    const repo = host.settingsRepository;
-    if (repo) {
-      await repo.set(input.key, input.value, input.projectId);
-      return;
-    }
-    host.settings.set(input.key, input.value, input.projectId);
+    await writeSetting(host, input.key, input.value, input.projectId);
   });
 
   registerHandler('profiles:list', ipc['profiles:list'], async () => {

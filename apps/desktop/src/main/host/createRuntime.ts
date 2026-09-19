@@ -7,7 +7,10 @@
 // ContextBuilder con el repo map de @saurio/repomap y un Compactor real, ModelManager, HardwareProbe
 // y Telemetry.
 import path from 'node:path';
-import { openPersistence, type PersistenceHandle } from '@saurio/runtime/persistence/index';
+import { createHash } from 'node:crypto';
+import {
+  openPersistence, type ModelCompatRecord, type PersistenceHandle,
+} from '@saurio/runtime/persistence/index';
 import { ModelGatewayImpl, OllamaProvider, OpenAICompatProvider, AnthropicProvider } from '@saurio/runtime/gateway/index';
 import type { Provider } from '@saurio/runtime/gateway/Provider';
 import {
@@ -16,6 +19,8 @@ import {
 } from '@saurio/runtime/models/index';
 import type { HardwareProbeOptions } from '@saurio/runtime/models/index';
 import type { ModelCatalogEntry, DownloadProvider } from '@saurio/runtime/models/index';
+import { withHuggingFaceImports } from '@saurio/runtime/models/HuggingFaceDownloadProvider';
+import type { LocalChatOptions } from '@saurio/runtime/gateway/types';
 import { Diagnostics, MetricsAggregator } from '@saurio/runtime/telemetry/index';
 import { SqlDownloadsRepository, seedOllamaProviderRow } from '../services/downloads/SqlDownloadsRepository.js';
 import { FileLibraryCache } from '../services/models/LibraryCache.js';
@@ -38,15 +43,15 @@ import { DefaultTaskManager } from '@saurio/runtime/tasks/TaskManager';
 import { RunController } from '@saurio/runtime/agent/RunController';
 import {
   createDefaultAgentConfig, DEFAULT_AGENT_ID, DEFAULT_MODEL_REF, DEFAULT_TOOL_TRANSPORT_OVERRIDES,
-  defaultIdGenerator, systemClock,
+  defaultIdGenerator, systemClock, resolveModelSelection,
 } from '@saurio/runtime/agent/index';
 import type { RunControllerDeps } from '@saurio/runtime/agent/RunController';
-import type { ModelContextProbe, LastReadHashes, ModelLayerCountProbe, ModelParameterSizeProbe, ModelVisionProbe } from '@saurio/runtime/agent/ports';
+import type { AgentMemoryPort, LastReadHashes, ModelContextProbe, ModelLayerCountProbe, ModelParameterSizeProbe, ModelVisionProbe } from '@saurio/runtime/agent/ports';
 import type { DefaultNumCtxFor } from '@saurio/runtime/agent/defaults';
 import { recover as recoverRuns, type RecoverResult } from '@saurio/runtime/agent/recover';
 import { ensurePersonalProject } from '@saurio/runtime/agent/personalProject';
-import type { ModelRef, Project, ProviderConfig, ProviderPreset } from '@saurio/shared';
-import { NUM_CTX_SETTINGS_KEY, isNumCtxDefaults } from '@saurio/shared';
+import type { AgentMemory, AgentProfile, ModelRef, Project, ProviderConfig, ProviderPreset } from '@saurio/shared';
+import { LOCAL_ONLY_SETTINGS_KEY, NUM_CTX_SETTINGS_KEY, isNumCtxDefaults, maximumContextOrFallback } from '@saurio/shared';
 import type { HostAdapter } from './RuntimeHost.js';
 import { BroadcastEventStore } from './BroadcastEventStore.js';
 
@@ -56,6 +61,100 @@ import { BroadcastEventStore } from './BroadcastEventStore.js';
  *  tocar una instancia real que pueda estar corriendo en esta máquina (útil cuando esta sesión de
  *  trabajo comparte el equipo con otro proceso que sí depende de Ollama real en 11434). */
 export const OLLAMA_BASE_URL = process.env['SAURIO_OLLAMA_URL'] ?? 'http://127.0.0.1:11434';
+const LOCAL_INFERENCE_SETTING_KEY = 'resources.localInference';
+const PROVIDER_REQUEST_TIMEOUT_MS = 15_000;
+
+type AgentProfileReader = Pick<{ getProfile(id: string): Promise<AgentProfile | undefined> }, 'getProfile'>;
+type AgentMemoryReader = {
+  list(agentId: string, projectId?: string, options?: { includeGlobal?: boolean }): Promise<AgentMemory[]>;
+};
+
+/** Aplica la política persistida del perfil antes de que el runtime arme el prompt. El controlador
+ * recibe solamente memorias ya autorizadas y por eso no puede mezclar proyectos por error. */
+export function createAgentMemoryPort(
+  profiles: AgentProfileReader,
+  memories: AgentMemoryReader,
+): AgentMemoryPort {
+  return {
+    async listForRun(agentId, projectId) {
+      const profile = await profiles.getProfile(agentId);
+      if (profile?.memoryScope === 'project') {
+        if (!profile.projectId || profile.projectId !== projectId) return [];
+        return memories.list(agentId, projectId, { includeGlobal: false });
+      }
+      // Legacy sin policy explícita conserva el filtro histórico del repositorio: global + proyecto actual.
+      return memories.list(agentId, projectId);
+    },
+  };
+}
+
+/** Defensa del lado main: la UI valida sliders/radios, pero el valor persistido sigue siendo
+ * `unknown`. Sólo enteros positivos llegan a Ollama; CPU fuerza num_gpu=0 y auto lo omite. */
+export function parseLocalInferenceOptions(value: unknown): LocalChatOptions | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const numThreads = typeof record['numThreads'] === 'number'
+    && Number.isInteger(record['numThreads']) && record['numThreads'] > 0
+    ? record['numThreads'] : undefined;
+  const numGpu = record['computeMode'] === 'cpu' ? 0 : undefined;
+  return numThreads === undefined && numGpu === undefined ? undefined : { numThreads, numGpu };
+}
+
+/** La caché del catálogo cambia junto con la configuración y la credencial del proveedor. Sólo se
+ * persiste el hash; la clave real no entra en SQLite ni en el nombre legible del ajuste. */
+export function providerCatalogStorageKey(provider: StoredProvider | undefined, apiKey: string | undefined): string {
+  const providerId = provider?.id ?? 'missing';
+  const identity = JSON.stringify({
+    kind: provider?.kind, baseUrl: provider?.baseUrl, headers: provider?.headers, mode: provider?.mode,
+  });
+  const digest = createHash('sha256').update(identity).update('\0').update(apiKey ?? '').digest('hex').slice(0, 24);
+  return `models.providerCatalog.${providerId}.${digest}`;
+}
+
+export function measuredFitClass(
+  evidence: Pick<ModelCompatRecord, 'status' | 'offloadRatio' | 'size' | 'sizeVram' | 'error'>,
+) {
+  if (evidence.status === 'partial') return 'partial_offload' as const;
+  if (evidence.status === 'failed') {
+    return evidence.error && /out of memory|cudaMalloc|model is too large|insufficient memory|not enough memory|cannot allocate memory/i.test(evidence.error)
+      ? 'no_fit' as const
+      : undefined;
+  }
+  if (evidence.offloadRatio !== null && Number.isFinite(evidence.offloadRatio)
+    && evidence.offloadRatio >= 0 && evidence.offloadRatio <= 1) {
+    return evidence.offloadRatio < 1 ? 'partial_offload' as const : 'fits_gpu' as const;
+  }
+  if (evidence.size !== null && evidence.sizeVram !== null
+    && Number.isFinite(evidence.size) && Number.isFinite(evidence.sizeVram)
+    && evidence.size > 0 && evidence.sizeVram > 0) {
+    return evidence.sizeVram < evidence.size ? 'partial_offload' as const : 'fits_gpu' as const;
+  }
+  return undefined;
+}
+
+export function testedSpeedFromCompat(evidence: ModelCompatRecord | undefined) {
+  if (evidence?.status !== 'fits' || evidence.genTps === null
+    || !Number.isFinite(evidence.genTps) || evidence.genTps <= 0) return undefined;
+  return { tokPerSec: evidence.genTps, testedAt: evidence.testedAt };
+}
+
+export async function withProviderDeadline<T>(
+  label: string, operation: (signal: AbortSignal) => Promise<T>, timeoutMs = PROVIDER_REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error(`${label} tardó demasiado en responder.`));
+      }, timeoutMs);
+    });
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /** Presets con baseUrl por defecto (punto 2 del encargo: "Presets con baseUrl por defecto"). Doc 18
  *  §1/§2: OpenAI/OpenRouter hablan el dialecto `/v1/chat/completions` (`OpenAICompatProvider`, mismo
@@ -173,6 +272,8 @@ function makeDownloadCallbacks(modelManager: ModelManager, gateway: ModelGateway
 export function createGlobalRuntime(
   hostAdapter: HostAdapter,
   deps: {
+    ollamaBaseUrl?: string;
+    managedModelsFolder?: string;
     readResourceFile?: typeof readResourceFile;
     secureKeyStore?: SecureKeyStore;
     /** Tarea "carga de modelo/oom_load" punto 4: fuente real de la línea `msg="inference compute"`
@@ -202,8 +303,10 @@ export function createGlobalRuntime(
     ?? new SecureKeyStore(path.join(hostAdapter.paths.userDataDir, 'provider-keys.enc.json'), createUnavailableSafeStorage());
 
   // ADR-2: se habla el HTTP de Ollama directamente (fetch + NDJSON propio), nunca el cliente npm.
-  const ollama = new OllamaProvider({ id: OLLAMA_PROVIDER_ID, baseUrl: OLLAMA_BASE_URL });
-  seedOllamaProviderRow(persistence.driver, ollama.id, OLLAMA_BASE_URL);
+  seedOllamaProviderRow(persistence.driver, OLLAMA_PROVIDER_ID, deps.ollamaBaseUrl ?? OLLAMA_BASE_URL);
+  const ollama = new OllamaProvider({ id: OLLAMA_PROVIDER_ID,
+    baseUrl: deps.ollamaBaseUrl ?? providersRepository.get(OLLAMA_PROVIDER_ID)?.baseUrl ?? OLLAMA_BASE_URL });
+  if (deps.ollamaBaseUrl) providersRepository.update(OLLAMA_PROVIDER_ID, { baseUrl: deps.ollamaBaseUrl });
 
   const auditLog = new SqlAuditLogRepository(persistence.driver);
 
@@ -214,16 +317,42 @@ export function createGlobalRuntime(
   const gateway = new ModelGatewayImpl(currentProviders, { slots: 1, groupByModel: true }, {
     // Punto 4 del encargo ("registrar en audit_log cada llamada no local"): único punto por el que
     // pasa TODA llamada de inferencia no local, sin importar quién la haya iniciado (chat normal,
-    // compactación nivel 2, etc.) — hook aditivo agregado a ModelGatewayImpl en esta misma tarea.
-    onNonLocalCall: (ref, ctx) => {
-      auditLog.recordNonLocalCall({ providerId: ref.providerId, modelName: ref.name, locality: ref.locality, runId: ctx.runId, ts: Date.now() });
+    // compactación nivel 2, etc.) — el hook de resultado conserva costo reportado/estimado y marca
+    // como desconocidas las llamadas cortadas, sin inventar cero.
+    onNonLocalResult: (ref, result) => {
+      auditLog.recordNonLocalResult({
+        providerId: ref.providerId,
+        modelName: ref.name,
+        locality: ref.locality,
+        runId: result.runId,
+        callId: result.callId,
+        ts: Date.now(),
+        metrics: result.metrics,
+        error: result.error,
+        interrupted: result.interrupted,
+      });
     },
+    resolveLocalChatOptions: async () => parseLocalInferenceOptions(
+      await persistence.repositories.settings.get(LOCAL_INFERENCE_SETTING_KEY),
+    ),
+    // Se evalúa por llamada, no al crear el chat/runtime: activar "Solo local" debe cortar también
+    // chats cloud existentes, continuaciones, regeneraciones, delegaciones y compactaciones.
+    isLocalOnlyEnabled: async () =>
+      await persistence.repositories.settings.get(LOCAL_ONLY_SETTINGS_KEY) === true,
   });
 
   const hardwareProbe = new HardwareProbe({ inferenceComputeSource: deps.inferenceComputeSource });
-  const modelManager = new ModelManager(currentProviders, hardwareProbe);
+  const modelManager = new ModelManager(currentProviders, hardwareProbe, {
+    modelLoadSamplesRepository: persistence.repositories.modelLoadSamples,
+    catalogStorage: persistence.repositories.settings,
+    catalogStorageKey: (providerId) => providerCatalogStorageKey(
+      providersRepository.get(providerId), secureKeyStore.get(providerId),
+    ),
+  });
+  modelManager.setManagedModelsFolder(deps.managedModelsFolder);
 
   function refreshProviders(): void {
+    ollama.setBaseUrl(providersRepository.get(OLLAMA_PROVIDER_ID)?.baseUrl ?? OLLAMA_BASE_URL);
     currentProviders = buildEnabledProviders(providersRepository, secureKeyStore, ollama);
     gateway.setProviders(currentProviders);
     modelManager.setProviders(currentProviders);
@@ -234,9 +363,11 @@ export function createGlobalRuntime(
     if (!row) return { providerId: id, ok: false, error: `no existe ningún provider con id "${id}"` };
     try {
       const provider = instantiateProvider(row, secureKeyStore, ollama);
-      const health = await provider.health();
+      const health = await withProviderDeadline(`El proveedor "${id}"`, (signal) => provider.health(signal));
       if (!health.ok) return { providerId: id, ok: false, error: health.error ?? 'health() devolvió ok: false', version: health.version };
-      const models = await provider.listModels().catch(() => []);
+      const models = await withProviderDeadline(
+        `El catálogo del proveedor "${id}"`, (signal) => provider.listModels(signal),
+      ).catch(() => []);
       return { providerId: id, ok: true, version: health.version, modelNames: models.map((m) => m.ref.name) };
     } catch (error) {
       return { providerId: id, ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -256,7 +387,11 @@ export function createGlobalRuntime(
 
   const downloadCallbacks = makeDownloadCallbacks(modelManager, gateway);
   const downloadsRepository = new SqlDownloadsRepository(persistence.driver);
-  const downloadManager = new DownloadManager(ollama as unknown as DownloadProvider, {
+  const downloadProvider = withHuggingFaceImports(ollama as unknown as DownloadProvider, {
+    ollamaBaseUrl: () => providersRepository.get(OLLAMA_PROVIDER_ID)?.baseUrl ?? deps.ollamaBaseUrl ?? OLLAMA_BASE_URL,
+    stagingRoot: path.join(hostAdapter.paths.userDataDir, 'downloads', 'hf-staging'),
+  });
+  const downloadManager = new DownloadManager(downloadProvider, {
     manifestFetcher: new RegistryClient(),
     blobStore: new FsBlobStoreProbe(),
     diskSpace: new FsDiskSpaceProbe(),
@@ -274,7 +409,48 @@ export function createGlobalRuntime(
   if (!catalogJson) {
     console.warn('[createRuntime] no se pudo leer resources/model-catalog.json; catálogo vacío (ver services/resources.ts)');
   }
-  const recommendationEngine = new RecommendationEngine(modelCatalog);
+  async function compatibilityFor(entry: ModelCatalogEntry, hardwareFingerprint: string) {
+    if (!hardwareFingerprint) return undefined;
+    const expectedName = `${entry.name}:${entry.tag}`;
+    const installed = (await modelManager.listInstalled()).find((model) =>
+      model.ref.locality === 'local' && model.ref.name === expectedName && model.digest);
+    if (!installed?.digest) return undefined;
+    const description = await modelManager.describeModel(installed.ref);
+    const contextUsed = description.contextMax;
+    if (!contextUsed || contextUsed <= 0) return undefined;
+    const evidence = await persistence.repositories.modelCompat.latest({
+      providerId: installed.ref.providerId, modelName: installed.ref.name, modelDigest: installed.digest,
+      hardwareFingerprint, numCtx: contextUsed,
+    });
+    return { installed, contextUsed, evidence };
+  }
+
+  const recommendationEngine = new RecommendationEngine(modelCatalog, {
+    async lookup(entry, hardwareFingerprint) {
+      const resolved = await compatibilityFor(entry, hardwareFingerprint);
+      const evidence = resolved?.evidence;
+      // Una carga o un resultado sin throughput no se convierte en badge "probado". El último
+      // resultado exacto debe ser exitoso y tener velocidad realmente medida.
+      return testedSpeedFromCompat(evidence);
+    },
+  }, {
+    async fitClassFor(entry, _catalogContextMax, hardwareFingerprint) {
+      const resolved = await compatibilityFor(entry, hardwareFingerprint);
+      if (resolved?.evidence) {
+        const fitClass = measuredFitClass(resolved.evidence);
+        if (fitClass) return { fitClass, fitQuality: 'measured' as const, contextUsed: resolved.contextUsed };
+      }
+      const expectedName = `${entry.name}:${entry.tag}`;
+      const installed = (await modelManager.listInstalled()).find((model) =>
+        model.ref.locality === 'local' && model.ref.name === expectedName);
+      if (!installed) return undefined;
+      const description = await modelManager.describeModel(installed.ref);
+      const contextUsed = description.contextMax;
+      if (!contextUsed || contextUsed <= 0) return undefined;
+      const estimate = await modelManager.fits(installed.ref, contextUsed);
+      return { fitClass: estimate.fitClass, fitQuality: 'estimated', contextUsed };
+    },
+  });
 
   // Punto 2 del encargo (doc 16 §12.6): snapshot empaquetado como último fallback sin red y sin
   // ninguna caché en userData todavía (primera vez que se abre la app sin conexión) — best-effort,
@@ -431,17 +607,13 @@ function extractBlockCount(modelInfo: Record<string, unknown> | undefined): numb
   return undefined;
 }
 
-/** Punto 5 del encargo ("el numCtx por defecto por modelo de Ajustes debe llegar al runtime"): lee
- *  `models.numCtxDefaults` (settings, scope global — misma clave que
- *  apps/desktop/src/renderer/src/features/settings/SettingsPanel.tsx) cada vez que arranca un run,
- *  para que un cambio en Ajustes aplique en el próximo run sin reiniciar la app. Usa
- *  `RunControllerDeps.numCtxForModel` (cambio aditivo mínimo en packages/runtime/src/agent/RunController.ts
- *  de esta misma tarea — packages/runtime no es zona de este encargo, documentado ahí y en doc 16). */
+/** Política de contexto: el máximo declarado se consulta para cada modelo al iniciar el run.
+ *  Ante metadatos ausentes se usa un presupuesto provisional, visible como tal en Ajustes.
+ *  Las preferencias manuales antiguas se conservan en la base pero ya no limitan el run. */
 function makeNumCtxForModel(runtime: GlobalRuntime): (ref: ModelRef) => Promise<number | undefined> {
   return async (ref) => {
-    const numCtxDefaults = await loadNumCtxDefaults(runtime);
-    const value = numCtxDefaults?.[ref.name];
-    return typeof value === 'number' && value > 0 ? value : undefined;
+    const description = await runtime.modelManager.describeModel(ref).catch(() => undefined);
+    return maximumContextOrFallback(description?.contextMax);
   };
 }
 
@@ -552,6 +724,47 @@ export function createProjectRuntime(
     toolCalls: repositories.toolCalls,
     checkpointRepo: repositories.checkpoints,
     agents: repositories.agents,
+    agentMemories: createAgentMemoryPort(repositories.agents, repositories.agentMemories),
+    chatCollaborators: {
+      async listEnabled(chatId) {
+        const chat = await repositories.chats.get(chatId);
+        if (!chat || chat.projectId !== project.id) throw new Error('El chat no pertenece al proyecto activo.');
+        const saved = await repositories.settings.get(`chat.collaborators.${chatId}`, project.id);
+        const ids = Array.isArray(saved) ? [...new Set(saved.filter((id): id is string => typeof id === 'string'))].slice(0, 12) : [];
+        const active = new Set((await repositories.agents.listProfiles()).map((profile) => profile.id));
+        return Promise.all(ids.filter((id) => id !== chat.agentId && active.has(id)).map((id) => repositories.agents.resolve(id)));
+      },
+    },
+    resolveModelRef: (agent, chatModelRef) => resolveModelSelection(agent, chatModelRef, {
+      async listRecommendedRefs(candidateAgent) {
+        const use = candidateAgent.role === 'coder' ? 'coding'
+          : candidateAgent.role === 'lead' || candidateAgent.role === 'reviewer' || candidateAgent.role === 'explorer'
+            || (candidateAgent.role === 'custom' && candidateAgent.systemPrompt?.startsWith('Sos Tester'))
+            ? 'analysis' : 'chat';
+        const [hardware, installed] = await Promise.all([
+          runtime.hardwareProbe.sample(),
+          runtime.modelManager.listInstalled(),
+        ]);
+        const installedByName = new Map(installed
+          .filter((model) => model.ref.locality === 'local')
+          .map((model) => [model.ref.name, model.ref]));
+        const recommendations = await runtime.recommendationEngine.recommend(hardware, use, 'quality');
+        return recommendations
+          .filter((item) => item.locality === 'local' && item.catalogEntry.capabilities.tools)
+          .flatMap((item) => {
+            const ref = installedByName.get(`${item.catalogEntry.name}:${item.catalogEntry.tag}`);
+            return ref ? [{ ref, contextMax: item.contextUsed ?? item.catalogEntry.contextMax }] : [];
+          });
+      },
+      async listLoadedRefs() {
+        const local = runtime.providers.filter((provider) => provider.locality === 'local' && provider.listLoaded);
+        const results = await Promise.allSettled(local.map(async (provider) =>
+          (await provider.listLoaded!()).map((loaded) => ({ providerId: provider.id, name: loaded.name, locality: provider.locality }))));
+        return results.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
+      },
+      contextMaxForRef: async (ref) => (await runtime.modelManager.describeModel(ref)).contextMax,
+      fits: (ref, numCtx) => runtime.modelManager.fits(ref, numCtx),
+    }),
     // Doc 19 §2.5 (E3a delegación): `AgentRepository` ya implementa `AgentProfilePort.createProfile`
     // (packages/runtime/src/persistence/repositories/agent.ts) — se pasa el mismo repositorio, sin
     // adaptarlo, para que `delegate` sin `targetAgentId` pueda crear un worker efímero real.

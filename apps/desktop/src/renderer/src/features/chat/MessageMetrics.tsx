@@ -5,6 +5,8 @@
 // hace ver "cargado" al chat. apps/desktop/src/renderer/src/features/chat/MessageMetrics.tsx.
 import { useState } from 'react';
 import type { ResponseMetrics } from '@saurio/shared';
+import { formatUsd } from './costMetrics.js';
+import './costMetrics.css';
 
 export interface MessageMetricsProps {
   metrics: ResponseMetrics;
@@ -58,9 +60,11 @@ export function MessageMetrics({ metrics }: MessageMetricsProps): React.JSX.Elem
           {tps !== undefined && <span>{tps.toFixed(1)} tok/s</span>}
           {load && <span>carga {load}</span>}
           {cache !== undefined && <span>cache {(cache * 100).toFixed(0)}%</span>}
-          {/* Punto 3 del encargo ("'costo' solo si el proveedor lo informa"): ningún Provider del MVP
-              (Ollama/OpenAI-compatible/Anthropic) devuelve costo en $ — se omite en vez de mostrar
-              "no disponible" fijo en cada mensaje (eso era justamente parte de la queja de ruido). */}
+          {metrics.costUsd !== undefined && metrics.costSource && metrics.costSource !== 'unavailable' && (
+            <span className={`message-metrics__cost--${metrics.costSource}`}>
+              {formatUsd(metrics.costUsd)} {metrics.costSource === 'reported' ? 'informado' : 'estimado'}
+            </span>
+          )}
           <span className="message-metrics__quality" title="Calidad del dato">{QUALITY_LABEL[metrics.quality]}</span>
         </div>
       )}

@@ -5,7 +5,7 @@
 // SQLite real ni de safeStorage real — eso ya lo cubren SqlProvidersRepository.test.ts y
 // SecureKeyStore.test.ts por separado.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { NonLocalCallAuditEntry, ProviderConfig } from '@saurio/shared';
+import type { IpcOutput, NonLocalCallAuditEntry, ProviderConfig } from '@saurio/shared';
 
 const handlers = new Map<string, (event: unknown, payload: unknown) => unknown>();
 const fakeFrame = {} as never;
@@ -63,6 +63,11 @@ function makeFakeHost() {
       listNonLocalCalls: vi.fn((): NonLocalCallAuditEntry[] => [
         { id: 1, ts: 123, providerId: 'openrouter_1', modelName: 'llama-3.1-8b', locality: 'cloud', runId: 'run_1' },
       ]),
+      usageSummary: vi.fn((): IpcOutput<'providers:usageSummary'> => ({
+        reportedUsd: 0.25, reportedCalls: 1,
+        estimatedUsd: 0.1, estimatedCalls: 1,
+        unavailableCalls: 2, totalCalls: 4,
+      })),
     },
   };
   return host;
@@ -148,6 +153,20 @@ describe('ipc/providers', () => {
     expect(result).toEqual([
       { id: 1, ts: 123, providerId: 'openrouter_1', modelName: 'llama-3.1-8b', locality: 'cloud', runId: 'run_1' },
     ]);
+  });
+
+  it('providers:usageSummary delega filtros since/runId al ledger persistente', async () => {
+    const host = makeFakeHost();
+    registerProvidersHandlers(host as unknown as RuntimeHost);
+
+    const result = await invoke('providers:usageSummary', { since: 100, runId: 'run_1' });
+
+    expect(host.auditLog.usageSummary).toHaveBeenCalledWith({ since: 100, runId: 'run_1' });
+    expect(result).toEqual({
+      reportedUsd: 0.25, reportedCalls: 1,
+      estimatedUsd: 0.1, estimatedCalls: 1,
+      unavailableCalls: 2, totalCalls: 4,
+    });
   });
 
   it('providers:list refleja lo agregado', async () => {

@@ -29,6 +29,11 @@ describe('tools/protocols/text', () => {
     expect(apiTools).toBeUndefined();
     expect(systemSuffix).toContain('read_file');
     expect(systemSuffix).toContain('<tool_call>');
+    expect(systemSuffix).toContain('se considera tu respuesta final y termina este run');
+    expect(systemSuffix).toContain('no respondas en prosa ni le pidas al usuario que copie o confirme contenido o permisos');
+    expect(systemSuffix).toContain('Respondé directamente con texto sólo para conversación');
+    expect(systemSuffix).toContain('tu próxima respuesta DEBE ser exclusivamente');
+    expect(systemSuffix?.trimEnd().endsWith('Esta regla no aplica a saludos ni a preguntas generales que pueden responderse sin inspeccionar el proyecto.')).toBe(true);
     expect(stop).toEqual(['</tool_call>']);
   });
 

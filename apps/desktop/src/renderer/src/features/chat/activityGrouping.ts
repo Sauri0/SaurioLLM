@@ -22,6 +22,9 @@ export interface ChatTurn {
    *  para mensajes que aparecen antes del primer mensaje de usuario (system/seed, caso raro). */
   id: string;
   userMessage: ChatMessage | undefined;
+  /** Una regeneración conserva el pedido original, por lo que su respuesta abre un grupo propio
+   *  sin repetir la burbuja del usuario. */
+  alternative: boolean;
   /** Pasos internos en orden cronológico — lo que hoy se ve como burbujas "AGENTE" vacías sueltas y
    *  tarjetas de tool call desperdigadas pasa a vivir acá, dentro del bloque "Actividad". */
   steps: ActivityStep[];
@@ -52,9 +55,12 @@ export function groupMessagesIntoTurns(
   const turns: ChatTurn[] = [];
   let current: ChatTurn | undefined;
 
-  function startTurn(id: string, userMessage: ChatMessage | undefined): void {
+  function startTurn(id: string, userMessage: ChatMessage | undefined, alternative = false): void {
     if (current) turns.push(current);
-    current = { id, userMessage, steps: [], finalMessage: undefined, runId: undefined, checkpoints: [] };
+    current = {
+      id, userMessage, alternative, steps: [], finalMessage: undefined,
+      runId: userMessage?.originRunId, checkpoints: [],
+    };
   }
 
   for (const message of messages) {
@@ -69,7 +75,15 @@ export function groupMessagesIntoTurns(
       continue;
     }
     if (!current) startTurn('leading', undefined);
+    // Regenerar no agrega un segundo mensaje de usuario. Si se mezclara con el turno anterior,
+    // `finalMessage` escondería la respuesta original dentro de Actividad. El origen persistido
+    // permite abrir una respuesta alternativa sin duplicar el pedido histórico.
+    if (current!.finalMessage?.originRunId && message.originRunId
+      && current!.finalMessage.originRunId !== message.originRunId) {
+      startTurn(`alternative-${message.id}`, undefined, true);
+    }
     const turn = current!;
+    if (!turn.runId && message.originRunId) turn.runId = message.originRunId;
 
     // Un mensaje nuevo con contenido real reemplaza al "final" anterior — el anterior (si lo había)
     // pasa a ser un paso de texto interno (más de un mensaje con contenido en el mismo turno).

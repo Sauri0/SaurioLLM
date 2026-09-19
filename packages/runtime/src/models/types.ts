@@ -4,7 +4,7 @@
 // bajo demanda, MemoryEstimator.fits(), catálogo instalado, capabilities, fits, carpeta detectada
 // (modo attach), badge de localidad. AMD/Apple/registro de Windows, DownloadManager,
 // RecommendationEngine y modo managed son v0.2/v0.3.
-import type { ModelRef, Locality, ModelInfo, ModelDescription, LoadedModel, MemoryEstimate, Quality } from '@saurio/shared';
+import type { ModelRef, Locality, ModelInfo, ModelDescription, LoadedModel, MemoryEstimate, Quality, ProviderCatalogStatus } from '@saurio/shared';
 
 export type { ModelInfo, ModelDescription, LoadedModel, MemoryEstimate };
 
@@ -37,9 +37,14 @@ export interface HardwareProfile {
 export interface HardwareProbe {
   sample(): Promise<HardwareProfile>;
   supportsGpuSampling(): boolean;      // false: nvidia-smi ausente y no hay contador Windows disponible
+  /** Invalida la detección cacheada de GPU antes de una medición manual. Opcional para conservar
+   * adaptadores de prueba/implementaciones externas que sólo exponen la lectura base. */
+  refreshGpu?(): void;
 }
 
 export interface MemoryEstimator {
+  /** Evalúa GPU y RAM al contexto solicitado. `partial_offload` también representa CPU-only
+   * viable; `no_fit` significa que ni la memoria combinada alcanza. */
   fits(ref: ModelRef, numCtx: number, hardware: HardwareProfile): Promise<MemoryEstimate>;
 }
 
@@ -49,12 +54,14 @@ export interface AttachWarning { code: 'context_256k_default' | 'network_exposed
 export interface AttachWarningInput { baseUrl: string; observedContextLength?: number; ollamaHostEnv?: string }
 
 export interface ModelManager {
-  listInstalled(refresh?: boolean): Promise<ModelInfo[]>;
+  listInstalled(refresh?: boolean, providerId?: string): Promise<ModelInfo[]>;
+  catalogStatus?(): ProviderCatalogStatus[];
+  updateManualModel?(providerId: string, name: string, remove?: boolean): Promise<void>;
   listLoaded(): Promise<LoadedModel[]>;                 // único poller de /api/ps del sistema
   describeModel(ref: ModelRef): Promise<ModelDescription>;
   fits(ref: ModelRef, numCtx: number): Promise<MemoryEstimate>;
   detectedModelsFolder(): Promise<{
-    path: string; source: 'env:user' | 'env:machine' | 'default'; validated: boolean;
+    path: string; source: 'env:user' | 'env:machine' | 'default' | 'managed'; validated: boolean;
     freeBytes?: number; totalBytes?: number; spaceQuality: 'measured' | 'unavailable';
   }>;
   attachWarnings(input: AttachWarningInput): AttachWarning[];
@@ -62,6 +69,7 @@ export interface ModelManager {
 
 export interface DownloadJob {                          // v0.2
   id: string; providerId: string; modelName: string;
+  phase?: 'downloading' | 'verifying' | 'importing';
   // 'insufficient_space' (doc 13 §5 punto 1 / doc 16 §8 punto 1 / punto 2 del encargo): la migración
   // 0002 ya amplió el CHECK de `downloads.status`; este valor se persiste desde `DownloadManager.pull()`
   // cuando `checkSpace()` rechaza la descarga, para que la pestaña Descargas lo pueda mostrar.
@@ -169,6 +177,9 @@ export interface Recommendation {
   catalogEntry: ModelCatalogEntry; fitClass: MemoryEstimate['fitClass'];
   locality: Locality;
   speedHint: 'fast' | 'medium' | 'slow'; usesCpuOffload: boolean;
+  fitQuality?: 'measured' | 'estimated';
+  contextUsed?: number;
+  reason?: string;
   tested?: { tokPerSec: number; testedAt: number; hardwareFingerprint: string };  // ausente: sin ModelCompat
 }
 

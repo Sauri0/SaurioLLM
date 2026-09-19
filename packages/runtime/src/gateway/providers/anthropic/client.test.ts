@@ -35,6 +35,34 @@ describe('gateway/providers/anthropic/client', () => {
     expect(headers['anthropic-version']).toBe('2023-06-01');
   });
 
+  it('listAllModels recorre cursores, conserva el proxy y deduplica modelos', async () => {
+    const model = (id: string) => ({ type: 'model', id, display_name: id });
+    fetchMock.mockResolvedValueOnce(Response.json({ data: [model('first/with spaces')], has_more: true, last_id: 'first/with spaces' }));
+    fetchMock.mockResolvedValueOnce(Response.json({ data: [model('first/with spaces'), model('second')], has_more: false }));
+    const client = new AnthropicClient({ baseUrl: 'https://proxy.example/anthropic', getApiKey: async () => undefined });
+    expect((await client.listAllModels()).map((m) => m.id)).toEqual(['first/with spaces', 'second']);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://proxy.example/anthropic/v1/models?after_id=first%2Fwith%20spaces');
+  });
+
+  it.each([null, 'same'])('rechaza cursor inválido %s sin publicar catálogo parcial', async (cursor) => {
+    const page = { data: [{ type: 'model', id: 'same', display_name: 'Same' }], has_more: true, last_id: cursor };
+    fetchMock.mockImplementation(async () => Response.json(page));
+    const client = new AnthropicClient({ baseUrl: 'https://api.anthropic.com', getApiKey: async () => undefined });
+    await expect(client.listAllModels()).rejects.toThrow('paginación inválida');
+    expect(fetchMock).toHaveBeenCalledTimes(cursor === null ? 1 : 2);
+  });
+
+  it('propaga error de página posterior y aborta antes de otra petición', async () => {
+    fetchMock.mockResolvedValueOnce(Response.json({ data: [{ type: 'model', id: 'first', display_name: 'First' }], has_more: true, last_id: 'first' }));
+    fetchMock.mockResolvedValueOnce(new Response('unavailable', { status: 503 }));
+    const client = new AnthropicClient({ baseUrl: 'https://api.anthropic.com', getApiKey: async () => undefined });
+    await expect(client.listAllModels()).rejects.toMatchObject({ status: 503 });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(client.listAllModels(controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('messages(): stream normal produce eventos en orden hasta message_stop', async () => {
     fetchMock.mockResolvedValueOnce(mockSseResponse(STREAM_NORMAL_LINES));
     const client = new AnthropicClient({ baseUrl: 'https://api.anthropic.com', getApiKey: async () => 'sk-ant-test' });

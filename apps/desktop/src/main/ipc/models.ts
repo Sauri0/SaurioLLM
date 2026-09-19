@@ -31,10 +31,12 @@ function catalogStatus(
   installedNames: Set<string>,
   loadedNames: Set<string>,
   downloadingId: string | undefined,
+  installationKnown = true,
 ): CatalogItem['status'] {
   const fullName = `${entry.name}:${entry.tag}`;
   if (downloadingId) return 'downloading';
   if (loadedNames.has(fullName)) return 'loaded';
+  if (!installationKnown) return 'unknown';
   if (installedNames.has(fullName)) return 'installed_untested'; // "probado" solo con model_compat (Benchmark, v0.3)
   return 'not_installed';
 }
@@ -46,6 +48,7 @@ function buildCatalogItem(
   entry: ModelCatalogEntry, host: RuntimeHost,
   installedNames: Set<string>, loadedNames: Set<string>,
   hardware: HardwareProfile | undefined, freeDiskBytes: number | undefined,
+  installationKnown = true,
 ): CatalogItem {
   const fullName = `${entry.name}:${entry.tag}`;
   const downloadingId = host.downloadManager.isDownloading(fullName)
@@ -57,11 +60,11 @@ function buildCatalogItem(
   // la UI sabe que no hay nada que clasificar todavía (cloud: nunca lo va a haber; sizeUnresolved: la
   // ficha lo resuelve contra el registry y recién ahí pide `models:tierForSize` con el tamaño real).
   const tier: ModelTier | undefined = hardware && !entry.cloud && !entry.sizeUnresolved
-    ? tierForCatalogWeights(entry.sizeBytes, hardware, { freeDiskBytes })
+    ? tierForCatalogWeights(entry.sizeBytes, hardware, { freeDiskBytes, numCtx: entry.contextMax })
     : undefined;
   return {
     entry,
-    status: catalogStatus(entry, installedNames, loadedNames, downloadingId),
+    status: catalogStatus(entry, installedNames, loadedNames, downloadingId, installationKnown),
     downloadId: downloadingId,
     tier,
   } satisfies CatalogItem;
@@ -77,17 +80,19 @@ async function buildLibraryCatalogResult(
   raw: { snapshot: OllamaLibrarySnapshot; source: LibraryCatalogResult['source']; cachedAt?: number; syncing?: boolean },
 ): Promise<LibraryCatalogResult> {
   const [installed, loaded, hardware, folder] = await Promise.all([
-    host.modelManager.listInstalled(),
+    host.modelManager.listInstalled(false, 'ollama').catch(() => undefined),
     host.modelManager.listLoaded().catch(() => []),
     host.hardwareProbe.sample().catch(() => undefined),
     host.modelManager.detectedModelsFolder().catch(() => undefined),
   ]);
-  const installedNames = new Set(installed.map((m) => m.ref.name));
+  const installedNames = new Set((installed ?? []).filter((m) => m.ref.providerId === 'ollama').map((m) => m.ref.name));
+  const statuses = host.modelManager.catalogStatus?.();
+  const installationKnown = installed !== undefined && (statuses === undefined || statuses.some((status) => status.providerId === 'ollama' && status.state === 'ready'));
   const loadedNames = new Set(loaded.map((m) => m.name));
   const freeDiskBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
   const merged = mergeSnapshotWithCuratedCatalog(raw.snapshot, host.modelCatalog);
   return {
-    items: merged.map((entry) => buildCatalogItem(entry, host, installedNames, loadedNames, hardware, freeDiskBytes)),
+    items: merged.map((entry) => buildCatalogItem(entry, host, installedNames, loadedNames, hardware, freeDiskBytes, installationKnown)),
     source: raw.source,
     cachedAt: raw.cachedAt,
     generatedAt: raw.snapshot.generatedAt,
@@ -110,7 +115,17 @@ const PREVIEW_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024;
 
 export function registerModelsHandlers(host: RuntimeHost, libraryUpdates?: LibraryUpdateEmitter): void {
   registerHandler('models:list', ipc['models:list'], async (input) =>
-    host.modelManager.listInstalled(input.refresh));
+    host.modelManager.listInstalled(input.refresh, input.providerId));
+
+  registerHandler('models:catalogStatus', ipc['models:catalogStatus'], async () => host.modelManager.catalogStatus?.() ?? []);
+
+  registerHandler('models:updateManual', ipc['models:updateManual'], async (input) => {
+    // host.providers contiene únicamente los proveedores habilitados por buildEnabledProviders.
+    const provider = host.providers.find((candidate) => candidate.id === input.providerId);
+    if (!provider || provider.kind === 'ollama') throw new Error('Elegí un proveedor API habilitado para agregar un ID manual.');
+    if (!host.modelManager.updateManualModel) throw new Error('El catálogo manual no está disponible.');
+    await host.modelManager.updateManualModel(input.providerId, input.name, input.remove);
+  });
 
   registerHandler('models:loaded', ipc['models:loaded'], async () => host.modelManager.listLoaded());
 
@@ -119,6 +134,31 @@ export function registerModelsHandlers(host: RuntimeHost, libraryUpdates?: Libra
 
   registerHandler('models:fits', ipc['models:fits'], async (input) =>
     host.modelManager.fits(input.ref, input.numCtx));
+
+  /** Perfil resumido para Ajustes > Recursos. `refresh` sólo invalida la caché de detección de GPU
+   * del probe; no toca Ollama ni cambia su configuración global. */
+  registerHandler('hardware:profile', ipc['hardware:profile'], async (input) => {
+    if (input.refresh) host.hardwareProbe.refreshGpu?.();
+    const profile = await host.hardwareProbe.sample();
+    const gpu = profile.gpu;
+    return {
+      cpu: {
+        name: profile.cpu.name.value,
+        threads: profile.cpu.threads.value,
+        physicalCores: profile.cpu.physicalCores?.value,
+      },
+      ram: { totalBytes: profile.ram.totalBytes.value, freeBytes: profile.ram.freeBytes.value },
+      gpu: gpu && {
+        vendor: gpu.vendor,
+        vramTotalBytes: gpu.vramTotalBytes.value,
+        vramUsedBytes: gpu.vramUsedBytes?.value,
+        integrated: gpu.integrated,
+        quality: gpu.vramTotalBytes.quality,
+        source: gpu.vramTotalBytes.source,
+      },
+      sampledAt: profile.sampledAt,
+    };
+  });
 
   // Punto 2 del encargo / doc 16 §12: `ModelManager.detectedModelsFolder()` y `.attachWarnings()`
   // ya existían implementados (doc 13 §6/§7), pero sin canal IPC — el Centro de modelos no podía
@@ -167,15 +207,17 @@ export function registerModelsHandlers(host: RuntimeHost, libraryUpdates?: Libra
   // (eso es Benchmark/model_compat, v0.3) — TierClassifier solo decide el nivel 1-6.
   registerHandler('models:catalog', ipc['models:catalog'], async () => {
     const [installed, loaded, hardware, folder] = await Promise.all([
-      host.modelManager.listInstalled(),
+      host.modelManager.listInstalled(false, 'ollama').catch(() => undefined),
       host.modelManager.listLoaded().catch(() => []),
       host.hardwareProbe.sample().catch(() => undefined),
       host.modelManager.detectedModelsFolder().catch(() => undefined),
     ]);
-    const installedNames = new Set(installed.map((m) => m.ref.name));
+    const installedNames = new Set((installed ?? []).filter((m) => m.ref.providerId === 'ollama').map((m) => m.ref.name));
+    const statuses = host.modelManager.catalogStatus?.();
+    const installationKnown = installed !== undefined && (statuses === undefined || statuses.some((status) => status.providerId === 'ollama' && status.state === 'ready'));
     const loadedNames = new Set(loaded.map((m) => m.name));
     const freeDiskBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
-    return host.modelCatalog.map((entry) => buildCatalogItem(entry, host, installedNames, loadedNames, hardware, freeDiskBytes));
+    return host.modelCatalog.map((entry) => buildCatalogItem(entry, host, installedNames, loadedNames, hardware, freeDiskBytes, installationKnown));
   });
 
   // Punto 1/2 del encargo (doc 16 §12.6): biblioteca COMPLETA de Ollama (curado + snapshot fusionados
@@ -221,10 +263,7 @@ export function registerModelsHandlers(host: RuntimeHost, libraryUpdates?: Libra
     const name = input.name.trim();
     if (name.length === 0) throw new Error('escribí un nombre de modelo');
 
-    const [folder, hardware] = await Promise.all([
-      host.modelManager.detectedModelsFolder().catch(() => undefined),
-      host.hardwareProbe.sample().catch(() => undefined),
-    ]);
+    const folder = await host.modelManager.detectedModelsFolder().catch(() => undefined);
     const freeBytes = folder?.spaceQuality === 'measured' ? folder.freeBytes : undefined;
 
     const hfMatch = HF_REF_RE.exec(name);
@@ -249,9 +288,8 @@ export function registerModelsHandlers(host: RuntimeHost, libraryUpdates?: Libra
     // con una respuesta que no se puede confirmar (mismo criterio que TierClassifier nivel 6: "si no
     // hay dato de disco, nunca se fuerza por falta de disco").
     const spaceOk = freeBytes === undefined || freeBytes >= sizeBytes + PREVIEW_FREE_SPACE_MARGIN_BYTES;
-    const tier = hardware ? tierForCatalogWeights(sizeBytes, hardware, { freeDiskBytes: freeBytes }) : undefined;
-
-    return { fullName: name, source, sizeBytes, freeBytes, spaceOk, tier } satisfies ResolveModelByNameResult;
+    // El manifest de descarga informa bytes, no la ventana del modelo. No inventar un fit a 8K.
+    return { fullName: name, source, sizeBytes, freeBytes, spaceOk } satisfies ResolveModelByNameResult;
   });
 
   // Punto 3/4 del encargo: descarga de una referencia que no vive en el registry de Ollama (hf.co/...
@@ -261,7 +299,7 @@ export function registerModelsHandlers(host: RuntimeHost, libraryUpdates?: Libra
   registerHandler('models:pullExternal', ipc['models:pullExternal'], async (input) =>
     host.downloadManager.pullKnownSize(input.ref, input.sizeBytes));
 
-  // Selector de contexto 4k/8k/16k/32k de la ficha de Explorar (punto 5 del encargo): recalcula
+  // La ficha de Explorar envía el máximo anunciado: recalcula
   // nivel/memoria para un tamaño de pesos ya conocido (el que ya trae la ficha en pantalla) sin volver
   // a pedir el catálogo completo — mismo `tierForCatalogWeights`, mismo hardware muestreado.
   registerHandler('models:tierForSize', ipc['models:tierForSize'], async (input) => {
@@ -284,5 +322,12 @@ export function registerModelsHandlers(host: RuntimeHost, libraryUpdates?: Libra
   // project/chat/run/permission/checkpoint/models/terminal/metrics/settings/bench); se registra acá
   // por estar pegado a Providers/ModelGateway, igual que el resto de este archivo.
   registerHandler('provider:health', ipc['provider:health'], async () =>
-    Promise.all(host.providers.map((provider) => provider.health().then((health) => ({ providerId: provider.id, ...health })))));
+    Promise.all(host.providers.map(async (provider) => {
+      try {
+        const health = await provider.health(AbortSignal.timeout(15_000));
+        return { providerId: provider.id, ...health };
+      } catch (error) {
+        return { providerId: provider.id, ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    })));
 }

@@ -10,17 +10,21 @@ import { replaceAtCascade } from '../matching.js';
 import { resolveExpectedHash } from './conflictCheck.js';
 
 const ArgsSchema = z.object({
-  path: z.coerce.string().min(1),
-  old_string: z.string().min(1),
-  new_string: z.string(),
-  replace_all: z.coerce.boolean().optional(),
+  path: z.coerce.string().min(1).describe('Ruta del archivo existente, relativa a la raíz del proyecto.'),
+  old_string: z.string().min(1).describe(
+    'Fragmento exacto copiado de read_file en este run. Preservá comentarios, firmas y tipos; preferí el fragmento mínimo que sea unívoco. No envíes los dos caracteres barra+n salvo que el archivo contenga literalmente esa secuencia.',
+  ),
+  new_string: z.string().describe(
+    'Reemplazo completo para old_string. Conservá comentarios, firmas y tipos que el usuario no pidió cambiar.',
+  ),
+  replace_all: z.coerce.boolean().optional().describe('Usalo sólo si querés reemplazar todas las coincidencias exactas.'),
 }).strict();
 type Args = z.infer<typeof ArgsSchema>;
 
 export function createEditFileTool(deps: BuiltinToolsDeps): ToolDefinition<Args> {
   return {
     name: 'edit_file',
-    description: 'Reemplaza old_string por new_string en un archivo existente, con matching tolerante en cascada.',
+    description: 'Reemplaza old_string por new_string en un archivo existente. Antes usá read_file en este run y copiá un fragmento exacto, mínimo y unívoco; no reconstruyas el bloque desde el mapa del repositorio. Preservá comentarios, firmas y tipos que no deban cambiar. El matching tolera EOL, indentación y espacios, pero una coincidencia sólo aproximada nunca se escribe.',
     inputSchema: z.toJSONSchema(ArgsSchema),
     argsSchema: ArgsSchema,
     category: 'write',
@@ -64,7 +68,17 @@ export function createEditFileTool(deps: BuiltinToolsDeps): ToolDefinition<Args>
           const candidatesText = result.candidates && result.candidates.length > 0
             ? `\nCoincidencias encontradas:\n${result.candidates.map((c, i) => `${i + 1}. línea ${c.line}: ${c.preview}`).join('\n')}\nAgregá más líneas de contexto (antes y/o después) a old_string para desambiguar, o usá replace_all: true si querés reemplazar todas.`
             : '';
-          return { content: [{ type: 'text', text: `no se pudo aplicar el cambio: ${result.reason}${candidatesText}` }], isError: true };
+          const possibleDoubleEscape = args.old_string.includes('\\n') && !current.content.includes(args.old_string)
+            ? '\nold_string contiene la secuencia literal barra+n, pero el archivo no contiene ese mismo fragmento. Puede ser un doble escape de los saltos de línea.'
+            : '';
+          const recovery = '\nReleé el archivo con read_file y copiá en old_string un fragmento exacto, mínimo y unívoco del resultado, preservando comentarios, firmas y tipos. No repitas la llamada con los mismos argumentos.';
+          return {
+            content: [{
+              type: 'text',
+              text: `no se pudo aplicar el cambio: ${result.reason}${candidatesText}${possibleDoubleEscape}${recovery}`,
+            }],
+            isError: true,
+          };
         }
 
         await ctx.checkpoint.before(args.path);

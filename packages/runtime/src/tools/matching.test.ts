@@ -3,6 +3,26 @@ import { describe, expect, it } from 'vitest';
 import { matchCascade, replaceAtCascade } from './matching.js';
 
 describe('tools/matching', () => {
+  it('no reemplaza una cabecera por confundirla con una función completa aproximada', () => {
+    const content = 'export function suma(a: number, b: number): number {\n  return a - b; // BUG\n}\n';
+    const result = replaceAtCascade(content,
+      'export function suma(a: number, b: number): number { return a - b; }',
+      'function suma(a: number, b: number): number { return a + b; }', false);
+    expect(result.level).toBeNull();
+    if (result.level === null) {
+      expect(result.reason).toContain('no se modificó');
+      expect(result.candidates?.[0]?.line).toBe(1);
+    }
+    const corrected = replaceAtCascade(content, 'return a - b;', 'return a + b;', false);
+    expect(corrected.level).toBe('exact');
+    if (corrected.level) expect(corrected.content).toBe(content.replace('a - b', 'a + b'));
+  });
+
+  it('una sugerencia fuzzy no autoriza sustituir otro identificador o literal', () => {
+    const result = replaceAtCascade('function greet(name) {\n  return "hello " + name;\n}\n',
+      'function greet(name) {\n  return "hi " + name;\n}', 'wrong block', false);
+    expect(result.level).toBeNull();
+  });
   it('exact: encuentra una única ocurrencia', () => {
     const content = 'const a = 1;\nconst b = 2;\n';
     const r = matchCascade(content, 'const a = 1;');

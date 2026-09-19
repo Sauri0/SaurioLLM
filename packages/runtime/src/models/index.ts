@@ -31,7 +31,7 @@ export type {
 } from './types.js';
 export { HardwareProbe } from './HardwareProbe.js';
 export type { HardwareProbeOptions } from './HardwareProbe.js';
-export { MemoryEstimator } from './MemoryEstimator.js';
+export { MemoryEstimator, DEFAULT_MEMORY_OVERHEAD_BYTES } from './MemoryEstimator.js';
 export type { ModelDescriber, OverheadCalibrator } from './MemoryEstimator.js';
 export { ModelManager } from './ModelManager.js';
 export type {

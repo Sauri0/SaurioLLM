@@ -20,6 +20,20 @@ describe('tools/builtin/edit_file', () => {
 
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+  it('publica en la descripción y el schema la guía para copiar un fragmento exacto de read_file', () => {
+    const editTool = createEditFileTool(deps);
+    const schema = editTool.inputSchema as {
+      properties?: Record<string, { description?: string }>;
+    };
+
+    expect(editTool.description).toContain('Antes usá read_file en este run');
+    expect(editTool.description).toContain('fragmento exacto, mínimo y unívoco');
+    expect(editTool.description).toContain('Preservá comentarios, firmas y tipos');
+    expect(schema.properties?.old_string?.description).toContain('Fragmento exacto copiado de read_file en este run');
+    expect(schema.properties?.old_string?.description).toContain('dos caracteres barra+n');
+    expect(schema.properties?.new_string?.description).toContain('Conservá comentarios, firmas y tipos');
+  });
+
   it('falla con edit_conflict si el archivo no fue leído antes en este run', async () => {
     writeFileSync(path.join(root, 'a.ts'), 'const a = 1;\n');
     const editTool = createEditFileTool(deps);
@@ -41,6 +55,82 @@ describe('tools/builtin/edit_file', () => {
     expect(structured.matchLevel).toBe('exact');
     const onDisk = readFileSync(path.join(root, 'a.ts'), 'utf8');
     expect(onDisk).toBe('const a = 42;\nconst b = 2;\n');
+  });
+
+  it('rechaza un bloque aproximado sin alterar el archivo y permite corregir con texto real', async () => {
+    const original = 'export function suma(a: number, b: number): number {\n  return a - b;\n}\n';
+    const file = path.join(root, 'math.ts');
+    writeFileSync(file, original);
+    const ctx = makeToolContext(root);
+    await createReadFileTool(deps).handler({ path: 'math.ts' }, ctx);
+    const editTool = createEditFileTool(deps);
+    const rejected = await editTool.handler({
+      path: 'math.ts',
+      old_string: 'export function suma(a: number, b: number): number { return a - b; }',
+      new_string: 'function suma(a: number, b: number): number { return a + b; }',
+    }, ctx);
+    expect(rejected.isError).toBe(true);
+    expect(readFileSync(file, 'utf8')).toBe(original);
+    const corrected = await editTool.handler({
+      path: 'math.ts', old_string: 'return a - b;', new_string: 'return a + b;',
+    }, ctx);
+    expect(corrected.isError).toBe(false);
+    expect(readFileSync(file, 'utf8')).toBe(original.replace('a - b', 'a + b'));
+  });
+
+  it('diagnostica un posible doble escape sin modificar el archivo ni crear checkpoint', async () => {
+    const original = '// comentario que debe conservarse\nexport function suma(a: number, b: number): number {\n  return a - b;\n}\n';
+    const file = path.join(root, 'math.ts');
+    writeFileSync(file, original);
+    const checkpointCalls: string[] = [];
+    const ctx = makeToolContext(root, {
+      checkpoint: {
+        checkpointId: 'ckpt-double-escape',
+        before: async (relPath) => { checkpointCalls.push(`before:${relPath}`); },
+        after: async (relPath) => { checkpointCalls.push(`after:${relPath}`); },
+      },
+    });
+    await createReadFileTool(deps).handler({ path: 'math.ts' }, ctx);
+
+    const res = await createEditFileTool(deps).handler({
+      path: 'math.ts',
+      old_string: '// comentario que debe conservarse\\nexport function suma(a: number, b: number): number {',
+      new_string: '// comentario que debe conservarse\\nexport function suma(a: number, b: number): number {',
+    }, ctx);
+    const message = res.content[0]?.type === 'text' ? res.content[0].text : '';
+
+    expect(res.isError).toBe(true);
+    expect(message).toContain('doble escape');
+    expect(message).toContain('read_file');
+    expect(message).toContain('fragmento exacto, mínimo y unívoco');
+    expect(message).toContain('preservando comentarios, firmas y tipos');
+    expect(message).toContain('No repitas la llamada con los mismos argumentos');
+    expect(readFileSync(file, 'utf8')).toBe(original);
+    expect(checkpointCalls).toEqual([]);
+  });
+
+  it('edita normalmente una secuencia literal barra+n cuando existe en el archivo', async () => {
+    const original = 'const etiqueta = "primera\\nsegunda";\n';
+    const file = path.join(root, 'literal.ts');
+    writeFileSync(file, original);
+    const checkpointCalls: string[] = [];
+    const ctx = makeToolContext(root, {
+      checkpoint: {
+        checkpointId: 'ckpt-literal-backslash-n',
+        before: async (relPath) => { checkpointCalls.push(`before:${relPath}`); },
+        after: async (relPath) => { checkpointCalls.push(`after:${relPath}`); },
+      },
+    });
+    await createReadFileTool(deps).handler({ path: 'literal.ts' }, ctx);
+
+    const res = await createEditFileTool(deps).handler({
+      path: 'literal.ts', old_string: 'primera\\nsegunda', new_string: 'uno\\ndos',
+    }, ctx);
+
+    expect(res.isError).toBe(false);
+    expect(res.structured).toMatchObject({ matchLevel: 'exact', count: 1 });
+    expect(readFileSync(file, 'utf8')).toBe('const etiqueta = "uno\\ndos";\n');
+    expect(checkpointCalls).toEqual(['before:literal.ts', 'after:literal.ts']);
   });
 
   it('falla con edit_conflict si el archivo cambió en disco desde la última lectura', async () => {

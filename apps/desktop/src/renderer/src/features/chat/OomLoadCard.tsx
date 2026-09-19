@@ -15,16 +15,19 @@ export interface OomLoadCardProps {
   runId: string;
   error: RunError;
   modelName: string | undefined;
-  onRetry: (runId: string) => void;
+  onRetry: (runId: string) => Promise<void>;
+  busy?: boolean;
+  retryError?: string;
 }
 
-export function OomLoadCard({ runId, error, modelName, onRetry }: OomLoadCardProps): React.JSX.Element {
+export function OomLoadCard({ runId, error, modelName, onRetry, busy = false, retryError }: OomLoadCardProps): React.JSX.Element {
   return (
     <div className="oom-load-card" role="alert">
       <p className="oom-load-card__title">
         El modelo{modelName ? ` (${modelName})` : ''} no entró en la memoria de tu equipo.
       </p>
       <p className="oom-load-card__detail">{error.message}</p>
+      {retryError && <p className="oom-load-card__error" role="alert">No se pudo reintentar: {retryError}</p>}
       <div className="oom-load-card__actions">
         <button
           type="button"
@@ -36,10 +39,11 @@ export function OomLoadCard({ runId, error, modelName, onRetry }: OomLoadCardPro
         <button
           type="button"
           className="saurio-btn-primary"
-          onClick={() => onRetry(runId)}
+          onClick={() => void onRetry(runId)}
+          disabled={busy}
           title="Vuelve a intentar desde 0: primero con ~75% de las capas en GPU, después ~50%, por último solo CPU"
         >
-          Reintentar con menos capas en GPU
+          {busy ? 'Reintentando…' : 'Reintentar con menos capas en GPU'}
         </button>
       </div>
     </div>

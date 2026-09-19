@@ -2,7 +2,7 @@
 // Define: doc 04 §8. Solo interfaces/tipos (sin implementación). MVP: presupuesto a 16k, compactación
 // nivel 0 y 2 (nivel 1 solo junto con nivel 2), lectura de SAURIO.md. Presupuesto a 32k y
 // .saurio/rules/*.md son v0.2.
-import type { ModelRef, ChatMessage, ContextBudgetReport } from '@saurio/shared';
+import type { ModelRef, ChatMessage, ContextBudgetReport, ContextInspection } from '@saurio/shared';
 import type { AgentConfig } from '../agent/types.js';
 import type { Mode } from '@saurio/shared';
 
@@ -21,6 +21,19 @@ export interface TokenCounter {
 /** Alias documentado por la tarea de contratos (item 2: "TokenEstimator"); el doc 04 §8 lo nombra
  *  `TokenCounter` — ver deviations. */
 export type TokenEstimator = TokenCounter;
+
+export type ContextInspectionReason = NonNullable<ContextInspection['sources'][number]['reason']>;
+export interface ContextInspectionInput {
+  projectRoot: string;
+  repoMapReason?: ContextInspectionReason;
+  projectMemoryReason?: ContextInspectionReason;
+  agentMemoryReason?: ContextInspectionReason;
+  attachmentsKnown: boolean;
+  attachments: ContextInspection['attachments'];
+  /** Mensaje que aportó los adjuntos de este envío. Sólo vive en el run; no se persiste en el
+   * inspector. Permite marcar los adjuntos como excluidos si ese mensaje ya no llegó al prompt. */
+  attachmentMessageId?: string;
+}
 
 export interface CompactionResult {
   level: 0 | 1 | 2;
@@ -52,6 +65,9 @@ export interface RepoMapClient {
  *  recibía nada de las definiciones de tools, que las antepone `ToolProtocol` fuera de este módulo). */
 export interface ContextBuilderInputBase {
   agent: AgentConfig; mode: Mode; history: ChatMessage[]; repoMap: string; projectMemory?: string;
+  /** Memorias recuperadas para ESTE agente/proyecto por el adaptador autorizado. Es un bloque
+   * distinto de `projectMemory`/`SAURIO.md`: conserva procedencia y se presenta como datos, no instrucciones. */
+  agentMemory?: string;
   /** Texto ya serializado de las definiciones de tools de este turno (JSON Schema o el bloque de
    *  texto del transporte Hermes); se estima como tokens 'json' para `report.used.tools`. Opcional:
    *  sin esto, `used.tools` sigue en 0 (comportamiento previo, documentado como límite conocido). */
@@ -64,18 +80,17 @@ export interface ContextBuilderInputBase {
    *  `build` disparan compactación en esta llamada puntual, sin importar el ratio de tokens ni
    *  `turnsSinceCompaction`. Default `true` (comportamiento previo si se omite). */
   allowCompaction?: boolean;
-  /** Feedback real v0.2.1, punto 1e/7 ("el indicador de contexto muestra 2.3k / 262k" — el 262k era
-   *  el máximo teórico del modelo, no lo que de verdad se mandó): numCtx REAL que va a viajar al
-   *  provider en esta request, ya capeado (`RunController.capNumCtxAgainstModel`, ADR-7) — puede
-   *  diferir de `agent.contextPolicy.numCtx` (el que usa `computeBudget` para repartir el presupuesto
-   *  por bloque) cuando el cap corrigió `effectiveConfig` sin mutar `agent.contextPolicy`. Opcional:
-   *  sin esto, `report.effectiveNumCtx` cae a `budget.numCtx` (comportamiento previo). */
+  /** numCtx REAL que va a viajar al provider en esta request, ya confirmado/capeado por el host.
+   *  Cuando difiere de `agent.contextPolicy.numCtx`, ContextBuilder deriva una policy completa para
+   *  este valor y la usa para compactación, poda, reserva y reporte; no es sólo una etiqueta de UI. */
   effectiveNumCtx?: number;
   /** Punto 3 del encargo: bloque de entorno real (carpeta de trabajo, SO, shell) que se concatena
    *  al final de `agent.systemPrompt` (antes del sufijo de modo plan). Ver
    *  `agent/environmentPrompt.ts`. Opcional/aditivo: sin esto, el system message queda igual que
    *  antes de esta tarea. */
   environmentInfo?: string;
+  /** Metadata segura para el inspector: estados y nombres, nunca contenido completo. */
+  inspection?: ContextInspectionInput;
 }
 
 /** Ensamblador del prompt: system inmutable -> few-shot -> repo map -> memoria -> resumen ->
@@ -87,7 +102,7 @@ export interface ContextBuilder {
    *  le pide un resumen al modelo, doc 07 §7.2 "corrección sobre slots de inferencia": esa llamada
    *  ocupa un slot de inferencia real). Usa la misma heurística que `build()` aplicará a
    *  continuación; llamado sin efectos secundarios. */
-  willCompact(input: Pick<ContextBuilderInputBase, 'agent' | 'history' | 'turnsSinceCompaction' | 'allowCompaction'>): boolean;
+  willCompact(input: Pick<ContextBuilderInputBase, 'agent' | 'history' | 'turnsSinceCompaction' | 'allowCompaction' | 'effectiveNumCtx'>): boolean;
   build(input: ContextBuilderInputBase): Promise<{
     messages: ChatMessage[];
     report: ContextBudgetReport;

@@ -21,6 +21,9 @@ interface MessageRow extends SqliteRow {
 function rowToMessage(row: MessageRow): ChatMessage {
   return {
     id: row.id,
+    // `messages.run_id` ya es la procedencia persistida por la proyección de `message.done`.
+    // Exponerla evita que el renderer intente asociar una respuesta con el último run del chat.
+    originRunId: row.run_id ?? undefined,
     role: row.role as ChatMessage['role'],
     content: row.content ?? '',
     thinking: row.thinking ?? undefined,
@@ -47,9 +50,9 @@ export function createMessageRepository(driver: SqliteDriver): MessageRepository
       const seq = (row?.max ?? 0) + 1;
       driver.prepare(
         `INSERT INTO messages (id, chat_id, run_id, seq, role, content, thinking, tool_calls_json, tool_call_id, tool_name, token_estimate, response_metrics_json, truncated, compacted_by, created_at, model_ref_json)
-         VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)`,
       ).run(
-        message.id, chatId, seq, message.role, message.content, message.thinking ?? null,
+        message.id, chatId, message.originRunId ?? null, seq, message.role, message.content, message.thinking ?? null,
         message.toolCalls ? JSON.stringify(message.toolCalls) : null, message.toolCallId ?? null,
         message.toolName ?? null, message.tokenEstimate ?? null, message.truncated ? 1 : 0, Date.now(),
         message.modelRef ? JSON.stringify(message.modelRef) : null,

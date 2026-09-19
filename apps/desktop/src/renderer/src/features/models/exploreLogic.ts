@@ -4,7 +4,7 @@
 // tamaño y por fuente ... orden por recomendación para ESTE equipo, lista virtualizada o paginada para
 // cientos de modelos". Funciones puras, sin IPC ni React — así se pueden testear directo con fixtures,
 // separadas de ExploreTab.tsx (que solo orquesta estado + IPC).
-import type { CatalogItem } from '@saurio/shared';
+import type { CatalogItem, HuggingFaceGgufFile } from '@saurio/shared';
 
 export type ExploreUseFilter = 'all' | 'coding' | 'chat' | 'analysis' | 'vision';
 /** `@saurio/shared` no exporta un alias `ModelTierLevel` propio (solo la forma completa
@@ -13,7 +13,7 @@ export type ExploreUseFilter = 'all' | 'coding' | 'chat' | 'analysis' | 'vision'
 export type ModelTierLevelFilter = 1 | 2 | 3 | 4 | 5 | 6;
 export type ExploreTierFilter = 'all' | ModelTierLevelFilter;
 export type ExploreSizeBucket = 'all' | 'small' | 'medium' | 'large';
-export type ExploreSortMode = 'recommended' | 'name' | 'size';
+export type ExploreSortMode = 'recommended' | 'name' | 'size' | 'context';
 
 const GIB = 1024 * 1024 * 1024;
 
@@ -41,9 +41,10 @@ export interface ExploreFilters {
    *  no se pueden descargar, y mezcladas sin avisar con las variantes locales confundían más de lo
    *  que ayudaban. `false` por defecto; el usuario las muestra a propósito con un filtro explícito. */
   showCloud: boolean;
+  minContext: number | undefined;
 }
 
-export const DEFAULT_EXPLORE_FILTERS: ExploreFilters = { search: '', use: 'all', tierLevel: 'all', sizeBucket: 'all', showCloud: false };
+export const DEFAULT_EXPLORE_FILTERS: ExploreFilters = { search: '', use: 'all', tierLevel: 'all', sizeBucket: 'all', showCloud: false, minContext: undefined };
 
 function fullName(item: CatalogItem): string {
   return `${item.entry.name}:${item.entry.tag}`;
@@ -66,6 +67,7 @@ export function filterCatalogItems(items: CatalogItem[], filters: ExploreFilters
     // Bucket de tamaño no aplica a una entrada cloud (sizeBytes es un placeholder en 0) — se
     // muestra igual con el filtro de tamaño en 'all' cuando showCloud la dejó pasar arriba.
     && (filters.sizeBucket === 'all' || item.entry.cloud || sizeBucketOf(item.entry.sizeBytes) === filters.sizeBucket)
+    && (filters.minContext === undefined || item.entry.contextMax >= filters.minContext)
   ));
 }
 
@@ -79,6 +81,15 @@ export function sortCatalogItems(items: CatalogItem[], sortBy: ExploreSortMode):
     copy.sort((a, b) => fullName(a).localeCompare(fullName(b)));
   } else if (sortBy === 'size') {
     copy.sort((a, b) => a.entry.sizeBytes - b.entry.sizeBytes);
+  } else if (sortBy === 'context') {
+    copy.sort((a, b) => {
+      const aContext = knownContextMax(a);
+      const bContext = knownContextMax(b);
+      if (aContext === undefined && bContext === undefined) return fullName(a).localeCompare(fullName(b));
+      if (aContext === undefined) return 1;
+      if (bContext === undefined) return -1;
+      return bContext - aContext || fullName(a).localeCompare(fullName(b));
+    });
   } else {
     copy.sort((a, b) => {
       const levelA = a.tier?.level ?? 6;
@@ -105,10 +116,10 @@ export function paginate<T>(items: T[], page: number, pageSize: number): Page<T>
 
 export interface FamilyGroup { name: string; variants: CatalogItem[] }
 
-/** Agrupa por familia (`entry.name`) para la ficha lateral (punto 5 del encargo: "ficha lateral con
- *  variantes") — mantiene el orden de aparición de `items` (ya viene ordenado por `sortCatalogItems`),
- *  y dentro de cada familia ordena las variantes por tamaño ascendente (la más chica primero, más fácil
- *  de recomendar como punto de entrada). */
+/** Agrupa por familia (`entry.name`) para la ficha lateral y el listado principal (punto 5 del
+ *  encargo: "una fila por familia con variantes") — mantiene el orden de aparición de `items`; el
+ *  llamador puede ordenar después las familias sin perder sus variantes. Dentro de cada familia las
+ *  variantes se ordenan por tamaño ascendente, para que la más chica sea el punto de entrada. */
 export function groupByFamily(items: CatalogItem[]): FamilyGroup[] {
   const order: string[] = [];
   const map = new Map<string, CatalogItem[]>();
@@ -120,6 +131,69 @@ export function groupByFamily(items: CatalogItem[]): FamilyGroup[] {
     name,
     variants: [...map.get(name)!].sort((a, b) => a.entry.sizeBytes - b.entry.sizeBytes),
   }));
+}
+
+/** El catálogo no debe inventar un contexto cuando el origen no lo informó. Aunque el contrato
+ * curado normalmente usa un entero positivo, este guard deja que snapshots parciales y fixtures
+ * antiguos caigan en "sin confirmar" y queden al final del orden por contexto. */
+export function knownContextMax(item: CatalogItem): number | undefined {
+  return typeof item.entry.contextMax === 'number' && item.entry.contextMax > 0
+    ? item.entry.contextMax
+    : undefined;
+}
+
+/** Ordena una fila por familia sin volver a aplanar sus variantes. Para contexto se toma el máximo
+ * conocido de cada familia; una familia sin ese dato queda explícitamente al final. */
+export function sortFamilyGroups(groups: FamilyGroup[], sortBy: ExploreSortMode): FamilyGroup[] {
+  const copy = [...groups];
+  if (sortBy === 'name') return copy.sort((a, b) => a.name.localeCompare(b.name));
+  if (sortBy === 'size') return copy.sort((a, b) => (a.variants[0]?.entry.sizeBytes ?? 0) - (b.variants[0]?.entry.sizeBytes ?? 0));
+  if (sortBy === 'context') {
+    return copy.sort((a, b) => {
+      const maxContext = (group: FamilyGroup): number | undefined => {
+        const known = group.variants.map(knownContextMax).filter((value): value is number => value !== undefined);
+        return known.length > 0 ? Math.max(...known) : undefined;
+      };
+      const aContext = maxContext(a);
+      const bContext = maxContext(b);
+      if (aContext === undefined && bContext === undefined) return a.name.localeCompare(b.name);
+      if (aContext === undefined) return 1;
+      if (bContext === undefined) return -1;
+      return bContext - aContext || a.name.localeCompare(b.name);
+    });
+  }
+  return copy.sort((a, b) => {
+    const bestTier = (group: FamilyGroup) => Math.min(...group.variants.map((item) => item.tier?.level ?? 6));
+    const tierDelta = bestTier(a) - bestTier(b);
+    if (tierDelta !== 0) return tierDelta;
+    return (a.variants[0]?.entry.sizeBytes ?? 0) - (b.variants[0]?.entry.sizeBytes ?? 0);
+  });
+}
+
+export type HuggingFaceFileSizeFilter = 'all' | 'unknown' | Exclude<ExploreSizeBucket, 'all'>;
+export interface HuggingFaceFileFilters {
+  sizeBucket: HuggingFaceFileSizeFilter;
+  quantization: string;
+}
+export const DEFAULT_HUGGING_FACE_FILE_FILTERS: HuggingFaceFileFilters = { sizeBucket: 'all', quantization: 'all' };
+
+/** Opciones discretas derivadas sólo de cuantizaciones parseadas de archivos GGUF reales. */
+export function availableQuantizations(files: HuggingFaceGgufFile[]): string[] {
+  return [...new Set(files.flatMap((file) => file.quant ? [file.quant] : []))]
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+}
+
+/** Filtros compuestos de los archivos de un repo HF. Un tamaño o cuantización ausente nunca se
+ * fuerza a un bucket/quant inventado: se puede pedir por separado con la opción "Sin dato". */
+export function filterHuggingFaceGgufFiles(files: HuggingFaceGgufFile[], filters: HuggingFaceFileFilters): HuggingFaceGgufFile[] {
+  return files.filter((file) => {
+    const sizeMatches = filters.sizeBucket === 'all'
+      || (filters.sizeBucket === 'unknown' ? file.sizeBytes === undefined
+        : file.sizeBytes !== undefined && sizeBucketOf(file.sizeBytes) === filters.sizeBucket);
+    const quantMatches = filters.quantization === 'all'
+      || (filters.quantization === 'unknown' ? file.quant === undefined : file.quant === filters.quantization);
+    return sizeMatches && quantMatches;
+  });
 }
 
 /** Selector de contexto de la ficha (punto 5 del encargo: "selector de contexto 4k/8k/16k/32k"). */

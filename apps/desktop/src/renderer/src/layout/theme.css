@@ -152,7 +152,7 @@ button.saurio-btn-danger:hover:not(:disabled) { border-color: var(--danger); bac
 button.saurio-btn-ghost { background: transparent; border-color: transparent; }
 button.saurio-btn-ghost:hover:not(:disabled) { background: var(--bg-4); }
 
-input[type="text"], input[type="number"], select, textarea {
+input[type="text"], input[type="search"], input[type="number"], input[type="password"], select, textarea {
   font-family: inherit;
   font-size: var(--text-sm);
   color: var(--text-primary);
@@ -162,6 +162,9 @@ input[type="text"], input[type="number"], select, textarea {
   padding: 6px 8px;
 }
 input::placeholder, textarea::placeholder { color: var(--text-muted); }
+input[type="password"]:focus-visible {
+  border-color: var(--accent);
+}
 label { font-size: var(--text-xs); color: var(--text-secondary); }
 
 code, pre, kbd { font-family: var(--font-mono); }
@@ -255,6 +258,7 @@ kbd {
   min-height: 0;
   overflow: hidden;
 }
+.saurio-compact-tabs { display: none; }
 
 .saurio-sidebar {
   flex: 0 0 var(--chats-sidebar-width);
@@ -297,6 +301,7 @@ kbd {
 }
 .saurio-sidebar-item:hover { background: var(--bg-3); color: var(--text-primary); }
 .saurio-sidebar-item.active { background: var(--accent-subtle); color: var(--text-primary); font-weight: 500; }
+.saurio-sidebar-item:focus-visible, .saurio-project-row__open:focus-visible { position: relative; z-index: 1; }
 .saurio-sidebar-item__title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .saurio-sidebar-item__badges { display: flex; gap: 4px; overflow: hidden; }
 .saurio-sidebar-item__badges .saurio-badge { margin-left: 0; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
@@ -396,6 +401,7 @@ kbd {
   background: var(--bg-1);
   border-left: 1px solid var(--border-subtle);
   min-width: 0;
+  max-width: calc(100vw - var(--nav-rail-width) - var(--chats-sidebar-width) - 320px);
 }
 
 .saurio-context-resize-handle {
@@ -446,6 +452,11 @@ body.saurio-resizing { cursor: col-resize; user-select: none; }
   font-size: var(--text-sm);
   color: var(--text-muted);
   border-bottom: 2px solid transparent;
+  background: transparent;
+  border-top: 0;
+  border-left: 0;
+  border-right: 0;
+  font-family: inherit;
 }
 .saurio-tab svg { flex: 0 0 auto; }
 .saurio-tab__label {
@@ -491,8 +502,10 @@ body.saurio-resizing { cursor: col-resize; user-select: none; }
   border-top: 1px solid var(--border-subtle);
   font-size: var(--text-xs);
   color: var(--text-secondary);
+  min-width: 0;
+  overflow: hidden;
 }
-.saurio-statusbar__item { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.saurio-statusbar__item { display: flex; align-items: center; gap: 5px; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .saurio-statusbar__item svg { flex: 0 0 auto; opacity: 0.85; }
 .saurio-statusbar__dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
 .saurio-statusbar__dot.ok { background: var(--success); box-shadow: 0 0 0 2px var(--success-subtle); }
@@ -501,7 +514,30 @@ body.saurio-resizing { cursor: col-resize; user-select: none; }
 .saurio-statusbar__sep { width: 1px; height: 14px; background: var(--border); }
 /* PRIORIDAD CERO puntos 1/7: botón "Iniciar Ollama" cuando el health check falla, del tamaño de la
    barra de estado (no el botón grande de la barra lateral). */
-.saurio-statusbar__start-ollama { padding: 2px var(--space-2); font-size: var(--text-xs); line-height: 1.2; }
+.saurio-statusbar .saurio-statusbar__start-ollama { min-height: 26px; padding: 2px var(--space-2); font-size: var(--text-xs); line-height: 1.2; }
+
+/* En zoom alto la ventana puede ofrecer apenas unos cientos de píxeles CSS. Mantener tres columnas
+   en ese espacio deja al centro sin ancho; las pestañas compactas permiten cambiar de vista sin
+   modificar `contextOpen` ni su preferencia persistida. */
+@media (max-width: 1100px) {
+  .saurio-chats-view { position: relative; flex-direction: column; }
+  .saurio-compact-tabs { display: flex; flex: 0 0 auto; gap: var(--space-1); padding: var(--space-1); background: var(--bg-1); border-bottom: 1px solid var(--border-subtle); }
+  .saurio-compact-tabs button { flex: 1 1 0; min-width: 0; min-height: 32px; border: 1px solid transparent; border-radius: var(--radius-sm); padding: var(--space-1) var(--space-2); color: var(--text-secondary); background: transparent; cursor: pointer; font-size: var(--text-xs); }
+  .saurio-compact-tabs button[aria-selected="true"] { color: var(--text-primary); background: var(--accent-subtle); border-color: var(--accent); }
+  .saurio-compact-tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .saurio-chats-view > .saurio-sidebar, .saurio-chats-view > .saurio-main, .saurio-chats-view > .saurio-right-panel, .saurio-chats-view > .saurio-context-rail { display: none; }
+  .saurio-chats-view--compact-sidebar > .saurio-sidebar,
+  .saurio-chats-view--compact-chat > .saurio-main,
+  .saurio-chats-view--compact-context > .saurio-right-panel { display: flex; flex: 1 1 auto; width: auto !important; max-width: none; min-width: 0; min-height: 0; }
+  .saurio-chats-view--compact-sidebar > .saurio-sidebar { flex-basis: auto; }
+  .saurio-chats-view--compact-context > .saurio-right-panel { border-left: 0; }
+  .saurio-chats-view > .saurio-context-resize-handle { display: none; }
+  .saurio-statusbar { gap: var(--space-2); padding-inline: var(--space-2); }
+  .saurio-statusbar__spacer { display: none; }
+  .saurio-statusbar__sep { display: none; }
+  .saurio-statusbar__item { flex: 1 1 auto; }
+  .saurio-statusbar__start-ollama { flex: 0 0 auto; }
+}
 
 /* ── Badges ───────────────────────────────────────────────────────────────────────────────── */
 
@@ -681,7 +717,7 @@ button.saurio-btn-danger {
   min-height: 34px;
   padding: 7px 14px;
 }
-input[type="text"], input[type="number"], select, textarea {
+input[type="text"], input[type="search"], input[type="number"], input[type="password"], select, textarea {
   min-height: 34px;
   padding: 7px 10px;
 }

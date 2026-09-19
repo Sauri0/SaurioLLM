@@ -3,14 +3,16 @@
 import { describe, expect, it } from 'vitest';
 import type { CatalogItem } from '@saurio/shared';
 import {
-  DEFAULT_EXPLORE_FILTERS, filterCatalogItems, groupByFamily, matchesSearch, paginate, sizeBucketOf,
-  sortCatalogItems,
+  availableQuantizations, DEFAULT_EXPLORE_FILTERS, DEFAULT_HUGGING_FACE_FILE_FILTERS, filterCatalogItems,
+  filterHuggingFaceGgufFiles, groupByFamily, matchesSearch, paginate, sizeBucketOf, sortCatalogItems,
+  sortFamilyGroups,
 } from './exploreLogic.js';
 
 const GIB = 1024 * 1024 * 1024;
 
 interface ItemOptions {
   name: string; tag: string; sizeBytes: number;
+  contextMax?: number;
   tier?: CatalogItem['tier'];
   notes?: string;
   suggestedUse?: CatalogItem['entry']['suggestedUse'];
@@ -23,7 +25,7 @@ function item(opts: ItemOptions): CatalogItem {
     entry: {
       name: opts.name, tag: opts.tag, sizeBytes: opts.sizeBytes,
       capabilities: { tools: false, thinking: false, vision: false, embedding: false, ...opts.capabilities },
-      contextMax: 8192, suggestedUse: opts.suggestedUse ?? ['chat'], notes: opts.notes,
+      contextMax: opts.contextMax ?? 8192, suggestedUse: opts.suggestedUse ?? ['chat'], notes: opts.notes,
       ...(opts.cloud ? { cloud: true } : {}),
     },
     status: 'not_installed',
@@ -154,6 +156,14 @@ describe('sortCatalogItems', () => {
     sortCatalogItems(all, 'size');
     expect(all).toEqual(copy);
   });
+
+  it('ordena por contexto conocido descendente y deja el desconocido al final', () => {
+    const knownSmall = item({ name: 'known-small', tag: '1', sizeBytes: 1, contextMax: 8192 });
+    const knownLarge = item({ name: 'known-large', tag: '1', sizeBytes: 1, contextMax: 32768 });
+    const unknown = item({ name: 'unknown', tag: '1', sizeBytes: 1, contextMax: 0 });
+    expect(sortCatalogItems([knownSmall, unknown, knownLarge], 'context').map((entry) => entry.entry.name))
+      .toEqual(['known-large', 'known-small', 'unknown']);
+  });
 });
 
 describe('paginate', () => {
@@ -193,5 +203,41 @@ describe('groupByFamily', () => {
     const groups = groupByFamily(items);
     expect(groups.map((g) => g.name)).toEqual(['qwen3', 'gemma4']);
     expect(groups[0]?.variants.map((v) => v.entry.tag)).toEqual(['4b', '8b']); // ordenado por tamaño asc dentro de la familia
+  });
+
+  it('ordena familias por su mayor contexto conocido y deja explícita la familia sin dato', () => {
+    const groups = groupByFamily([
+      item({ name: 'sin-contexto', tag: 'a', sizeBytes: 1, contextMax: 0 }),
+      item({ name: 'corto', tag: 'a', sizeBytes: 1, contextMax: 8192 }),
+      item({ name: 'largo', tag: 'a', sizeBytes: 1, contextMax: 32768 }),
+    ]);
+    expect(sortFamilyGroups(groups, 'context').map((group) => group.name)).toEqual(['largo', 'corto', 'sin-contexto']);
+  });
+
+  it('reduce mil variantes de una familia a una fila antes de paginar', () => {
+    const variants = Array.from({ length: 1000 }, (_, index) => item({ name: 'misma-familia', tag: `q${index}`, sizeBytes: index + 1 }));
+    const groups = groupByFamily(variants);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.variants).toHaveLength(1000);
+    expect(paginate(groups, 1, 30).pageItems).toHaveLength(1);
+  });
+});
+
+describe('filtros discretos de archivos Hugging Face', () => {
+  const files = [
+    { filename: 'modelo-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 5 * GIB },
+    { filename: 'modelo-Q8_0.gguf', quant: 'Q8_0', sizeBytes: 17 * GIB },
+    { filename: 'modelo-sin-datos.gguf' },
+  ];
+
+  it('combina tamaño y cuantización sin inventar datos faltantes', () => {
+    expect(filterHuggingFaceGgufFiles(files, { ...DEFAULT_HUGGING_FACE_FILE_FILTERS, sizeBucket: 'medium', quantization: 'Q4_K_M' }))
+      .toEqual([files[0]]);
+    expect(filterHuggingFaceGgufFiles(files, { ...DEFAULT_HUGGING_FACE_FILE_FILTERS, sizeBucket: 'unknown', quantization: 'unknown' }))
+      .toEqual([files[2]]);
+  });
+
+  it('deriva las cuantizaciones del listado real y no agrega una para archivos desconocidos', () => {
+    expect(availableQuantizations(files)).toEqual(['Q4_K_M', 'Q8_0']);
   });
 });

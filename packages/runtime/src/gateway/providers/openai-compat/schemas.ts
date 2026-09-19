@@ -20,6 +20,19 @@ export const OpenAIModelSchema = z.looseObject({
   context_length: z.number().optional(),
   max_model_len: z.number().optional(),
   max_context_length: z.number().optional(),
+  // Metadatos publicados por GET /api/v1/models de OpenRouter. Se declaran acá (en vez de leer el
+  // bag loose) para que el mapper sólo pueda usarlos cuando el host fue reconocido como oficial.
+  pricing: z.object({
+    prompt: z.union([z.string(), z.number()]).optional(),
+    completion: z.union([z.string(), z.number()]).optional(),
+    request: z.union([z.string(), z.number()]).optional(),
+    image: z.union([z.string(), z.number()]).optional(),
+  }).optional(),
+  architecture: z.object({
+    input_modalities: z.array(z.string()).optional(),
+    output_modalities: z.array(z.string()).optional(),
+  }).optional(),
+  supported_parameters: z.array(z.string()).optional(),
 });
 export type OpenAIModel = z.infer<typeof OpenAIModelSchema>;
 
@@ -85,6 +98,9 @@ export const OpenAIUsageSchema = z.object({
   completion_tokens: z.number().optional(),
   total_tokens: z.number().optional(),
   prompt_tokens_details: z.object({ cached_tokens: z.number().optional() }).optional(),
+  // OpenRouter agrega este total de cuenta al usage final del SSE. El schema rechaza importes
+  // negativos/NaN: una ausencia sigue siendo "no informado", nunca USD 0 inventado.
+  cost: z.number().finite().nonnegative().optional(),
 });
 export type OpenAIUsage = z.infer<typeof OpenAIUsageSchema>;
 

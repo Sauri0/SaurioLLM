@@ -23,7 +23,7 @@ import { HomeScreen } from './HomeScreen.js';
 import { AgentsView } from './AgentsView.js';
 import { WideView } from './WideView.js';
 import { StatusBar } from './StatusBar.js';
-import { useChatStore, wireIpcEvents } from '../stores/index.js';
+import { useChatStore, useProjectStore, wireIpcEvents } from '../stores/index.js';
 import { useUiNavStore, type SectionId } from '../stores/uiNavStore.js';
 import { demoProject, isDemoMode, seedDemoState } from '../demo/demoState.js';
 import { OnboardingWizard } from '../features/onboarding/index.js';
@@ -60,13 +60,39 @@ export function AppLayout(): React.JSX.Element {
   const [project, setProject] = useState<Project | null>(() => (isDemoMode() ? demoProject() : null));
   const currentChatId = useChatStore((s) => s.currentChatId);
   const setCurrentChat = useChatStore((s) => s.setCurrentChat);
+  const loadChats = useChatStore((s) => s.loadChats);
+  const restoreLastProject = useProjectStore((s) => s.restoreLastProject);
+  const setCurrentProject = useProjectStore((s) => s.setCurrentProject);
+  const selectedProjectId = useProjectStore((s) => s.currentProjectId);
+  const storedProjects = useProjectStore((s) => s.projects);
   const section = useUiNavStore((s) => s.section);
   const setSection = useUiNavStore((s) => s.setSection);
 
   useEffect(() => wireIpcEvents(), []);
 
   useEffect(() => {
+    if (isDemoMode()) return;
+    setProject(storedProjects.find((item) => item.id === selectedProjectId) ?? null);
+  }, [selectedProjectId, storedProjects]);
+
+  useEffect(() => {
+    if (isDemoMode()) return;
+    let cancelled = false;
+    void restoreLastProject().then((restored) => {
+      if (!restored || cancelled) return;
+      setProject(restored);
+      setCurrentProject(restored.id);
+      setSection('chats');
+      void loadChats(restored.id);
+    }).catch(() => {
+      // La pantalla Inicio sigue siendo usable si un proyecto anterior ya no puede abrirse.
+    });
+    return () => { cancelled = true; };
+  }, [loadChats, restoreLastProject, setCurrentProject, setSection]);
+
+  useEffect(() => {
     function onKeyDown(ev: KeyboardEvent): void {
+      if (ev.target instanceof Element && ev.target.closest('[role="dialog"][aria-modal="true"]')) return;
       if (!ev.ctrlKey || ev.altKey || ev.metaKey || isTypingTarget(ev.target)) return;
       const target = SHORTCUT_SECTIONS[ev.key];
       if (!target) return;
@@ -82,6 +108,7 @@ export function AppLayout(): React.JSX.Element {
   // pantalla de Inicio sigue funcionando igual, pero ahora integrada como sección de la barra).
   function handleProjectChange(next: Project): void {
     setProject(next);
+    setCurrentProject(next.id);
     setCurrentChat(undefined);
     setSection('chats');
   }

@@ -113,9 +113,11 @@ function main() {
   }
   console.log('  OK: version/path/sha512 de latest.yml coinciden con el instalador real.');
 
-  console.log(`\nListo para publicar. Comando exacto (agregá --generate-notes o --notes-file si querés notas):\n`);
+  console.log('\nIntegridad de artefactos aprobada. Esto no certifica instalación, funcionamiento ni aceptación de la versión.');
+  console.log('Antes de publicar, completá los criterios pendientes registrados en PROYECTO.md y docs/INSTALAR.md.');
+  console.log(`\nComando de publicación para usar después de cerrar la aceptación (agregá --notes-file para las notas):\n`);
   console.log(
-    `  gh release create ${tag} --repo Sauri0/SaurioLLM --generate-notes \\\n` +
+    `  gh release create ${tag} --repo Sauri0/SaurioLLM --target main --generate-notes \\\n` +
       `    "${path.join('apps', 'desktop', 'release', installerName)}" \\\n` +
       `    "${path.join('apps', 'desktop', 'release', blockmapName)}" \\\n` +
       `    "${path.join('apps', 'desktop', 'release', latestYmlName)}"`,

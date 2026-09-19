@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { openDriver, type SqliteDriver } from '../driver.js';
 import { runMigrations } from '../migrations/index.js';
 import { createAgentRepository } from './agent.js';
+import { createAgentMemoryRepository } from './agentMemory.js';
 import type { AgentCreateInput } from '@saurio/shared';
 
 function openTestDb(): { driver: SqliteDriver; dir: string } {
@@ -44,8 +45,15 @@ describe('AgentRepository — perfiles (doc 19 §1.5)', () => {
     expect(profile.name).toBe('Revisor');
     expect(profile.modelMode).toBe('fixed');
     expect(profile.permissionPreset).toBe('balanced');
+    expect(profile.memoryScope).toBe('global');
     expect(profile.allowedTools).not.toContain('delegate');
     expect(profile.archivedAt).toBeUndefined();
+  });
+
+  it('rechaza crear memoria de proyecto sin un proyecto asociado', async () => {
+    const repo = createAgentRepository(driver);
+    await expect(repo.createProfile(inputFor('Incompleto', { memoryScope: 'project', projectId: undefined })))
+      .rejects.toThrow(/proyecto asociado/);
   });
 
   it('listProfiles sin filtro devuelve solo personal, nunca worker/coordinator', async () => {
@@ -75,6 +83,9 @@ describe('AgentRepository — perfiles (doc 19 §1.5)', () => {
     const withArchived = await repo.listProfiles({ includeArchived: true });
     expect(withArchived).toHaveLength(1);
     expect(withArchived[0]!.archivedAt).toBeDefined();
+    await repo.restore(created.id);
+    expect((await repo.listProfiles()).map((profile) => profile.id)).toEqual([created.id]);
+    expect((await repo.getProfile(created.id))?.archivedAt).toBeUndefined();
   });
 
   it('duplicate copia el agente con un id nuevo y nombre distinto', async () => {
@@ -93,6 +104,67 @@ describe('AgentRepository — perfiles (doc 19 §1.5)', () => {
     const updated = await repo.updateProfile(created.id, { description: 'nueva descripción' });
     expect(updated.description).toBe('nueva descripción');
     expect(updated.name).toBe('Editable');
+  });
+
+  it('permite borrar instrucciones explícitamente sin restaurar el valor anterior', async () => {
+    const repo = createAgentRepository(driver);
+    const created = await repo.createProfile(inputFor('Sin instrucciones', { systemPrompt: 'instrucción inicial' }));
+    const updated = await repo.updateProfile(created.id, { systemPrompt: '' });
+    expect(updated.systemPrompt).toBe('');
+  });
+
+  it('conserva el alcance de memoria del proyecto al listar, editar y duplicar', async () => {
+    const repo = createAgentRepository(driver);
+    const now = Date.now();
+    driver.prepare('INSERT INTO projects (id, path, name, created_at) VALUES (?, ?, ?, ?)')
+      .run('project-memoria', 'N:/memoria', 'Memoria', now);
+
+    const created = await repo.createProfile(inputFor('Del proyecto', {
+      memoryScope: 'project', projectId: 'project-memoria',
+    }));
+    expect(created).toMatchObject({ memoryScope: 'project', projectId: 'project-memoria' });
+    expect((await repo.listProfiles()).find((profile) => profile.id === created.id)).toMatchObject({
+      memoryScope: 'project', projectId: 'project-memoria',
+    });
+
+    const updated = await repo.updateProfile(created.id, { description: 'sin cambiar el alcance' });
+    expect(updated).toMatchObject({ memoryScope: 'project', projectId: 'project-memoria' });
+
+    const reopened = await createAgentRepository(driver).getProfile(created.id);
+    expect(reopened).toMatchObject({ memoryScope: 'project', projectId: 'project-memoria' });
+    const copy = await repo.duplicate(created.id);
+    expect(copy).toMatchObject({ memoryScope: 'project', projectId: 'project-memoria' });
+  });
+
+  it('cambiar alcance del perfil no convierte memorias privadas en globales', async () => {
+    const repo = createAgentRepository(driver);
+    const memories = createAgentMemoryRepository(driver);
+    driver.prepare('INSERT INTO projects (id, path, name, created_at) VALUES (?, ?, ?, ?)')
+      .run('project-scope', '/scope', 'Scope', Date.now());
+    const agent = await repo.createProfile(inputFor('Cambio de alcance', { memoryScope: 'project', projectId: 'project-scope' }));
+    const memory = await memories.upsert({ agentId: agent.id, projectId: 'project-scope', content: 'Sólo proyecto' });
+    const global = await repo.updateProfile(agent.id, { memoryScope: 'global' });
+    expect(global.memoryScope).toBe('global');
+    expect(global.projectId).toBeUndefined();
+    expect(await memories.list(agent.id)).toEqual([]);
+    expect((await memories.get(memory.id))?.projectId).toBe('project-scope');
+    await expect(repo.updateProfile(agent.id, { memoryScope: 'project' })).rejects.toThrow('proyecto asociado');
+    expect(await repo.updateProfile(agent.id, { memoryScope: 'project', projectId: 'project-scope' }))
+      .toMatchObject({ memoryScope: 'project', projectId: 'project-scope' });
+  });
+
+  it('trata una política histórica ausente como desconocida y la conserva al editar', async () => {
+    const repo = createAgentRepository(driver);
+    const created = await repo.createProfile(inputFor('Histórico'));
+    driver.prepare('UPDATE agents SET memory_policy_json = NULL, project_id = NULL WHERE id = ?').run(created.id);
+
+    const legacy = await repo.getProfile(created.id);
+    expect(legacy?.memoryScope).toBeUndefined();
+    expect((await repo.listProfiles()).find((profile) => profile.id === created.id)?.memoryScope).toBeUndefined();
+    const updated = await repo.updateProfile(created.id, { description: 'actualización segura' });
+    expect(updated.memoryScope).toBeUndefined();
+    expect(driver.prepare<{ memory_policy_json: string | null }>('SELECT memory_policy_json FROM agents WHERE id = ?')
+      .get(created.id)?.memory_policy_json).toBeNull();
   });
 });
 

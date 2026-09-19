@@ -3,7 +3,7 @@
 // tipados (para que el resto del monorepo compile contra ellos) pero sin handler real todavía
 // (principio 8 de la columna vertebral).
 import { z } from 'zod';
-import { Mode, ChatPermissionPreset, Effort } from './enums.js';
+import { Mode, ChatPermissionPreset, Effort, RunState } from './enums.js';
 import {
   ProjectSchema, ChatSchema, ChatMessageSchema, ToolCallRecordSchema, CheckpointSchema, TaskSchema,
   ModelRefSchema, ModelInfoSchema, ModelDescriptionSchema, LoadedModelSchema, MemoryEstimateSchema,
@@ -14,7 +14,8 @@ import {
   ProviderConfigSchema, ProviderPresetSchema, ProviderTestResultSchema, NonLocalCallAuditEntrySchema,
   AgentProfileSchema, AgentMemorySchema, AgentCreateInputSchema,
   HuggingFaceSearchResultSchema, HuggingFaceGgufFileSchema, LibraryCatalogResultSchema, ResolveModelByNameResultSchema,
-  ModelTierSchema, AttachmentSchema, ProjectRecentSchema,
+  ModelTierSchema, AttachmentSchema, ProjectRecentSchema, ProviderCatalogStatusSchema,
+  ModelResolutionSchema, RunErrorSchema,
 } from './domain.js';
 import { RunEventSchema } from './events.js';
 
@@ -23,6 +24,15 @@ const ChatHistorySchema = z.object({
   toolCalls: z.array(ToolCallRecordSchema),
   checkpoints: z.array(CheckpointSchema),
   tasks: z.array(TaskSchema),
+  /** Último run persistido del chat. Permite rehidratar un cierre/error después de reiniciar sin
+   *  reconstruir estados transitorios a partir de todo el event log. */
+  lastRun: z.object({
+    id: z.string(),
+    state: RunState,
+    error: RunErrorSchema.optional(),
+  }).optional(),
+  /** Última razón realmente persistida. Ausente para chats sin runs o runs legacy. */
+  modelResolution: ModelResolutionSchema.optional(),
 });
 
 const BenchRequestSchema = z.object({
@@ -53,6 +63,12 @@ const OllamaEnsureRunningOutputSchema = z.object({
   error: z.string().optional(),
 });
 
+const EngineStatusSchema = z.object({
+  phase: z.enum(['missing', 'checking', 'downloading', 'verifying', 'extracting', 'installed', 'cancelled', 'error']),
+  version: z.string().optional(), completedBytes: z.number(), totalBytes: z.number().optional(), error: z.string().optional(),
+  mode: z.enum(['managed', 'external']), hasManaged: z.boolean(),
+});
+
 export const ipc = {
   'app:ping':               { input: AppPingInputSchema, output: AppPingOutputSchema },
   // Asistente de primer arranque (punto 5 del encargo): "abre la descarga oficial de Ollama con
@@ -60,7 +76,12 @@ export const ipc = {
   // invocar esto; este canal solo hace `shell.openExternal(url)`, nunca descarga ni ejecuta nada.
   'app:openExternal':       { input: z.object({ url: z.string().url() }), output: z.void() },
   'ollama:ensureRunning':  { input: z.void(), output: OllamaEnsureRunningOutputSchema },
+  'engine:status':         { input: z.void(), output: EngineStatusSchema },
+  'engine:install':        { input: z.void(), output: EngineStatusSchema },
+  'engine:cancel':         { input: z.void(), output: z.void() },
+  'engine:select':         { input: z.object({ mode: z.enum(['managed', 'external']) }), output: OllamaEnsureRunningOutputSchema },
   'project:open':          { input: z.object({ path: z.string().optional() }), output: ProjectSchema },
+  'project:createManaged': { input: z.object({ name: z.string().trim().min(1).max(80) }), output: ProjectSchema },
   'project:list':          { input: z.void(), output: z.array(ProjectSchema) },
   // Feedback real v0.2.1, punto 12 ("proyectos persistentes como Claude Code/Codex"): lista de
   // proyectos abiertos alguna vez, más reciente primero, con cantidad de chats y si la carpeta sigue
@@ -72,11 +93,28 @@ export const ipc = {
   // historial salvo confirmación aparte").
   'project:remove':        { input: z.object({ id: z.string() }), output: z.void() },
   'project:rename':        { input: z.object({ id: z.string(), name: z.string() }), output: ProjectSchema },
+  'project:relocate':      { input: z.object({ id: z.string().min(1), path: z.string().optional() }), output: ProjectSchema.nullable() },
   // `confirmed`: mismo mecanismo que `chat:setModel` (frontera local/nube, punto 4 del encargo) —
   // crear un chat nuevo directamente con un modelRef NUBE es otra forma de "elegir un modelo NUBE
   // para un chat", así que pasa por la misma confirmación explícita la primera vez por proyecto.
-  'chat:create':           { input: z.object({ projectId: z.string(), agentId: z.string(), mode: Mode, modelRef: ModelRefSchema, confirmed: z.boolean().optional() }), output: ChatSchema },
+  'chat:create':           { input: z.object({ projectId: z.string(), agentId: z.string(), mode: Mode, modelRef: ModelRefSchema.optional(), modelSelection: z.enum(['auto', 'explicit']).optional(), confirmed: z.boolean().optional() }).superRefine((value, ctx) => {
+    if ((value.modelSelection ?? 'explicit') === 'explicit' && !value.modelRef) {
+      ctx.addIssue({ code: 'custom', path: ['modelRef'], message: 'un chat con selección explícita requiere modelo' });
+    }
+    if (value.modelSelection === 'auto' && value.modelRef) {
+      ctx.addIssue({ code: 'custom', path: ['modelRef'], message: 'un chat automático no persiste un modelo provisional' });
+    }
+  }), output: ChatSchema },
   'chat:list':             { input: z.object({ projectId: z.string() }), output: z.array(ChatSchema) },
+  'chat:search': { input: z.object({
+    projectId: z.string().min(1), query: z.string().trim().min(1).max(200),
+    since: z.number().int().nonnegative().optional(), until: z.number().int().nonnegative().optional(),
+    includeArchived: z.boolean().optional(), offset: z.number().int().nonnegative().max(100000).optional(),
+    limit: z.number().int().min(1).max(50).optional(),
+  }), output: z.object({ items: z.array(z.object({
+    chatId: z.string(), projectId: z.string(), title: z.string(), updatedAt: z.number(), archived: z.boolean(),
+    snippet: z.string(), messageId: z.string().optional(), matchedAt: z.number().optional(),
+  })), hasMore: z.boolean() }) },
   'chat:history':          { input: z.object({ chatId: z.string() }), output: ChatHistorySchema },
   // Cambiar modelo/modo de un chat existente (punto 3 del encargo; doc 04 §16 no traía este canal
   // porque el MVP fijaba modelo/modo al crear el chat — `chats.model_ref_json`/`chats.mode` son
@@ -102,13 +140,17 @@ export const ipc = {
   // Feedback real v0.2.1, punto 1c: adjuntos de archivo/imagen junto con el mensaje del usuario.
   'run:start':             { input: z.object({ chatId: z.string(), text: z.string(), mode: Mode, attachments: z.array(AttachmentSchema).optional() }), output: z.object({ runId: z.string() }) },
   'run:cancel':            { input: z.object({ runId: z.string() }), output: z.void() },
+  'run:cancelChild':       { input: z.object({ parentRunId: z.string(), childRunId: z.string() }), output: z.void() },
   'run:continue':          { input: z.object({ runId: z.string(), extraIterations: z.number().optional() }), output: z.object({ runId: z.string() }) },
+  'run:regenerate':        { input: z.object({ runId: z.string().min(1) }), output: z.object({ runId: z.string() }) },
   'permission:answer':     { input: PermissionAnswerSchema, output: z.void() },
   'checkpoint:list':       { input: z.object({ chatId: z.string() }), output: z.array(CheckpointSchema) },
   'checkpoint:diff':       { input: z.object({ checkpointId: z.string(), relPath: z.string() }), output: DiffResultSchema },
   'checkpoint:planRevert': { input: z.object({ checkpointIds: z.array(z.string()) }), output: RevertPlanSchema },
   'checkpoint:revert':     { input: z.object({ checkpointIds: z.array(z.string()), resolution: z.record(z.string(), z.enum(['restore', 'keep_mine', 'skip'])) }), output: RevertResultSchema },  // zod 4.6.5: z.record exige key+value schema
-  'models:list':           { input: z.object({ refresh: z.boolean().optional() }), output: z.array(ModelInfoSchema) },
+  'models:list':           { input: z.object({ refresh: z.boolean().optional(), providerId: z.string().optional() }), output: z.array(ModelInfoSchema) },
+  'models:catalogStatus':  { input: z.undefined(), output: z.array(ProviderCatalogStatusSchema) },
+  'models:updateManual':   { input: z.object({ providerId: z.string().min(1), name: z.string().trim().min(1).max(200).regex(/^[^\r\n]+$/u).refine((name) => !name.includes('\0')), remove: z.boolean().optional() }), output: z.void() },
   'models:loaded':         { input: z.void(), output: z.array(LoadedModelSchema) },
   'models:describe':       { input: z.object({ ref: ModelRefSchema }), output: ModelDescriptionSchema },
   'models:fits':           { input: z.object({ ref: ModelRefSchema, numCtx: z.number() }), output: MemoryEstimateSchema },
@@ -169,9 +211,34 @@ export const ipc = {
   // que faltaba en este contrato, FilesPanel lo invocaba con invokeRaw y se degradaba).
   'files:tree':            { input: z.object({ projectId: z.string(), relPath: z.string().optional() }), output: z.array(FileTreeNodeSchema) },
   'files:read':            { input: z.object({ projectId: z.string(), relPath: z.string() }), output: FileReadResultSchema },
+  // Búsqueda acotada y cancelable: una coincidencia por archivo, sin devolver ni retener el contenido
+  // completo del proyecto. El requestId permite al renderer descartar/cancelar consultas supersedidas.
+  'files:search':          { input: z.object({
+    projectId: z.string().min(1), requestId: z.string().min(1).max(120), query: z.string().trim().min(1).max(200),
+    mode: z.enum(['path', 'content', 'all']).optional(), offset: z.number().int().nonnegative().max(100000).optional(),
+    limit: z.number().int().min(1).max(50).optional(),
+  }), output: z.object({
+    requestId: z.string(), items: z.array(z.object({
+      relPath: z.string(), name: z.string(), match: z.enum(['path', 'content']), line: z.number().int().positive().optional(),
+      excerpt: z.string().max(400).optional(), sizeBytes: z.number().nonnegative(),
+    })), hasMore: z.boolean(), cancelled: z.boolean(),
+  }) },
+  'files:cancelSearch':    { input: z.object({ projectId: z.string().min(1), requestId: z.string().min(1).max(120) }), output: z.void() },
   'terminal:create':       { input: z.object({ projectId: z.string(), shell: z.string().optional() }), output: z.object({ terminalId: z.string() }) },
   'terminal:resize':       { input: z.object({ terminalId: z.string(), cols: z.number(), rows: z.number() }), output: z.void() },
   'terminal:close':        { input: z.object({ terminalId: z.string() }), output: z.void() },
+  'project:personal': { input: z.void(), output: ProjectSchema },
+  'hardware:profile': { input: z.object({ refresh: z.boolean().optional() }), output: z.object({
+    cpu: z.object({ name: z.string(), threads: z.number().int().positive(), physicalCores: z.number().int().positive().optional() }),
+    ram: z.object({ totalBytes: z.number().nonnegative(), freeBytes: z.number().nonnegative() }),
+    gpu: z.object({ vendor: z.enum(['nvidia', 'amd', 'intel', 'apple', 'other']), vramTotalBytes: z.number().nonnegative(), vramUsedBytes: z.number().nonnegative().optional(), integrated: z.boolean().optional(), quality: z.enum(['measured', 'estimated', 'unavailable']), source: z.string() }).optional(),
+    sampledAt: z.number(),
+  }) },
+  'providers:usageSummary': { input: z.object({ since: z.number().nonnegative().optional(), runId: z.string().optional() }), output: z.object({
+    reportedUsd: z.number().nonnegative(), reportedCalls: z.number().int().nonnegative(),
+    estimatedUsd: z.number().nonnegative(), estimatedCalls: z.number().int().nonnegative(),
+    unavailableCalls: z.number().int().nonnegative(), totalCalls: z.number().int().nonnegative(),
+  }) },
   'metrics:snapshot':      { input: z.void(), output: MetricsSnapshotSchema },
   // Doc 14 §6/§8: "metrics:tick... solo mientras el panel está abierto" — el renderer avisa acá
   // cuando el Panel de rendimiento se monta/desmonta para que main arranque/pare el muestreo
@@ -193,8 +260,11 @@ export const ipc = {
   // por si una vista futura lo necesita, sin uso todavía en el handler del MVP de esta entrega.
   'agents:list':           { input: z.object({ projectId: z.string().optional(), includeArchived: z.boolean().optional() }), output: z.array(AgentProfileSchema) },
   'agents:create':         { input: AgentCreateInputSchema, output: AgentProfileSchema },
+  'agents:collaborators:get': { input: z.object({ chatId: z.string(), projectId: z.string() }), output: z.object({ agentIds: z.array(z.string()) }) },
+  'agents:collaborators:set': { input: z.object({ chatId: z.string(), projectId: z.string(), agentIds: z.array(z.string()).max(12) }), output: z.object({ agentIds: z.array(z.string()) }) },
   'agents:update':         { input: z.object({ id: z.string(), patch: AgentCreateInputSchema.partial() }), output: AgentProfileSchema },
   'agents:archive':        { input: z.object({ id: z.string() }), output: z.void() },
+  'agents:restore':        { input: z.object({ id: z.string() }), output: z.void() },
   'agents:duplicate':      { input: z.object({ id: z.string(), name: z.string().optional() }), output: AgentProfileSchema },
   'agent-memory:list':     { input: z.object({ agentId: z.string(), projectId: z.string().optional() }), output: z.array(AgentMemorySchema) },
   'agent-memory:upsert':   { input: AgentMemorySchema.partial(), output: AgentMemorySchema },
@@ -217,7 +287,9 @@ export interface RendererEvents {
   'models:changed': { installed: z.infer<typeof ModelInfoSchema>[]; loaded: z.infer<typeof LoadedModelSchema>[] };
   'download:progress': z.infer<typeof DownloadJobSchema>;
   'download:done': z.infer<typeof DownloadJobSchema>;
-  'download:failed': { downloadId: string; error: string };
+  // El job completo permite insertar una descarga que falló antes de emitir progreso (por ejemplo,
+  // al resolver un redirect de Hugging Face), además de conservar tamaño/modelo para reintentar.
+  'download:failed': z.infer<typeof DownloadJobSchema>;
   'metrics:tick': z.infer<typeof MetricsSnapshotSchema>;                        // solo con el panel de rendimiento abierto
   'provider:health': { providerId: string; ok: boolean; version?: string; error?: string };
   'bench:progress': { benchmarkRunId: string; taskId: string; completed: number; total: number };  // v0.3

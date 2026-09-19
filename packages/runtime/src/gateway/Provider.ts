@@ -12,9 +12,9 @@ export interface Provider {
   readonly locality: Locality;
 
   health(signal?: AbortSignal): Promise<{ ok: boolean; version?: string; error?: string }>;
-  listModels(): Promise<ModelInfo[]>;
+  listModels(signal?: AbortSignal): Promise<ModelInfo[]>;
   describeModel(name: string): Promise<ModelDescription>;
-  listLoaded?(): Promise<LoadedModel[]>;                    // /api/ps
+  listLoaded?(signal?: AbortSignal): Promise<LoadedModel[]>; // /api/ps
 
   /** Streaming con abort real por request (ADR-2: el cliente ollama 0.6.3 no lo permite). */
   chat(req: ChatRequest, signal: AbortSignal): AsyncIterable<ChatChunk>;

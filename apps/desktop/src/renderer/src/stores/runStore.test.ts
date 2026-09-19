@@ -23,15 +23,26 @@ function emptyState(): Omit<RunStoreState, 'applyEvents' | 'clearChat' | 'dismis
     lastSeqByRun: {},
     childRunsByParent: {},
     childChatIdByRun: {},
+    childChatIdByToolCall: {},
     activityByRun: {},
     smallModelWarningByRun: {},
     contextBudgetByChat: {},
+    modelResolutionByChat: {},
   };
 }
 
 const base = { runId: 'run-1', chatId: 'chat-1', ts: 0 };
 
 describe('reduceRunEvent', () => {
+  it('recuerda el primer token después de message.done y lo separa del próximo run', () => {
+    let state = emptyState() as RunStoreState;
+    state = reduceRunEvent(state, { ...base, seq: 1, type: 'message.delta', messageId: 'm', field: 'thinking', text: 'Analizando' });
+    state = reduceRunEvent(state, { ...base, seq: 2, type: 'message.done', message: { id: 'm', role: 'assistant', content: '' }, metrics: { quality: 'measured' } });
+    state = reduceRunEvent(state, { ...base, seq: 3, type: 'run.state', from: 'queued', to: 'generating' });
+    expect(state.streaming).toEqual({});
+    expect(state.firstChunkByRun?.['run-1']).toBe(true);
+    expect(state.firstChunkByRun?.['run-2']).toBeUndefined();
+  });
   it('actualiza runStates con run.state', () => {
     const event: RunEvent = { ...base, seq: 1, type: 'run.state', from: 'created', to: 'generating' };
     const next = reduceRunEvent(emptyState() as RunStoreState, event);
@@ -141,19 +152,20 @@ describe('reduceRunEvent', () => {
     expect(next.interrupted['run-1']).toEqual({ runId: 'run-1', chatId: 'chat-1', orphaned: [], abandoned: [] });
   });
 
-  it('acumula childRunsByParent y childChatIdByRun con run.delegated (doc 19 §2.6)', () => {
+  it('acumula runs hijos y correlación exacta por toolCallId', () => {
     const state = emptyState() as RunStoreState;
     const event: RunEvent = {
       ...base, seq: 1, type: 'run.delegated',
       parentRunId: 'run-1', childRunId: 'run-2', childChatId: 'chat-2',
-      targetAgentId: 'agent-x', task: 'revisar el módulo X',
+      targetAgentId: 'agent-x', task: 'revisar el módulo X', toolCallId: 'call-1',
     };
     const next = reduceRunEvent(state, event);
     expect(next.childRunsByParent['run-1']).toEqual(['run-2']);
     expect(next.childChatIdByRun['run-2']).toBe('chat-2');
+    expect(next.childChatIdByToolCall['call-1']).toBe('chat-2');
 
     // Un segundo run.delegated del mismo padre se agrega, no reemplaza.
-    const event2: RunEvent = { ...event, seq: 2, childRunId: 'run-3', childChatId: 'chat-3' };
+    const event2: RunEvent = { ...event, seq: 2, childRunId: 'run-3', childChatId: 'chat-3', toolCallId: undefined };
     const next2 = reduceRunEvent(next, event2);
     expect(next2.childRunsByParent['run-1']).toEqual(['run-2', 'run-3']);
   });
@@ -169,15 +181,23 @@ describe('reduceRunEvent', () => {
     expect(next.activityByRun['run-1']).toEqual({ phase: 'running_command', label: 'Ejecutando: npm test', toolCallId: 'tc1', ts: 10 });
   });
 
-  it('guarda context.built por chat, con effectiveNumCtx (nunca el maximo teorico del modelo)', () => {
+  it('guarda context.built por chat con effectiveNumCtx y la resolución real del modelo', () => {
     const state = emptyState() as RunStoreState;
     const budget = {
       numCtx: 262144, effectiveNumCtx: 8192, reserveForResponse: 512,
       used: { system: 100, tools: 50, repoMap: 0, memory: 0, history: 200 }, totalUsed: 350, fits: true,
     };
-    const event: RunEvent = { ...base, seq: 1, type: 'context.built', budget };
+    const modelResolution = {
+      source: 'automatic_loaded' as const, contextMax: 32768,
+      fitClass: 'tight' as const, fitQuality: 'estimated' as const,
+    };
+    const event: RunEvent = { ...base, seq: 1, type: 'context.built', budget, modelResolution };
     const next = reduceRunEvent(state, event);
     expect(next.contextBudgetByChat['chat-1']).toEqual(budget);
+    expect(next.modelResolutionByChat['chat-1']).toEqual(modelResolution);
+
+    const legacy = reduceRunEvent(next, { ...base, seq: 2, type: 'context.built', budget });
+    expect(legacy.modelResolutionByChat['chat-1']).toBeUndefined();
   });
 
   it('guarda run.smallModelWarning una sola vez por run, sin pisarla en iteraciones siguientes', () => {

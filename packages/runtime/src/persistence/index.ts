@@ -29,5 +29,6 @@ export function openPersistence(path: string): PersistenceHandle {
 export { openDriver, type SqliteDriver, type SqliteRow, type PreparedStatement } from './driver.js';
 export { runMigrations, NewerSchemaError } from './migrations/index.js';
 export { createRepositories, type Repositories } from './repositories/index.js';
+export type { ModelCompatLookup, ModelCompatRecord, ModelLoadSampleRecord } from './repositories/index.js';
 export { SqliteEventStore, createProjector } from '../events/index.js';
 export * from './types.js';

@@ -58,7 +58,7 @@ function makeFakeHost(overrides: Record<string, unknown> = {}) {
       listLoaded: vi.fn(async () => []),
       detectedModelsFolder: vi.fn(async () => ({ path: '/models', source: 'default', validated: true, freeBytes: 100 * GIB, spaceQuality: 'measured' })),
     },
-    hardwareProbe: { sample: vi.fn(async () => fakeHardware(8, 1, 24)) },
+    hardwareProbe: { sample: vi.fn(async () => fakeHardware(8, 1, 24)), refreshGpu: vi.fn() },
     downloadManager: {
       isDownloading: vi.fn(() => false),
       downloadIdFor: vi.fn(() => undefined),
@@ -89,6 +89,23 @@ describe('ipc/models — cobertura máxima del catálogo (doc 16 §12.6)', () =>
     allowFrame(fakeFrame);
   });
 
+  it('hardware:profile aplana el perfil medido y refresh invalida solamente la caché de GPU', async () => {
+    const hardware = fakeHardware(8, 1, 24);
+    hardware.gpu = { ...hardware.gpu!, integrated: false };
+    const host = makeFakeHost({ hardwareProbe: { sample: vi.fn(async () => hardware), refreshGpu: vi.fn() } });
+    registerModelsHandlers(host as unknown as RuntimeHost);
+
+    const result = await invoke('hardware:profile', { refresh: true }) as {
+      cpu: { name: string; threads: number }; gpu?: { vramTotalBytes: number; integrated?: boolean; quality: string; source: string };
+    };
+    expect(host.hardwareProbe.refreshGpu).toHaveBeenCalledOnce();
+    expect(host.hardwareProbe.sample).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      cpu: { name: 'CPU', threads: 8 },
+      gpu: { vramTotalBytes: 8 * GIB, integrated: false, quality: 'measured', source: 'test' },
+    });
+  });
+
   it('models:libraryCatalog fusiona el snapshot con el catálogo curado y expone la fuente', async () => {
     const host = makeFakeHost();
     registerModelsHandlers(host as unknown as RuntimeHost);
@@ -105,6 +122,18 @@ describe('ipc/models — cobertura máxima del catálogo (doc 16 §12.6)', () =>
     registerModelsHandlers(host as unknown as RuntimeHost);
     await invoke('models:libraryCatalog', { forceRefresh: true });
     expect(host.ollamaLibraryClient.getCatalog).toHaveBeenCalledWith({ forceRefresh: true });
+  });
+
+  it('el catálogo evalúa memoria al máximo anunciado, sin reducir una ventana grande a 8K', async () => {
+    const snapshot = structuredClone(SNAPSHOT);
+    snapshot.families[0]!.variants[0]!.contextMax = 262_144;
+    const host = makeFakeHost({ ollamaLibraryClient: {
+      getCatalog: vi.fn(async () => ({ snapshot, source: 'network' as const, cachedAt: 1000 })),
+    } });
+    registerModelsHandlers(host as unknown as RuntimeHost);
+    const result = await invoke('models:libraryCatalog', {}) as { items: { tier?: { level: number } }[] };
+    // Pesos de 5 GB con KV de 262K no entran cómodamente en esta GPU de 8 GB.
+    expect(result.items[0]?.tier?.level).toBeGreaterThan(2);
   });
 
   it('models:hfSearch delega en HuggingFaceClient.searchModels', async () => {
@@ -132,9 +161,10 @@ describe('ipc/models — cobertura máxima del catálogo (doc 16 §12.6)', () =>
     it('un nombre hf.co/<repo>:<quant> resuelve vía HuggingFaceClient (source: huggingface)', async () => {
       const host = makeFakeHost();
       registerModelsHandlers(host as unknown as RuntimeHost);
-      const result = await invoke('models:resolveByName', { name: 'hf.co/bartowski/x-GGUF:Q4_K_M' }) as { source: string; sizeBytes: number; fullName: string };
+      const result = await invoke('models:resolveByName', { name: 'hf.co/bartowski/x-GGUF:Q4_K_M' }) as { source: string; sizeBytes: number; fullName: string; tier?: unknown };
       expect(result.source).toBe('huggingface');
       expect(result.sizeBytes).toBe(4 * GIB);
+      expect(result.tier).toBeUndefined(); // Sin metadatos de contexto, no prometer compatibilidad.
       expect(host.huggingFaceClient.listGgufFiles).toHaveBeenCalledWith('bartowski/x-GGUF');
     });
 
@@ -186,11 +216,75 @@ describe('ipc/models — cobertura máxima del catálogo (doc 16 §12.6)', () =>
     expect(typeof tier.level).toBe('number');
   });
 
+  it('models:list pasa refresco individual y expone estado fechado del catálogo', async () => {
+    const host = makeFakeHost();
+    const statuses = [{ providerId: 'api', state: 'stale', count: 6, updatedAt: 100, error: 'offline' }];
+    Object.assign(host.modelManager, { catalogStatus: () => statuses });
+    registerModelsHandlers(host as unknown as RuntimeHost);
+    await invoke('models:list', { refresh: true, providerId: 'api' });
+    expect(host.modelManager.listInstalled).toHaveBeenCalledWith(true, 'api');
+    expect(await invoke('models:catalogStatus', undefined)).toEqual(statuses);
+  });
+
+  it('ID manual valida proveedor API habilitado sin llamar inferencia', async () => {
+    const update = vi.fn(async () => {});
+    const host = makeFakeHost({ providers: [{ id: 'api', kind: 'cloud' }, { id: 'ollama', kind: 'ollama' }] });
+    Object.assign(host.modelManager, { updateManualModel: update });
+    registerModelsHandlers(host as unknown as RuntimeHost);
+    await invoke('models:updateManual', { providerId: 'api', name: 'org/model' });
+    expect(update).toHaveBeenCalledWith('api', 'org/model', undefined);
+    await expect(invoke('models:updateManual', { providerId: 'ollama', name: 'model' })).rejects.toThrow('API habilitado');
+    await expect(invoke('models:updateManual', { providerId: 'missing', name: 'model' })).rejects.toThrow('API habilitado');
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+
+  it('biblioteca conserva snapshot cuando el inventario local falla, sin fingir no instalado', async () => {
+    const host = makeFakeHost();
+    host.modelManager.listInstalled.mockRejectedValue(new Error('Ollama offline'));
+    registerModelsHandlers(host as unknown as RuntimeHost);
+    const result = await invoke('models:libraryCatalog', {}) as { items: Array<{ status: string }> };
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.status).toBe('unknown');
+  });
+
+  it('un catálogo cloud disponible no confirma el inventario Ollama caído', async () => {
+    const host = makeFakeHost();
+    Object.assign(host.modelManager, { catalogStatus: () => [
+      { providerId: 'ollama', state: 'error', count: 0 },
+      { providerId: 'api', state: 'ready', count: 0 },
+    ] });
+    registerModelsHandlers(host as unknown as RuntimeHost);
+    const result = await invoke('models:libraryCatalog', {}) as { items: Array<{ status: string }> };
+    expect(result.items[0]?.status).toBe('unknown');
+  });
+
   it('models:pullExternal delega en DownloadManager.pullKnownSize', async () => {
     const host = makeFakeHost();
     registerModelsHandlers(host as unknown as RuntimeHost);
     const result = await invoke('models:pullExternal', { ref: 'hf.co/bartowski/x-GGUF:Q4_K_M', sizeBytes: 4 * GIB }) as { downloadId: string };
     expect(host.downloadManager.pullKnownSize).toHaveBeenCalledWith('hf.co/bartowski/x-GGUF:Q4_K_M', 4 * GIB);
     expect(result.downloadId).toBeTruthy();
+  });
+
+  it('models:downloads rehidrata un fallo persistido con modelo, tamaño y motivo', async () => {
+    const host = makeFakeHost({
+      downloadManager: {
+        isDownloading: vi.fn(() => false), downloadIdFor: vi.fn(() => undefined),
+        pullKnownSize: vi.fn(), listAll: vi.fn(() => []),
+      },
+      downloadsRepository: { listActiveOrRecent: vi.fn(async () => [{
+        id: 'hf-failed', providerId: 'ollama', modelName: 'hf.co/Qwen/repo:q8_0',
+        status: 'failed', total: 1_894_532_160, completed: 0, startedAt: 10, finishedAt: 11,
+        error: 'blocked redirect to a different host',
+      }]) },
+    });
+    registerModelsHandlers(host as unknown as RuntimeHost);
+
+    await expect(invoke('models:downloads', undefined)).resolves.toEqual([
+      expect.objectContaining({
+        id: 'hf-failed', modelName: 'hf.co/Qwen/repo:q8_0', status: 'failed',
+        totalBytes: 1_894_532_160, error: 'blocked redirect to a different host',
+      }),
+    ]);
   });
 });

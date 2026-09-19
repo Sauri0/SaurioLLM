@@ -3,8 +3,8 @@
 // del chat (feedback real v0.2.1: "el chat es confuso y muy cargado"; burbujas "AGENTE" vacías;
 // tarjetas de tool/checkpoint amontonadas al final en vez de en orden). apps/desktop/src/renderer/
 // src/features/chat/ChatMessageList.tsx.
-import { useEffect, useMemo, useRef } from 'react';
-import type { ChatMessage, Checkpoint, Locality, PermissionAnswer, ToolCallRecord } from '@saurio/shared';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ChatMessage, Checkpoint, Locality, PermissionAnswer, RunState, ToolCallRecord } from '@saurio/shared';
 import { invoke } from '../../ipc/client.js';
 import { useRunStore } from '../../stores/runStore.js';
 import { useChatStore } from '../../stores/chatStore.js';
@@ -15,9 +15,11 @@ import { RunCheckpointCard } from './RunCheckpointCard.js';
 import { SmallModelWarningBanner } from './SmallModelWarningBanner.js';
 import { InterruptedRunCard } from './InterruptedRunCard.js';
 import { OomLoadCard } from './OomLoadCard.js';
+import { adjustmentsForRun, RunAdjustments } from './RunAdjustments.js';
 import { groupMessagesIntoTurns, countTurnSteps, turnElapsedMs, type ActivityStep, type ChatTurn } from './activityGrouping.js';
 import { mergeRunCheckpoints } from './runCheckpoints.js';
 import { turnSummaryLabel, toolStepLabel } from './stepLabel.js';
+import { isNearChatScrollBottom } from './chatScroll.js';
 
 const TERMINAL_STATES = new Set(['completed', 'cancelled', 'failed', 'interrupted']);
 
@@ -51,22 +53,73 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
   const pendingPermissions = useRunStore((s) => s.pendingPermissions);
   const interrupted = useRunStore((s) => s.interrupted);
   const errorsByRun = useRunStore((s) => s.errorsByRun);
+  const adjustmentsByRun = useRunStore((s) => s.adjustmentsByRun);
   const activityByRun = useRunStore((s) => s.activityByRun);
   const smallModelWarningByRun = useRunStore((s) => s.smallModelWarningByRun);
-  // Doc 19 §2.6 (E3a delegación): DelegationCard necesita el childChatId de ESTA tool call puntual
-  // para "ver conversación completa" — `run.delegated` no lleva `toolCallId` (doc 19 §2.3, literal),
-  // así que se correlaciona por orden de aparición entre las tool calls `delegate` del run y los
-  // childRunId que fue emitiendo `run.delegated` para ese mismo run (limitación conocida: documentada
-  // en DelegationCard.tsx).
+  // Delegaciones nuevas correlacionan por toolCallId. El orden se conserva sólo para replays
+  // legacy cuyos eventos run.delegated todavía no incluían ese campo.
   const childRunsByParent = useRunStore((s) => s.childRunsByParent);
   const childChatIdByRun = useRunStore((s) => s.childChatIdByRun);
+  const childChatIdByToolCall = useRunStore((s) => s.childChatIdByToolCall);
   const setCurrentChat = useChatStore((s) => s.setCurrentChat);
+  // `run:continue` crea un run nuevo. Mantener este cerrojo hasta que la tarjeta desaparezca evita
+  // que un doble click alcance a crear dos continuaciones antes de que llegue el próximo evento.
+  const continuingRunIds = useRef(new Set<string>());
+  const [continuingByRun, setContinuingByRun] = useState<Record<string, true>>({});
+  const [continueErrors, setContinueErrors] = useState<Record<string, string>>({});
+  const stoppingChildRunIds = useRef(new Set<string>());
+  const [stoppingByChildRun, setStoppingByChildRun] = useState<Record<string, true>>({});
+  const [stopErrorsByChildRun, setStopErrorsByChildRun] = useState<Record<string, string>>({});
 
-  function resolveDelegationChatId(call: ToolCallRecord): string | undefined {
+  function resolveDelegationTarget(call: ToolCallRecord): {
+    childRunId?: string;
+    childChatId?: string;
+    childRunState?: RunState;
+    stopping?: boolean;
+    stopError?: string;
+  } {
+    const exactChatId = childChatIdByToolCall[call.id];
+    const childRuns = childRunsByParent[call.runId] ?? [];
+    const exactRunId = exactChatId
+      ? childRuns.find((candidate) => childChatIdByRun[candidate] === exactChatId)
+      : undefined;
     const orderedIds = (toolCallOrderByRun[call.runId] ?? []).filter((id) => toolCalls[id]?.toolName === 'delegate');
     const delegateIndex = orderedIds.indexOf(call.id);
-    const childRunId = delegateIndex >= 0 ? (childRunsByParent[call.runId] ?? [])[delegateIndex] : undefined;
-    return childRunId ? childChatIdByRun[childRunId] : undefined;
+    const childRunId = exactRunId ?? (delegateIndex >= 0 ? childRuns[delegateIndex] : undefined);
+    const childChatId = exactChatId ?? (childRunId ? childChatIdByRun[childRunId] : undefined);
+    return {
+      childRunId,
+      childChatId,
+      childRunState: childRunId ? runStates[childRunId] : undefined,
+      stopping: childRunId ? stoppingByChildRun[childRunId] === true : false,
+      stopError: childRunId ? stopErrorsByChildRun[childRunId] : undefined,
+    };
+  }
+
+  async function stopDelegation(parentRunId: string, childRunId: string): Promise<void> {
+    if (stoppingChildRunIds.current.has(childRunId)) return;
+    stoppingChildRunIds.current.add(childRunId);
+    setStoppingByChildRun((current) => ({ ...current, [childRunId]: true }));
+    setStopErrorsByChildRun((current) => {
+      const next = { ...current };
+      delete next[childRunId];
+      return next;
+    });
+    try {
+      await invoke('run:cancelChild', { parentRunId, childRunId });
+      // El botón conserva "Deteniendo…" hasta que el evento del run confirme el estado terminal.
+    } catch (error) {
+      stoppingChildRunIds.current.delete(childRunId);
+      setStoppingByChildRun((current) => {
+        const next = { ...current };
+        delete next[childRunId];
+        return next;
+      });
+      setStopErrorsByChildRun((current) => ({
+        ...current,
+        [childRunId]: error instanceof Error && error.message.trim() ? error.message : 'Ocurrió un error inesperado.',
+      }));
+    }
   }
 
   const activeRunId = useMemo(() => {
@@ -74,6 +127,7 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
     return candidates.find((runId) => !TERMINAL_STATES.has(runStates[runId] ?? '')) ?? candidates.at(-1);
   }, [runChatIds, runStates, chatId]);
   const isActiveRunLive = activeRunId !== undefined && !TERMINAL_STATES.has(runStates[activeRunId] ?? '');
+  const activeRunAdjustments = adjustmentsForRun(adjustmentsByRun, activeRunId);
 
   const streamingMessage = useMemo(
     () => Object.values(streaming).find((m) => m.chatId === chatId),
@@ -135,18 +189,41 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
     const error = (errorsByRun[activeRunId] ?? []).at(-1);
     return error?.code === 'oom_load' ? { runId: activeRunId, error } : undefined;
   }, [activeRunId, runStates, errorsByRun]);
+  const failedRunError = activeRunId && runStates[activeRunId] === 'failed'
+    ? (errorsByRun[activeRunId] ?? []).at(-1)
+    : undefined;
 
   async function answerPermission(answer: PermissionAnswer): Promise<void> {
     await invoke('permission:answer', answer);
   }
 
-  async function recoverRun(runId: string): Promise<void> {
-    await invoke('run:continue', { runId });
-    useRunStore.getState().dismissInterrupted(runId);
-  }
+  async function continueRun(runId: string, dismissInterrupted: boolean): Promise<void> {
+    if (continuingRunIds.current.has(runId)) return;
+    continuingRunIds.current.add(runId);
+    setContinuingByRun((current) => ({ ...current, [runId]: true }));
+    setContinueErrors((current) => {
+      const next = { ...current };
+      delete next[runId];
+      return next;
+    });
 
-  async function retryAfterOom(runId: string): Promise<void> {
-    await invoke('run:continue', { runId });
+    try {
+      await invoke('run:continue', { runId });
+      if (dismissInterrupted) useRunStore.getState().dismissInterrupted(runId);
+      // El cerrojo se libera cuando se desmonta la tarjeta (effect de abajo): antes de eso el run
+      // nuevo puede todavía no haber emitido su estado y permitiría una continuación duplicada.
+    } catch (error) {
+      const message = error instanceof Error && error.message.trim()
+        ? error.message
+        : 'Ocurrió un error inesperado.';
+      setContinueErrors((current) => ({ ...current, [runId]: message }));
+      continuingRunIds.current.delete(runId);
+      setContinuingByRun((current) => {
+        const next = { ...current };
+        delete next[runId];
+        return next;
+      });
+    }
   }
 
   const pendingForActiveRun = Object.values(pendingPermissions).filter((req) => toolCalls[req.toolCallId]?.runId === activeRunId);
@@ -157,12 +234,67 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
   // (feature chat/ChatPanel.tsx); `scrollIntoView` sobre un centinela al final alcanza sin acoplar
   // este componente a esa clase.
   const bottomRef = useRef<HTMLDivElement>(null);
+  const [followScroll, setFollowScroll] = useState(true);
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: 'end' });
-  }, [messages.length, streamingMessage?.content, currentRunToolCalls.length, checkpoints.length, pendingForActiveRun.length, chatInterrupted, oomFailure]);
+    // Al cambiar de chat se arranca en el final de su conversación. Después, sólo una acción de
+    // scroll de la persona decide si seguimos los mensajes nuevos.
+    setFollowScroll(true);
+  }, [chatId]);
+
+  useEffect(() => {
+    const scrollContainer = bottomRef.current?.closest<HTMLElement>('.chat-panel__messages');
+    if (!scrollContainer) return;
+
+    const updateFollowScroll = () => {
+      setFollowScroll(isNearChatScrollBottom(
+        scrollContainer.scrollHeight,
+        scrollContainer.scrollTop,
+        scrollContainer.clientHeight,
+      ));
+    };
+    scrollContainer.addEventListener('scroll', updateFollowScroll, { passive: true });
+    return () => scrollContainer.removeEventListener('scroll', updateFollowScroll);
+  }, [chatId]);
+
+  useEffect(() => {
+    if (followScroll) bottomRef.current?.scrollIntoView({ block: 'end' });
+  }, [followScroll, messages.length, streamingMessage?.content, currentRunToolCalls.length, checkpoints.length, pendingForActiveRun.length, chatInterrupted, oomFailure]);
+
+  useEffect(() => {
+    const visibleRunIds = new Set([chatInterrupted?.runId, oomFailure?.runId].filter((runId): runId is string => runId !== undefined));
+    for (const runId of continuingRunIds.current) {
+      if (visibleRunIds.has(runId)) continue;
+      continuingRunIds.current.delete(runId);
+      setContinuingByRun((current) => {
+        if (!current[runId]) return current;
+        const next = { ...current };
+        delete next[runId];
+        return next;
+      });
+      setContinueErrors((current) => {
+        if (!current[runId]) return current;
+        const next = { ...current };
+        delete next[runId];
+        return next;
+      });
+    }
+  }, [chatInterrupted?.runId, oomFailure?.runId]);
+
+  useEffect(() => {
+    for (const childRunId of stoppingChildRunIds.current) {
+      if (!TERMINAL_STATES.has(runStates[childRunId] ?? '')) continue;
+      stoppingChildRunIds.current.delete(childRunId);
+      setStoppingByChildRun((current) => {
+        const next = { ...current };
+        delete next[childRunId];
+        return next;
+      });
+    }
+  }, [runStates]);
 
   const isEmpty = turns.length === 0 && liveSteps.length === 0 && !streamingMessage
-    && pendingForActiveRun.length === 0 && !chatInterrupted && !oomFailure;
+    && pendingForActiveRun.length === 0 && !chatInterrupted && !oomFailure && !isActiveRunLive;
 
   if (isEmpty) {
     return (
@@ -200,6 +332,7 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
 
     return (
       <div key={turn.id} className="chat-message-list__group">
+        {turn.alternative && <p className="chat-message-list__alternative">Respuesta alternativa</p>}
         {turn.userMessage && (
           <MessageBubble message={turn.userMessage} currentModelLocality={currentModelLocality} />
         )}
@@ -207,7 +340,8 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
           steps={steps}
           headerLabel={headerLabel}
           live={attachLive}
-          resolveDelegationChatId={resolveDelegationChatId}
+          resolveDelegationTarget={resolveDelegationTarget}
+          onStopChild={(parentRunId, childRunId) => void stopDelegation(parentRunId, childRunId)}
           onOpenChat={setCurrentChat}
         />
         {smallModelWarning && (
@@ -221,6 +355,7 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
           <MessageBubble
             message={finalContent}
             streaming={attachLive}
+            hasActiveRun={isActiveRunLive}
             metrics={attachLive ? undefined : metricsByMessage[finalContent.id] ?? turn.finalMessage?.metrics}
             currentModelLocality={currentModelLocality}
           />
@@ -239,14 +374,15 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
     <div className="chat-message-list">
       {turns.map((turn, index) => renderTurn(turn, index === turns.length - 1))}
 
-      {(trailingLiveSteps.length > 0 || trailingPending.length > 0) && (
+      {((isActiveRunLive && !liveAttachesToLastTurn) || trailingPending.length > 0) && (
         <div className="chat-message-list__group">
-          {trailingLiveSteps.length > 0 && (
+          {isActiveRunLive && (
             <ActivityBlock
               steps={trailingLiveSteps}
               headerLabel={liveHeaderLabel()}
               live
-              resolveDelegationChatId={resolveDelegationChatId}
+              resolveDelegationTarget={resolveDelegationTarget}
+              onStopChild={(parentRunId, childRunId) => void stopDelegation(parentRunId, childRunId)}
               onOpenChat={setCurrentChat}
             />
           )}
@@ -263,11 +399,25 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
         </div>
       )}
 
+      <RunAdjustments adjustments={activeRunAdjustments} />
+
+      {failedRunError && failedRunError.code !== 'oom_load' && (
+        <div className="saurio-banner danger" role="alert">
+          <div>
+            <strong>No se pudo completar el pedido.</strong>
+            <p>{failedRunError.message}</p>
+            <p>Podés revisar la configuración o enviar un nuevo pedido.</p>
+          </div>
+        </div>
+      )}
+
       {chatInterrupted && (
         <InterruptedRunCard
           info={chatInterrupted}
-          onRecover={(runId) => void recoverRun(runId)}
+          onRecover={(runId) => continueRun(runId, true)}
           onDismiss={(runId) => useRunStore.getState().dismissInterrupted(runId)}
+          busy={continuingByRun[chatInterrupted.runId] === true}
+          recoverError={continueErrors[chatInterrupted.runId]}
         />
       )}
 
@@ -276,7 +426,9 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
           runId={oomFailure.runId}
           error={oomFailure.error}
           modelName={currentModelName}
-          onRetry={(runId) => void retryAfterOom(runId)}
+          onRetry={(runId) => continueRun(runId, false)}
+          busy={continuingByRun[oomFailure.runId] === true}
+          retryError={continueErrors[oomFailure.runId]}
         />
       )}
       <div ref={bottomRef} aria-hidden="true" />

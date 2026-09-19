@@ -1,0 +1,5 @@
+.engine-setup { display: grid; gap: 12px; min-width: 0; }
+.engine-setup p { margin: 0; line-height: 1.5; }
+.engine-setup__title, .engine-setup__actions, .engine-setup__progress { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.engine-setup__progress progress { flex: 1; min-width: 100px; accent-color: var(--accent); }
+.engine-setup small { opacity: .7; line-height: 1.4; }

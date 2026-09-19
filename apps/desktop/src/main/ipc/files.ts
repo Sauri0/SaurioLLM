@@ -12,10 +12,20 @@ import { ipc } from '@saurio/shared';
 import type { FileTreeNode } from '@saurio/shared';
 import type { RuntimeHost } from '../host/RuntimeHost.js';
 import type { ProjectRuntime } from '../host/createRuntime.js';
+import { FileSearchService } from '../services/files/FileSearchService.js';
 import { registerHandler } from './registerHandler.js';
 
 export interface FilesChangeEmitter {
   emit(event: { projectId: string; relPath: string; kind: 'modified' | 'removed' }): void;
+}
+
+/** fs.watch emite `rename` tanto al crear como al quitar un nombre. Consultar el estado actual evita
+ * etiquetar una creación/renombre existente como borrado en la UI. */
+export function classifyFsEvent(eventType: string, absolutePath: string): 'modified' | 'removed' {
+  if (eventType === 'rename') {
+    try { return statSync(absolutePath).isFile() || statSync(absolutePath).isDirectory() ? 'modified' : 'removed'; } catch { return 'removed'; }
+  }
+  return 'modified';
 }
 
 function requireActiveProject(host: RuntimeHost, projectId: string): ProjectRuntime {
@@ -36,6 +46,7 @@ function toPosix(relPath: string): string {
 /** Único watcher activo a la vez (coherente con "un proyecto abierto a la vez", punto 7.a del
  *  encargo): abrir otro proyecto cierra el watcher del anterior en vez de acumularlos. */
 let current: { root: string; watcher: FSWatcher; dirty: Set<string> } | undefined;
+const fileSearch = new FileSearchService();
 
 function ensureWatcher(project: ProjectRuntime, emitter: FilesChangeEmitter): Set<string> {
   if (current?.root === project.projectRoot) return current.dirty;
@@ -49,7 +60,7 @@ function ensureWatcher(project: ProjectRuntime, emitter: FilesChangeEmitter): Se
     // .git/**, .saurio/**, node_modules ignorado por .gitignore, temporales de escritura atómica
     // (*.saurio-tmp-*): ruido, no cambios que el usuario hizo por fuera de SaurioLLM.
     if (project.workspaceFs.isProtected(relPath) || project.workspaceFs.isIgnored(relPath)) return;
-    const kind: 'modified' | 'removed' = eventType === 'rename' ? 'removed' : 'modified';
+    const kind = classifyFsEvent(eventType, project.workspaceFs.resolve(relPath));
     if (kind === 'removed') dirty.delete(relPath);
     else dirty.add(relPath);
     emitter.emit({ projectId: project.projectId, relPath, kind });
@@ -73,6 +84,7 @@ function ensureWatcher(project: ProjectRuntime, emitter: FilesChangeEmitter): Se
 export function closeAllFileWatchers(): void {
   current?.watcher.close();
   current = undefined;
+  fileSearch.cancelAll();
 }
 
 export function registerFilesHandlers(host: RuntimeHost, emitter: FilesChangeEmitter): void {
@@ -123,5 +135,15 @@ export function registerFilesHandlers(host: RuntimeHost, emitter: FilesChangeEmi
     // el contenido actual (mismo criterio que un editor de texto normal).
     current?.dirty.delete(relPath);
     return { relPath, content, sizeBytes: Buffer.byteLength(content, 'utf8'), truncated: false };
+  });
+
+  registerHandler('files:search', ipc['files:search'], async (input) => {
+    const project = requireActiveProject(host, input.projectId);
+    return fileSearch.search(project, input);
+  });
+
+  registerHandler('files:cancelSearch', ipc['files:cancelSearch'], async (input) => {
+    requireActiveProject(host, input.projectId);
+    fileSearch.cancel(input.projectId, input.requestId);
   });
 }

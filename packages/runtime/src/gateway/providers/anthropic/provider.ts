@@ -48,13 +48,13 @@ export class AnthropicProvider implements Provider {
     }
   }
 
-  async listModels(): Promise<ModelInfo[]> {
-    const { data } = await this.client.listModels();
+  async listModels(signal?: AbortSignal): Promise<ModelInfo[]> {
+    const data = await this.client.listAllModels(signal);
     return data.map((m) => mapModelInfo(this.id, this.locality, m));
   }
 
   async describeModel(name: string): Promise<ModelDescription> {
-    const { data } = await this.client.listModels();
+    const data = await this.client.listAllModels();
     const model = data.find((m) => m.id === name);
     const base: ModelInfo = model !== undefined
       ? mapModelInfo(this.id, this.locality, model)

@@ -1,7 +1,7 @@
 // Pestaña "Explorar" del Centro de modelos (doc 13 §10, v0.2 + doc 16 §12.6 "cobertura máxima del
 // catálogo", puntos 1-5 del encargo): biblioteca completa de Ollama (curado + snapshot fusionados,
 // caché 24h + botón "Actualizar catálogo"), búsqueda de Hugging Face GGUF, "descargar por nombre"
-// libre, y una ficha lateral con variantes + selector de contexto 4k/8k/16k/32k.
+// libre, y una ficha lateral con variantes evaluadas al máximo de contexto anunciado.
 // apps/desktop/src/renderer/src/features/models/ExploreTab.tsx.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type {
@@ -10,16 +10,19 @@ import type {
 } from '@saurio/shared';
 import { invoke, onEvent } from '../../ipc/client.js';
 import { formatBytes } from './format.js';
+import { visibleDownloadError } from './downloadUi.js';
 import { useChatStore } from '../../stores/chatStore.js';
 import { useProjectStore } from '../../stores/projectStore.js';
 import {
-  DEFAULT_EXPLORE_FILTERS, DEFAULT_NUM_CTX_OPTION, NUM_CTX_OPTIONS, SIZE_BUCKET_LABELS,
-  filterCatalogItems, groupByFamily, paginate, sortCatalogItems,
+  DEFAULT_EXPLORE_FILTERS, SIZE_BUCKET_LABELS,
+  availableQuantizations, DEFAULT_HUGGING_FACE_FILE_FILTERS, filterCatalogItems, filterHuggingFaceGgufFiles,
+  groupByFamily, knownContextMax, paginate, sortFamilyGroups,
   type ExploreFilters, type ExploreSizeBucket, type ExploreSortMode, type ExploreTierFilter,
-  type ExploreUseFilter, type NumCtxOption,
+  type ExploreUseFilter, type HuggingFaceFileFilters, type HuggingFaceFileSizeFilter,
 } from './exploreLogic.js';
 
 const PAGE_SIZE = 30;
+let persistedExploreFilters: ExploreFilters = DEFAULT_EXPLORE_FILTERS;
 
 type SourceMode = 'ollama' | 'huggingface';
 
@@ -27,7 +30,7 @@ const USE_LABELS: Record<ExploreUseFilter, string> = {
   all: 'Todos', coding: 'Programación', chat: 'Conversación', analysis: 'Análisis', vision: 'Visión',
 };
 const SORT_LABELS: Record<ExploreSortMode, string> = {
-  recommended: 'Recomendado para tu PC', name: 'Nombre', size: 'Tamaño',
+  recommended: 'Recomendado para tu PC', name: 'Nombre', size: 'Tamaño', context: 'Contexto informado',
 };
 const SOURCE_LABELS: Record<LibraryCatalogSource, string> = {
   network: 'sincronizado ahora', cache: 'en caché', bundled: 'incluido con la app (sin conexión)',
@@ -55,13 +58,15 @@ function capabilityBadges(entry: CatalogItem['entry']): string[] {
   return badges;
 }
 
-const STATUS_LABELS: Record<CatalogItem['status'], string> = {
+const STATUS_LABELS: Record<string, string> = {
   not_installed: 'no instalado',
   downloading: 'descargando…',
   installed_untested: 'instalado',
   installed_tested: 'instalado y probado',
   loaded: 'cargado',
+  unknown: 'Instalación sin confirmar',
 };
+function statusLabel(status: string): string { return STATUS_LABELS[status] ?? 'estado no disponible'; }
 
 function TierBadge({ tier }: { tier: ModelTier | undefined }): React.JSX.Element | null {
   if (!tier) return null;
@@ -87,7 +92,7 @@ export function ExploreTab(): React.JSX.Element {
   const [justUpdated, setJustUpdated] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Record<string, DownloadJob>>({});
-  const [filters, setFilters] = useState<ExploreFilters>(DEFAULT_EXPLORE_FILTERS);
+  const [filters, setFiltersState] = useState<ExploreFilters>(persistedExploreFilters);
   const [sortMode, setSortMode] = useState<ExploreSortMode>('recommended');
   const [page, setPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
@@ -97,6 +102,7 @@ export function ExploreTab(): React.JSX.Element {
   const [justDownloaded, setJustDownloaded] = useState<Set<string>>(new Set());
   const [freeDiskBytes, setFreeDiskBytes] = useState<number | undefined>(undefined);
   const [selectedFamily, setSelectedFamily] = useState<string | null>(null);
+  const [expandedFamilies, setExpandedFamilies] = useState<Set<string>>(new Set());
 
   const currentChatId = useChatStore((s) => s.currentChatId);
   const currentProjectId = useProjectStore((s) => s.currentProjectId);
@@ -142,12 +148,9 @@ export function ExploreTab(): React.JSX.Element {
       setJustDownloaded((prev) => new Set(prev).add(job.modelName));
       void refresh(false);
     });
-    const offFailed = onEvent('download:failed', ({ downloadId, error: err }) => {
-      setJobs((prev) => {
-        const existing = prev[downloadId];
-        return existing ? { ...prev, [downloadId]: { ...existing, status: 'failed', error: err } } : prev;
-      });
-      setError(`Descarga fallida: ${err}`);
+    const offFailed = onEvent('download:failed', (job) => {
+      setJobs((prev) => ({ ...prev, [job.id]: job }));
+      setError(`Descarga fallida: ${visibleDownloadError(job.error ?? 'el motor rechazó la descarga')}`);
     });
     // Stale-while-revalidate (doc 16 §16.5): la sincronización real contra ollama.com/library corrió
     // en segundo plano (host `OllamaLibraryClient`) mientras esta pestaña ya mostraba la caché vencida
@@ -169,8 +172,17 @@ export function ExploreTab(): React.JSX.Element {
   }, [refresh, applyLibraryResult]);
 
   const filtered = useMemo(() => filterCatalogItems(items, filters), [items, filters]);
-  const sorted = useMemo(() => sortCatalogItems(filtered, sortMode), [filtered, sortMode]);
-  const pageResult = useMemo(() => paginate(sorted, page, PAGE_SIZE), [sorted, page]);
+  const familyGroups = useMemo(() => groupByFamily(filtered), [filtered]);
+  const sortedGroups = useMemo(() => sortFamilyGroups(familyGroups, sortMode), [familyGroups, sortMode]);
+  const pageResult = useMemo(() => paginate(sortedGroups, page, PAGE_SIZE), [sortedGroups, page]);
+
+  function toggleFamily(name: string): void {
+    setExpandedFamilies((current) => {
+      const next = new Set(current);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  }
 
   async function handleUseModel(fullName: string): Promise<void> {
     const ref: ModelRef = { providerId: 'ollama', name: fullName, locality: 'local' };
@@ -224,6 +236,14 @@ export function ExploreTab(): React.JSX.Element {
     () => (selectedFamily ? groupByFamily(items.filter((i) => i.entry.name === selectedFamily))[0] : undefined),
     [items, selectedFamily],
   );
+
+  function setFilters(next: ExploreFilters | ((current: ExploreFilters) => ExploreFilters)): void {
+    setFiltersState((current) => {
+      const value = typeof next === 'function' ? next(current) : next;
+      persistedExploreFilters = value;
+      return value;
+    });
+  }
 
   return (
     <div className="saurio-explore">
@@ -303,7 +323,10 @@ export function ExploreTab(): React.JSX.Element {
                 type="checkbox"
                 checked={filters.showCloud}
                 onChange={(e) => { setFilters((f) => ({ ...f, showCloud: e.target.checked })); setPage(1); }}
-              />
+            />
+            <select value={filters.minContext ?? ''} onChange={(e) => { setFilters((f) => ({ ...f, minContext: e.target.value ? Number(e.target.value) : undefined })); setPage(1); }} aria-label="Filtrar por contexto mínimo">
+              <option value="">Cualquier contexto</option><option value="4096">4K o más</option><option value="8192">8K o más</option><option value="16384">16K o más</option><option value="32768">32K o más</option>
+            </select>
               {' '}Mostrar modelos en la nube
             </label>
             <span className="saurio-filter-row__spacer" />
@@ -361,89 +384,32 @@ export function ExploreTab(): React.JSX.Element {
           ) : (
             <>
               <div className="saurio-row-list">
-                {pageResult.pageItems.map((item) => {
-                  const fullName = `${item.entry.name}:${item.entry.tag}`;
-                  const job = item.downloadId ? jobs[item.downloadId] : undefined;
-                  const pct = job && job.totalBytes > 0 ? Math.round((job.completedBytes / job.totalBytes) * 100) : 0;
-                  const isBusy = busyModel === fullName;
+                {pageResult.pageItems.map((group) => {
+                  const expanded = expandedFamilies.has(group.name);
+                  const contexts = group.variants.map(knownContextMax).filter((value): value is number => value !== undefined);
+                  const contextLabel = contexts.length > 0
+                    ? `hasta ${Math.max(...contexts).toLocaleString('es-AR')} tokens informados`
+                    : 'contexto máximo sin confirmar';
                   return (
-                    <div key={fullName} className="saurio-row">
-                      <div className="saurio-row__header">
-                        <button type="button" className="saurio-row__title-btn" onClick={() => setSelectedFamily(item.entry.name)}>
-                          <strong className="saurio-mono saurio-row__title">{fullName}</strong>
+                    <section key={group.name} className="saurio-explore__family">
+                      <div className="saurio-explore__family-header">
+                        <button type="button" className="saurio-row__title-btn" aria-expanded={expanded} aria-controls={`family-${group.name}`} onClick={() => toggleFamily(group.name)}>
+                          <strong className="saurio-mono saurio-row__title">{expanded ? '⌄' : '›'} {group.name}</strong>
                         </button>
-                        <span className="saurio-row__badges">
-                          <TierBadge tier={item.tier} />
-                          {item.entry.cloud ? (
-                            <span className="saurio-badge cloud" title="Se ejecuta en los servidores de Ollama, no en tu PC">NUBE</span>
-                          ) : (
-                            <span className="saurio-badge local">LOCAL</span>
-                          )}
-                          <span className="saurio-badge">{STATUS_LABELS[item.status]}</span>
-                        </span>
+                        <span className="saurio-row__badges"><span className="saurio-badge">{group.variants.length} variantes</span></span>
                       </div>
-                      <div className="saurio-row__meta">
-                        {item.entry.cloud
-                          ? 'Corre en los servidores de Ollama (no ocupa espacio en tu disco)'
-                          : item.entry.sizeUnresolved
-                            ? 'Tamaño de descarga sin confirmar todavía — se resuelve al abrir la ficha ("Ver variantes")'
-                            : `Descarga: ${formatBytes(item.entry.sizeBytes)}`}
-                        {' '}· contexto máx {item.entry.contextMax.toLocaleString('es-AR')}
-                        {item.entry.quantization && ` · ${item.entry.quantization}`}
-                      </div>
-                      {item.entry.cloud && (
-                        <div className="saurio-row__line saurio-row__line--muted">
-                          Este modelo se ejecuta en los servidores de Ollama, no en tu PC — no se puede descargar ni usar sin conexión.
+                      <div className="saurio-row__meta">{contextLabel} · expandí para comparar tamaño, cuantización y acciones por variante.</div>
+                      <div className="saurio-row__actions"><button type="button" onClick={() => setSelectedFamily(group.name)}>Abrir ficha</button></div>
+                      {expanded && (
+                        <div id={`family-${group.name}`} className="saurio-explore__family-variants">
+                          {group.variants.map((item) => <CatalogVariantRow
+                            key={`${item.entry.name}:${item.entry.tag}`}
+                            item={item} jobs={jobs} busyModel={busyModel} justDownloaded={justDownloaded}
+                            onDownload={handleDownload} onCancel={handleCancel} onDelete={handleDelete} onUse={handleUseModel}
+                          />)}
                         </div>
                       )}
-                      {item.tier && <div className="saurio-row__line">{item.tier.explanation}</div>}
-                      <div className="saurio-row__line">
-                        Capabilities: {capabilityBadges(item.entry).join(', ') || 'sin capabilities declaradas'}
-                      </div>
-                      {item.entry.notes && <div className="saurio-row__line saurio-row__line--muted">{item.entry.notes}</div>}
-
-                      {item.status === 'downloading' && job && (
-                        <>
-                          <div className="saurio-progress">
-                            <div className={`saurio-progress__fill ${job.status}`} style={{ width: `${pct}%` }} />
-                          </div>
-                          <div className="saurio-row__line">
-                            {pct}% · {formatBytes(job.bytesPerSec ?? 0)}/s
-                            {job.etaMs !== undefined && ` · ETA ${Math.ceil(job.etaMs / 1000)}s`}
-                            <button type="button" onClick={() => void handleCancel(item.downloadId!)} className="saurio-inline-action">
-                              Cancelar
-                            </button>
-                          </div>
-                        </>
-                      )}
-
-                      <div className="saurio-row__actions">
-                        <button type="button" onClick={() => setSelectedFamily(item.entry.name)}>Ver variantes</button>
-                        {item.entry.cloud ? null : item.status === 'not_installed' && (
-                          <button type="button" className="saurio-btn-primary" disabled={isBusy} onClick={() => void handleDownload(item)}>
-                            {isBusy ? 'Iniciando…' : 'Descargar'}
-                          </button>
-                        )}
-                        {(item.status === 'installed_untested' || item.status === 'installed_tested') && (
-                          <>
-                            <button type="button" className="saurio-btn-primary" onClick={() => void handleUseModel(fullName)}>
-                              Usar este modelo
-                            </button>
-                            <button type="button" disabled={isBusy} onClick={() => void handleDelete(item)}>
-                              {isBusy ? 'Borrando…' : 'Eliminar'}
-                            </button>
-                            {justDownloaded.has(fullName) && (
-                              <span className="saurio-row__line saurio-row__line--muted">Descarga completa.</span>
-                            )}
-                          </>
-                        )}
-                        {item.status === 'loaded' && (
-                          <span className="saurio-row__line saurio-row__line--muted">
-                            Cargado ahora mismo — descargalo/liberalo desde el chat antes de borrarlo.
-                          </span>
-                        )}
-                      </div>
-                    </div>
+                    </section>
                   );
                 })}
               </div>
@@ -451,7 +417,7 @@ export function ExploreTab(): React.JSX.Element {
               <div className="saurio-explore__pagination">
                 <button type="button" disabled={pageResult.page <= 1} onClick={() => setPage((p) => p - 1)}>« Anterior</button>
                 <span className="saurio-row__line--muted">
-                  Página {pageResult.page} de {pageResult.pageCount} ({pageResult.total.toLocaleString('es-AR')} modelos)
+                  Página {pageResult.page} de {pageResult.pageCount} ({pageResult.total.toLocaleString('es-AR')} familias)
                 </span>
                 <button type="button" disabled={pageResult.page >= pageResult.pageCount} onClick={() => setPage((p) => p + 1)}>Siguiente »</button>
               </div>
@@ -477,8 +443,69 @@ export function ExploreTab(): React.JSX.Element {
   );
 }
 
-/** Ficha lateral con variantes de una familia (punto 5 del encargo: "ficha lateral con variantes,
- *  selector de contexto 4k/8k/16k/32k que recalcula memoria y nivel"). */
+/** Una variante mantiene sus acciones por identidad compuesta (`familia:tag`) aunque el catálogo
+ * principal la muestre anidada bajo una sola fila de familia. */
+function CatalogVariantRow(props: {
+  item: CatalogItem;
+  jobs: Record<string, DownloadJob>;
+  busyModel: string | null;
+  justDownloaded: Set<string>;
+  onDownload: (item: CatalogItem) => Promise<void>;
+  onCancel: (downloadId: string) => Promise<void>;
+  onDelete: (item: CatalogItem) => Promise<void>;
+  onUse: (fullName: string) => Promise<void>;
+}): React.JSX.Element {
+  const { item, jobs, busyModel, justDownloaded, onDownload, onCancel, onDelete, onUse } = props;
+  const fullName = `${item.entry.name}:${item.entry.tag}`;
+  const job = item.downloadId ? jobs[item.downloadId] : undefined;
+  const pct = job && job.totalBytes > 0 ? Math.round((job.completedBytes / job.totalBytes) * 100) : 0;
+  const isBusy = busyModel === fullName;
+  const context = knownContextMax(item);
+  return (
+    <div className="saurio-row saurio-explore__variant">
+      <div className="saurio-row__header">
+        <strong className="saurio-mono saurio-row__title">{fullName}</strong>
+        <span className="saurio-row__badges">
+          <TierBadge tier={item.tier} />
+          <span className={`saurio-badge ${item.entry.cloud ? 'cloud' : 'local'}`} title={item.entry.cloud ? 'Se ejecuta en los servidores de Ollama, no en tu PC' : undefined}>{item.entry.cloud ? 'NUBE' : 'LOCAL'}</span>
+          <span className="saurio-badge">{statusLabel(item.status)}</span>
+        </span>
+      </div>
+      <div className="saurio-row__meta">
+        {item.entry.cloud
+          ? 'Corre en los servidores de Ollama (no ocupa espacio en tu disco)'
+          : item.entry.sizeUnresolved
+            ? 'Tamaño de descarga sin confirmar todavía — se resuelve al abrir la ficha'
+            : `Descarga: ${formatBytes(item.entry.sizeBytes)}`}
+        {' '}· {context === undefined ? 'contexto máximo sin confirmar' : `contexto máx informado ${context.toLocaleString('es-AR')}`}
+        {item.entry.quantization && ` · ${item.entry.quantization}`}
+      </div>
+      {item.entry.cloud && <div className="saurio-row__line saurio-row__line--muted">Este modelo se ejecuta en los servidores de Ollama, no en tu PC — no se puede descargar ni usar sin conexión.</div>}
+      {item.tier && <div className="saurio-row__line">{item.tier.explanation}</div>}
+      <div className="saurio-row__line">Capabilities: {capabilityBadges(item.entry).join(', ') || 'sin capabilities declaradas'}</div>
+      {item.entry.notes && <div className="saurio-row__line saurio-row__line--muted">{item.entry.notes}</div>}
+      {item.status === 'downloading' && job && (
+        <>
+          <div className="saurio-progress"><div className={`saurio-progress__fill ${job.status}`} style={{ width: `${pct}%` }} /></div>
+          <div className="saurio-row__line">{pct}% · {formatBytes(job.bytesPerSec ?? 0)}/s{job.etaMs !== undefined && ` · ETA ${Math.ceil(job.etaMs / 1000)}s`}<button type="button" onClick={() => void onCancel(item.downloadId!)} className="saurio-inline-action">Cancelar</button></div>
+        </>
+      )}
+      <div className="saurio-row__actions">
+        {item.entry.cloud ? null : item.status === 'not_installed' && <button type="button" className="saurio-btn-primary" disabled={isBusy} onClick={() => void onDownload(item)}>{isBusy ? 'Iniciando…' : 'Descargar'}</button>}
+        {(item.status === 'installed_untested' || item.status === 'installed_tested') && (
+          <>
+            <button type="button" className="saurio-btn-primary" onClick={() => void onUse(fullName)}>Usar este modelo</button>
+            <button type="button" disabled={isBusy} onClick={() => void onDelete(item)}>{isBusy ? 'Borrando…' : 'Eliminar'}</button>
+            {justDownloaded.has(fullName) && <span className="saurio-row__line saurio-row__line--muted">Descarga completa.</span>}
+          </>
+        )}
+        {item.status === 'loaded' && <span className="saurio-row__line saurio-row__line--muted">Cargado ahora mismo — descargalo/liberalo desde el chat antes de borrarlo.</span>}
+      </div>
+    </div>
+  );
+}
+
+/** Ficha lateral con variantes de una familia y estimación al máximo de contexto anunciado. */
 function VariantSidePanel(props: {
   group: { name: string; variants: CatalogItem[] };
   freeDiskBytes: number | undefined;
@@ -492,7 +519,6 @@ function VariantSidePanel(props: {
 }): React.JSX.Element {
   const { group, freeDiskBytes, jobs, onClose, onDownload, onCancel, onDelete, onUse, busyModel } = props;
   const [selectedTag, setSelectedTag] = useState(group.variants[0]?.entry.tag);
-  const [numCtx, setNumCtx] = useState<NumCtxOption>(DEFAULT_NUM_CTX_OPTION);
   const [liveTier, setLiveTier] = useState<ModelTier | undefined>(undefined);
   const [tierLoading, setTierLoading] = useState(false);
   // Punto 4 del encargo (doc 16, "las que sí son locales pero fallan por parseo... deben resolverse
@@ -523,9 +549,11 @@ function VariantSidePanel(props: {
   }, [selected]);
 
   const effectiveSizeBytes = resolvedSizeBytes ?? selected?.entry.sizeBytes ?? 0;
+  const numCtx = selected?.entry.contextMax;
 
   useEffect(() => {
-    if (!selected || selected.entry.cloud) { setLiveTier(undefined); return; }
+    setLiveTier(undefined);
+    if (!selected || selected.entry.cloud || effectiveSizeBytes <= 0 || !numCtx) { setTierLoading(false); return; }
     let cancelled = false;
     setTierLoading(true);
     invoke('models:tierForSize', { sizeBytes: effectiveSizeBytes, numCtx })
@@ -586,17 +614,7 @@ function VariantSidePanel(props: {
 
       {!selected.entry.cloud && (
         <div className="saurio-side-panel__ctx">
-          <span>Contexto a usar: </span>
-          {NUM_CTX_OPTIONS.map((ctx) => (
-            <button
-              key={ctx}
-              type="button"
-              className={`saurio-filter-chip ${ctx === numCtx ? 'active' : ''}`}
-              onClick={() => setNumCtx(ctx)}
-            >
-              {ctx >= 1024 ? `${ctx / 1024}k` : ctx}
-            </button>
-          ))}
+          <span>Estimación con el contexto máximo anunciado: {numCtx?.toLocaleString('es-AR')} tokens. Al ejecutar se usa el máximo confirmado por el motor.</span>
         </div>
       )}
       {tierLoading && <div className="saurio-row__line--muted">Recalculando…</div>}
@@ -693,7 +711,7 @@ function DownloadByNameSection({ onDownloaded }: { onDownloaded: () => void }): 
       {result && (
         <div className="saurio-row__line">
           <span className="saurio-mono">{result.fullName}</span> · {formatBytes(result.sizeBytes)} · fuente: {result.source === 'ollama' ? 'Ollama' : 'Hugging Face'}
-          {' '}<TierBadge tier={result.tier} />
+          <div className="saurio-row__line--muted">Tamaño de descarga confirmado; contexto y compatibilidad se verifican al instalar.</div>
           {!result.spaceOk && <span className="saurio-row__line--danger"> — no hay espacio suficiente en disco</span>}
           <div>
             <button type="button" className="saurio-btn-primary" disabled={downloading || !result.spaceOk} onClick={() => void handleDownload()}>
@@ -715,8 +733,9 @@ function HuggingFaceSection({ onDownloaded, freeDiskBytes }: { onDownloaded: () 
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
   const [files, setFiles] = useState<HuggingFaceGgufFile[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
-  const [selectedQuant, setSelectedQuant] = useState<string | null>(null);
-  const [tier, setTier] = useState<ModelTier | undefined>(undefined);
+  const [selectedFilename, setSelectedFilename] = useState<string | null>(null);
+  const [variantQuery, setVariantQuery] = useState('');
+  const [fileFilters, setFileFilters] = useState<HuggingFaceFileFilters>(DEFAULT_HUGGING_FACE_FILE_FILTERS);
   const [downloading, setDownloading] = useState(false);
 
   async function handleSearch(): Promise<void> {
@@ -737,8 +756,8 @@ function HuggingFaceSection({ onDownloaded, freeDiskBytes }: { onDownloaded: () 
   async function handleSelectRepo(repoId: string): Promise<void> {
     setSelectedRepo(repoId);
     setFiles([]);
-    setSelectedQuant(null);
-    setTier(undefined);
+    setSelectedFilename(null);
+    setFileFilters(DEFAULT_HUGGING_FACE_FILE_FILTERS);
     setFilesLoading(true);
     setError(null);
     try {
@@ -750,24 +769,17 @@ function HuggingFaceSection({ onDownloaded, freeDiskBytes }: { onDownloaded: () 
     }
   }
 
-  async function handleSelectQuant(file: HuggingFaceGgufFile): Promise<void> {
-    setSelectedQuant(file.quant ?? file.filename);
-    setTier(undefined);
-    if (file.sizeBytes === undefined) return;
-    try {
-      setTier(await invoke('models:tierForSize', { sizeBytes: file.sizeBytes, numCtx: DEFAULT_NUM_CTX_OPTION }));
-    } catch {
-      setTier(undefined);
-    }
+  function handleSelectQuant(file: HuggingFaceGgufFile): void {
+    setSelectedFilename(file.filename);
   }
 
   async function handleDownload(): Promise<void> {
-    const file = files.find((f) => (f.quant ?? f.filename) === selectedQuant);
-    if (!selectedRepo || !file || !file.quant || file.sizeBytes === undefined) return;
+    const file = files.find((f) => f.filename === selectedFilename);
+    if (!selectedRepo || !file || file.sizeBytes === undefined) return;
     setDownloading(true);
     setError(null);
     try {
-      const ref = `hf.co/${selectedRepo}:${file.quant}`;
+      const ref = `hf.co/${selectedRepo}:${fileSelector(file)}`;
       await invoke('models:pullExternal', { ref, sizeBytes: file.sizeBytes });
       onDownloaded();
     } catch (err) {
@@ -777,7 +789,17 @@ function HuggingFaceSection({ onDownloaded, freeDiskBytes }: { onDownloaded: () 
     }
   }
 
-  const selectedFile = files.find((f) => (f.quant ?? f.filename) === selectedQuant);
+  function fileSelector(file: HuggingFaceGgufFile): string {
+    return file.quant && files.filter((item) => item.quant?.toLowerCase() === file.quant?.toLowerCase()).length === 1
+      ? file.quant : file.filename;
+  }
+  const selectedFile = files.find((f) => f.filename === selectedFilename);
+  const visibleFiles = filterHuggingFaceGgufFiles(files, fileFilters).filter((file) => {
+    const query = variantQuery.trim().toLowerCase();
+    if (!query) return true;
+    return `${file.filename} ${file.quant ?? ''} ${file.sizeBytes ?? ''}`.toLowerCase().includes(query);
+  });
+  const quantizations = availableQuantizations(files);
 
   return (
     <div className="saurio-explore__hf">
@@ -816,28 +838,47 @@ function HuggingFaceSection({ onDownloaded, freeDiskBytes }: { onDownloaded: () 
               <div className="saurio-explore__hf-files">
                 {filesLoading && <div className="saurio-row__line--muted">Cargando archivos .gguf…</div>}
                 {!filesLoading && files.length === 0 && <div className="saurio-row__line--muted">Este repo no tiene archivos .gguf.</div>}
+                {files.length > 0 && (
+                  <div className="saurio-explore__hf-filter-row">
+                    <input type="search" value={variantQuery} onChange={(event) => setVariantQuery(event.target.value)} placeholder="Buscar archivo GGUF…" aria-label="Buscar variantes Hugging Face" />
+                    <select value={fileFilters.sizeBucket} aria-label="Filtrar archivos Hugging Face por tamaño" onChange={(event) => setFileFilters((current) => ({ ...current, sizeBucket: event.target.value as HuggingFaceFileSizeFilter }))}>
+                      <option value="all">Cualquier tamaño</option>
+                      <option value="small">Chico (&lt; 4 GB)</option>
+                      <option value="medium">Mediano (4-15 GB)</option>
+                      <option value="large">Grande (&gt; 15 GB)</option>
+                      <option value="unknown">Tamaño sin dato</option>
+                    </select>
+                    <select value={fileFilters.quantization} aria-label="Filtrar archivos Hugging Face por cuantización" onChange={(event) => setFileFilters((current) => ({ ...current, quantization: event.target.value }))}>
+                      <option value="all">Cualquier cuantización</option>
+                      {quantizations.map((quant) => <option key={quant} value={quant}>{quant}</option>)}
+                      <option value="unknown">Cuantización sin dato</option>
+                    </select>
+                  </div>
+                )}
                 <div className="saurio-side-panel__variants">
-                  {files.map((f) => (
+                  {visibleFiles.map((f) => (
                     <button
                       key={f.filename}
                       type="button"
-                      className={`saurio-filter-chip ${(f.quant ?? f.filename) === selectedQuant ? 'active' : ''}`}
+                      className={`saurio-filter-chip ${f.filename === selectedFilename ? 'active' : ''}`}
+                      title={f.filename}
                       onClick={() => void handleSelectQuant(f)}
                     >
                       {f.quant ?? f.filename}{f.sizeBytes !== undefined && ` · ${formatBytes(f.sizeBytes)}`}
                     </button>
                   ))}
                 </div>
+                {files.length > 0 && visibleFiles.length === 0 && <div className="saurio-row__line--muted">No hay variantes que coincidan con ese filtro.</div>}
                 {selectedFile && (
                   <div className="saurio-row__line">
-                    <span className="saurio-mono">hf.co/{r.id}:{selectedFile.quant ?? '?'}</span>
+                    <span className="saurio-mono">hf.co/{r.id}:{fileSelector(selectedFile)}</span>
                     {selectedFile.sizeBytes !== undefined && ` · ${formatBytes(selectedFile.sizeBytes)}`}
-                    {' '}<TierBadge tier={tier} />
+                    <div className="saurio-row__line--muted">Contexto y compatibilidad sin confirmar. Se verifican después de instalar; el tamaño del archivo no garantiza que entre en memoria.</div>
                     {freeDiskBytes !== undefined && ` · espacio libre: ${formatBytes(freeDiskBytes)}`}
                     <div>
                       <button
                         type="button" className="saurio-btn-primary"
-                        disabled={downloading || !selectedFile.quant || selectedFile.sizeBytes === undefined}
+                        disabled={downloading || selectedFile.sizeBytes === undefined}
                         onClick={() => void handleDownload()}
                       >
                         {downloading ? 'Iniciando…' : 'Descargar'}

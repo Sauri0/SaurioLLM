@@ -47,11 +47,13 @@ function demoMessages(): ChatMessage[] {
   return [
     {
       id: 'm-user-1',
+      originRunId: DEMO_RUN_ID,
       role: 'user',
       content: 'Agregá un endpoint para listar los checkpoints de un chat y escribí un test.',
     },
     {
       id: 'm-assistant-1',
+      originRunId: DEMO_RUN_ID,
       role: 'assistant',
       thinking: 'El checkpoint ya se persiste por tool call; falta exponerlo por chat_id ordenado por fecha.',
       content:
@@ -150,16 +152,44 @@ function demoPermissionRequest(): PermissionRequest {
 // para capturar el bloque "Actividad" plegado/desplegado con contenido real, no el mínimo de 2
 // tool calls del escenario default. Se activa con `{"longRun": true}` en SAURIO_SMOKE_STATE. ──
 const LONG_RUN_ID = 'demo-run-long';
+let scrollProbeSequence = 0;
+
+/** Sólo en fixture: CDP agrega una respuesta alternativa cuando despacha este evento. Sirve para
+ * verificar el seguimiento de scroll contra un render real, sin modelo ni IPC externo. */
+function installScrollProbe(): void {
+  window.addEventListener('saurio:demo:append-message', () => {
+    const runId = `demo-scroll-run-${++scrollProbeSequence}`;
+    useRunStore.setState((state) => {
+      const messages = state.messagesByChat[DEMO_CHAT_ID] ?? [];
+      return {
+        ...state,
+        runStates: { ...state.runStates, [runId]: 'completed' },
+        runChatIds: { ...state.runChatIds, [runId]: DEMO_CHAT_ID },
+        messagesByChat: {
+          ...state.messagesByChat,
+          [DEMO_CHAT_ID]: [...messages, {
+            id: `demo-scroll-message-${scrollProbeSequence}`,
+            originRunId: runId,
+            role: 'assistant',
+            content: 'Respuesta alternativa de la fixture para verificar el desplazamiento del chat.',
+          }],
+        },
+      };
+    });
+  });
+}
 
 function longRunMessages(): ChatMessage[] {
   return [
     {
       id: 'lr-user-1',
+      originRunId: LONG_RUN_ID,
       role: 'user',
       content: 'El cliente de Ollama no distingue un timeout de una desconexión real. Arreglalo y agregá tests.',
     },
     {
       id: 'lr-assistant-1',
+      originRunId: LONG_RUN_ID,
       role: 'assistant',
       thinking:
         'OllamaClient.request envuelve todos los errores de fetch en OllamaHttpError sin conservar la causa — ' +
@@ -168,6 +198,7 @@ function longRunMessages(): ChatMessage[] {
     },
     {
       id: 'lr-assistant-2',
+      originRunId: LONG_RUN_ID,
       role: 'assistant',
       thinking: 'Los tests existentes mockean fetch pero ninguno cubre AbortController. Falta ese caso.',
       content:
@@ -316,6 +347,7 @@ export function getDemoRightPanelTab(): string | undefined {
  *  final ni checkpoint todavía (el run "está corriendo"); si no, el run queda `completed` con todo
  *  resuelto (checkpoint incluido). */
 function seedLongRunScenario(live: boolean): void {
+  installScrollProbe();
   const toolCalls = longRunToolCalls();
   const messages = live ? [longRunMessages()[0]!, longRunMessages()[1]!] : longRunMessages();
   const calls = live
@@ -339,6 +371,9 @@ function seedLongRunScenario(live: boolean): void {
     runStates: { ...state.runStates, [LONG_RUN_ID]: live ? 'generating' : 'completed' },
     runChatIds: { ...state.runChatIds, [LONG_RUN_ID]: DEMO_CHAT_ID },
     runStartedAt: { ...state.runStartedAt, [LONG_RUN_ID]: Date.now() - 62_000 },
+    // El run largo ya emitió contenido antes de llegar a este estado, tanto terminado como vivo.
+    // Así `ModelLoadingBanner` sigue el mismo contrato que los eventos reales (`message.delta`).
+    firstChunkByRun: { ...state.firstChunkByRun, [LONG_RUN_ID]: true },
     messagesByChat: { ...state.messagesByChat, [DEMO_CHAT_ID]: messages },
     metricsByMessage: live ? state.metricsByMessage : {
       ...state.metricsByMessage,
@@ -364,11 +399,6 @@ function seedLongRunScenario(live: boolean): void {
     activityByRun: live
       ? { ...state.activityByRun, [LONG_RUN_ID]: { phase: 'running_command', label: 'Ejecutando: npx vitest run client.test.ts', toolCallId: 'lr-tc-5', ts: Date.now() } }
       : state.activityByRun,
-    // Punto 6 del rediseño: aviso de modelo chico — se aprovecha este escenario para capturarlo
-    // también (qwen2.5:1.5b es chico para modo Agente).
-    smallModelWarningByRun: live
-      ? { ...state.smallModelWarningByRun, [LONG_RUN_ID]: { modelRef: { providerId: 'ollama', name: 'qwen2.5:1.5b', locality: 'local' }, parameterSize: '1.5B' } }
-      : state.smallModelWarningByRun,
     contextBudgetByChat: {
       ...state.contextBudgetByChat,
       [DEMO_CHAT_ID]: {

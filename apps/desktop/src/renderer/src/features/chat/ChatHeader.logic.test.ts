@@ -2,8 +2,9 @@
 // chat en vez de algo legible). Test de la lógica pura de `deriveDisplayTitle`, sin montar React
 // (no hay infraestructura de render de componentes en apps/desktop/src/renderer todavía).
 import { describe, expect, it } from 'vitest';
-import { deriveDisplayTitle } from './ChatHeader.js';
-import type { Chat } from '@saurio/shared';
+import { deriveDisplayTitle, displayedModelForChat } from './ChatHeader.js';
+import { isModelInstalled } from './effectiveChatModel.js';
+import type { Chat, ChatMessage, ModelRef } from '@saurio/shared';
 
 function makeChat(overrides: Partial<Chat> = {}): Chat {
   return {
@@ -32,5 +33,33 @@ describe('deriveDisplayTitle', () => {
     expect(deriveDisplayTitle(undefined, undefined)).toBe('Chat nuevo');
     expect(deriveDisplayTitle(makeChat(), undefined)).toBe('Chat nuevo');
     expect(deriveDisplayTitle(makeChat(), '   ')).toBe('Chat nuevo');
+  });
+});
+
+describe('displayedModelForChat', () => {
+  const selected: ModelRef = { providerId: 'ollama', name: 'seleccionado', locality: 'local' };
+  const effective: ModelRef = { providerId: 'ollama', name: 'efectivo-por-hardware', locality: 'local' };
+  const assistant = (modelRef: ModelRef): ChatMessage => ({
+    id: `m-${modelRef.name}`, role: 'assistant', content: 'ok', truncated: false, modelRef,
+  });
+
+  it('auto no muestra un placeholder antes del primer run y luego muestra el efectivo real', () => {
+    const chat = makeChat({ modelSelection: 'auto', modelRef: undefined });
+    expect(displayedModelForChat(chat, [])).toBeUndefined();
+    expect(displayedModelForChat(chat, [assistant(effective)])).toEqual(effective);
+  });
+
+  it('explicit conserva la elección aunque haya mensajes de otro modelo', () => {
+    expect(displayedModelForChat(makeChat({ modelSelection: 'explicit', modelRef: selected }), [assistant(effective)]))
+      .toEqual(selected);
+  });
+
+  it('valida instalación por proveedor y nombre, no sólo por el tag', () => {
+    const sameNameOtherProvider: ModelRef = { providerId: 'lan', name: selected.name, locality: 'local' };
+    expect(isModelInstalled(selected, [{
+      ref: sameNameOtherProvider, digest: 'sha256:x', sizeBytes: 1,
+      family: 'test', parameterSize: '1B', quantization: 'Q4',
+      capabilities: { tools: true, thinking: false, vision: false, embedding: false },
+    }])).toBe(false);
   });
 });

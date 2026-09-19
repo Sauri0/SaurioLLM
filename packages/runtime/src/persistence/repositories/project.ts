@@ -58,5 +58,11 @@ export function createProjectRepository(driver: SqliteDriver): ProjectRepository
       if (!updated) throw new Error(`proyecto ${id} no existe`);
       return updated;
     },
+    async relocate(id: string, path: string): Promise<Project> {
+      driver.prepare('UPDATE projects SET path = ? WHERE id = ?').run(path, id);
+      const updated = await this.get(id);
+      if (!updated) throw new Error(`proyecto ${id} no existe`);
+      return updated;
+    },
   };
 }

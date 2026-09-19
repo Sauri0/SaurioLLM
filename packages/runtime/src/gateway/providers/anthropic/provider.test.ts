@@ -86,6 +86,14 @@ describe('gateway/providers/anthropic/provider', () => {
     });
   });
 
+  it('describeModel encuentra contexto confirmado en una página posterior', async () => {
+    fetchMock.mockResolvedValueOnce(Response.json({ data: [{ type: 'model', id: 'first', display_name: 'First' }], has_more: true, last_id: 'first' }));
+    fetchMock.mockResolvedValueOnce(Response.json({ data: [{ type: 'model', id: 'second', display_name: 'Second', max_input_tokens: 123456 }], has_more: false }));
+    const provider = new AnthropicProvider({ id: 'anthropic', getApiKey: async () => undefined });
+    expect((await provider.describeModel('second')).contextMax).toBe(123456);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('describeModel(): modelo no listado degrada a capabilities asumidas sin lanzar', async () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: [] }), { status: 200 }));
     const provider = new AnthropicProvider({ id: 'anthropic', getApiKey: async () => 'sk-ant-test' });
@@ -184,7 +192,7 @@ describe('gateway/providers/anthropic/provider', () => {
 
 // ── Integración opcional (solo si hay ANTHROPIC_API_KEY en el entorno; se salta si no) ──────────
 const anthropicKey = process.env.ANTHROPIC_API_KEY;
-describe.skipIf(anthropicKey === undefined || anthropicKey.length === 0)('gateway/providers/anthropic/provider (integración real, opcional)', () => {
+describe.skipIf(process.env.SAURIO_TEST_EXTERNAL !== '1' || anthropicKey === undefined || anthropicKey.length === 0)('gateway/providers/anthropic/provider (integración real, opcional)', () => {
   it('chat() contra la API real produce al menos un chunk de contenido y un done measured/estimated', async () => {
     vi.unstubAllGlobals(); // esta prueba SÍ debe usar fetch real, no el mock del resto del archivo
     const provider = new AnthropicProvider({ id: 'anthropic', getApiKey: async () => anthropicKey });

@@ -74,4 +74,7 @@ export function registerProvidersHandlers(host: RuntimeHost): void {
   // Punto 4 del encargo ("visor simple del audit_log... en Ajustes > Proveedores"): solo lectura,
   // más recientes primero (mismo límite por defecto que `SqlAuditLogRepository.listNonLocalCalls`).
   registerHandler('providers:auditLog', ipc['providers:auditLog'], async () => host.auditLog.listNonLocalCalls());
+  registerHandler('providers:usageSummary', ipc['providers:usageSummary'], async (input) => (
+    host.auditLog.usageSummary(input)
+  ));
 }

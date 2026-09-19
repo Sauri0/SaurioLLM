@@ -9,10 +9,14 @@ import { TaskChecklist } from '../tasks/index.js';
 import { runStatusLabel, runStatusVisual } from './runStatus.js';
 import { ChevronDownIcon } from '../../ui/icons.js';
 import { ModelSelect } from '../models/ModelSelect.js';
+import { ChatCollaborators } from '../agents/ChatCollaborators.js';
 import { localityLabel } from '../models/locality.js';
 import { useRunStore } from '../../stores/runStore.js';
 import { useOllamaHealthStore } from '../../stores/ollamaHealthStore.js';
+import { displayedModelForChat } from './effectiveChatModel.js';
 import './chat.css';
+
+export { displayedModelForChat } from './effectiveChatModel.js';
 
 const MODE_LABEL: Record<Mode, string> = { plan: 'Plan', ask: 'Preguntar', edit: 'Editar', agent: 'Agente' };
 const MODES: Mode[] = ['agent', 'edit', 'plan', 'ask'];
@@ -64,6 +68,7 @@ export function ChatHeader({
     if (!chat) return undefined;
     return (s.messagesByChat[chat.id] ?? []).find((m) => m.role === 'user')?.content;
   });
+  const displayedModel = useRunStore((s) => displayedModelForChat(chat, chat ? (s.messagesByChat[chat.id] ?? []) : []));
   const displayTitle = deriveDisplayTitle(chat, firstUserMessage);
 
   // Tarea "ModelSelect: estados explícitos" (punto 2): mismo store compartido que Sidebar.tsx — un
@@ -89,7 +94,7 @@ export function ChatHeader({
             <ModelSelect
               models={installedModels}
               providers={providers}
-              value={chat?.modelRef}
+              value={displayedModel}
               onChange={onChangeModel}
               disabled={changing}
               title="Cambiar el modelo de este chat"
@@ -98,14 +103,19 @@ export function ChatHeader({
               startEngineError={ollamaStartError}
             />
           ) : (
-            chat?.modelRef && (
+            displayedModel && (
               <>
-                <span className="saurio-badge" title="Modelo activo de este chat">{chat.modelRef.name}</span>
+                <span className="saurio-badge" title="Modelo activo de este chat">{displayedModel.name}</span>
                 {/* Punto 4 del encargo: "badge NUBE visible... en cabecera del chat" — antes esto
                     siempre pintaba la clase `local` sin importar la localidad real del modelo. */}
-                <span className={`saurio-badge ${chat.modelRef.locality}`}>{localityLabel(chat.modelRef.locality)}</span>
+                <span className={`saurio-badge ${displayedModel.locality}`}>{localityLabel(displayedModel.locality)}</span>
               </>
             )
+          )}
+          {chat?.modelSelection === 'auto' && (
+            <span className="saurio-badge estimated" title="SaurioLLM elige un modelo local por rol y hardware en cada ejecución">
+              Automático{displayedModel ? '' : ' · se elegirá al ejecutar'}
+            </span>
           )}
           {canEdit && onChangeMode ? (
             <select
@@ -126,6 +136,10 @@ export function ChatHeader({
         </div>
       </div>
 
+      {chat && agent?.role === 'lead' && (
+        <ChatCollaborators key={chat.id} chatId={chat.id} projectId={chat.projectId} director={agent}
+          disabled={Boolean(runState && !['completed', 'failed', 'cancelled'].includes(runState))} />
+      )}
       {sorted.length > 0 && (
         <div className="chat-header__tasks">
           <button
@@ -148,6 +162,11 @@ export function ChatHeader({
             </div>
           )}
         </div>
+      )}
+      {mode === 'plan' && runState === 'completed' && sorted.length === 0 && (
+        <p className="saurio-banner warning" role="status">
+          La respuesta no produjo un plan estructurado. Pedí pasos concretos para guardar una lista de tareas.
+        </p>
       )}
     </header>
   );

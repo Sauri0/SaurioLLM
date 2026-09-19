@@ -1,6 +1,7 @@
 // Tests de DownloadManager con fixtures (sin red/disco real) — packages/runtime/src/models/DownloadManager.test.ts.
 import { describe, expect, it, vi } from 'vitest';
 import { DownloadManager } from './DownloadManager.js';
+import type { DownloadJob } from './types.js';
 import type {
   BlobStoreProbe, DiskSpaceProbe, DownloadProvider, DownloadRecord, DownloadsRepositoryPort,
   ManifestFetcher, RegistryManifest,
@@ -161,6 +162,7 @@ describe('DownloadManager.pull', () => {
     });
 
     let failedCalled = false;
+    const emitted: DownloadJob[] = [];
     const dm = new DownloadManager(deps.provider, {
       manifestFetcher: deps.manifestFetcher,
       blobStore: deps.blobStore,
@@ -168,6 +170,7 @@ describe('DownloadManager.pull', () => {
       modelsFolder: async () => '/models',
       onFailed: () => { failedCalled = true; },
     });
+    dm.on('progress', (job) => emitted.push(job));
 
     const { downloadId } = await dm.pull('tiny:latest');
     await new Promise((r) => setTimeout(r, 5));
@@ -175,6 +178,7 @@ describe('DownloadManager.pull', () => {
     await new Promise((r) => setTimeout(r, 5));
 
     expect(dm.getJob(downloadId)?.status).toBe('cancelled');
+    expect(emitted.at(-1)).toMatchObject({ id: downloadId, status: 'cancelled' });
     expect(failedCalled).toBe(false); // cancelar no es un error (doc 13 §5.3)
   });
 });
@@ -209,6 +213,39 @@ describe('DownloadManager.delete', () => {
 });
 
 describe('DownloadManager.pullKnownSize (hf.co/<user>/<repo>:<quant>, punto 3/4 del encargo)', () => {
+  it('conserva y notifica un fallo que ocurre antes del primer chunk de progreso', async () => {
+    const deps = makeDeps({ freeBytes: 10 * GIB });
+    async function* rejectedBeforeProgress(): AsyncIterable<never> {
+      yield* [] as never[];
+      throw new Error('blocked redirect to a different host');
+    }
+    deps.provider.pull = vi.fn(() => rejectedBeforeProgress());
+    const saved: DownloadRecord[] = [];
+    const repository: DownloadsRepositoryPort = {
+      save: vi.fn(async (record) => { saved.push(structuredClone(record)); }),
+      get: vi.fn(async () => undefined),
+    };
+    const progressStatuses: string[] = [];
+    const failedJobs: Array<{ status: string; error?: string }> = [];
+    const dm = new DownloadManager(deps.provider, {
+      manifestFetcher: deps.manifestFetcher,
+      blobStore: deps.blobStore,
+      diskSpace: deps.diskSpace,
+      modelsFolder: async () => '/models',
+      repository,
+      onProgress: (job) => progressStatuses.push(job.status),
+      onFailed: (job) => failedJobs.push(job),
+    });
+
+    const { downloadId } = await dm.pullKnownSize('hf.co/Qwen/repo:q8_0', 2 * GIB);
+    await vi.waitFor(() => expect(dm.getJob(downloadId)?.status).toBe('failed'));
+
+    expect(progressStatuses).toEqual(['running']);
+    expect(failedJobs).toEqual([expect.objectContaining({ status: 'failed', error: 'blocked redirect to a different host' })]);
+    expect(dm.listAll()).toEqual([expect.objectContaining({ id: downloadId, modelName: 'hf.co/Qwen/repo:q8_0', status: 'failed' })]);
+    expect(saved.at(-1)).toMatchObject({ id: downloadId, status: 'failed', error: 'blocked redirect to a different host' });
+  });
+
   it('descarga sin consultar el manifest del registry de Ollama (nombre hf.co no resuelve ahí)', async () => {
     const deps = makeDeps({ freeBytes: 10 * GIB });
     const dm = new DownloadManager(deps.provider, {

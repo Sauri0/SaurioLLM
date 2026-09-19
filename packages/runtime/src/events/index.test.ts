@@ -150,7 +150,44 @@ describe('events/SqliteEventStore', () => {
     const messages = createMessageRepository(driver);
     const list = await messages.listByChat(chatId);
     const msg = list.find((m) => m.id === 'msg-modelref');
-    expect(msg?.modelRef).toEqual({ providerId: 'openrouter_1', name: 'meta-llama/llama-3.1-8b-instruct', locality: 'cloud' });
+    expect(msg).toMatchObject({
+      modelRef: { providerId: 'openrouter_1', name: 'meta-llama/llama-3.1-8b-instruct', locality: 'cloud' },
+      originRunId: runId,
+    });
+  });
+
+  it('MessageRepository conserva originRunId al guardar un fragmento directo y rehidratarlo', async () => {
+    const messages = createMessageRepository(driver);
+    await messages.append(chatId, {
+      id: 'msg-truncado', originRunId: runId, role: 'assistant', content: 'Respuesta parcial.', truncated: true,
+    });
+
+    const [message] = await messages.listByChat(chatId);
+    expect(message).toMatchObject({ id: 'msg-truncado', originRunId: runId, truncated: true });
+  });
+
+  it('message.done conserva costo reportado y modelo tras cerrar y reabrir SQLite real', async () => {
+    store.append({
+      runId, chatId, ts: Date.now(), type: 'message.done',
+      message: {
+        id: 'msg-cost-reopen', role: 'assistant', content: 'respuesta',
+        modelRef: { providerId: 'openrouter_1', name: 'openai/gpt-4', locality: 'cloud' },
+      },
+      // USD 0 es válido y debe sobrevivir igual que cualquier total informado.
+      metrics: { promptTokens: 12, evalTokens: 4, costUsd: 0, costSource: 'reported', quality: 'estimated' },
+    });
+
+    driver.close();
+    driver = openDriver(path.join(dir, 'saurio.db'));
+    runMigrations(driver);
+
+    const messages = createMessageRepository(driver);
+    const [message] = await messages.listByChat(chatId);
+    expect(message).toMatchObject({
+      id: 'msg-cost-reopen',
+      modelRef: { providerId: 'openrouter_1', name: 'openai/gpt-4', locality: 'cloud' },
+      metrics: { promptTokens: 12, evalTokens: 4, costUsd: 0, costSource: 'reported', quality: 'estimated' },
+    });
   });
 
   it('since() devuelve eventos ordenados por seq mayores al cursor dado', () => {
@@ -162,6 +199,35 @@ describe('events/SqliteEventStore', () => {
     expect(sinceFirst).toHaveLength(1);
     expect(sinceFirst[0]!.seq).toBe(e2.seq);
     expect(store.lastSeq(runId)).toBe(e2.seq);
+  });
+
+  it('persiste y relee la inspección aditiva de context.built sin contenido de las fuentes', () => {
+    store.append({
+      runId, chatId, ts: 1, type: 'context.built',
+      budget: {
+        numCtx: 8_192, effectiveNumCtx: 8_192, contextLimitSource: 'reported',
+        reserveForResponse: 1_500,
+        used: { system: 20, tools: 30, repoMap: 10, memory: 5, history: 40 },
+        totalUsed: 105, fits: true,
+        inspection: {
+          projectRoot: 'N:/proyecto-real', tokenUsageQuality: 'estimated', limitSource: 'reported',
+          sources: [{ kind: 'history', status: 'included', tokens: 40, itemCount: 2, provenance: 'chat_history' }],
+          attachmentsKnown: true, attachments: [],
+          history: { inputMessages: 2, includedMessages: 2, prunedMessages: 0, compactedMessages: 0, summaryIncluded: false },
+        },
+      },
+    });
+
+    const [event] = store.since(runId, 0);
+    expect(event?.type).toBe('context.built');
+    if (!event || event.type !== 'context.built') throw new Error('faltó context.built');
+    expect(event.budget.inspection).toMatchObject({
+      projectRoot: 'N:/proyecto-real', tokenUsageQuality: 'estimated', limitSource: 'reported',
+      attachmentsKnown: true,
+    });
+    expect(event.budget.inspection?.sources).toEqual([
+      { kind: 'history', status: 'included', tokens: 40, itemCount: 2, provenance: 'chat_history' },
+    ]);
   });
 
   it('revierte el insert de run_events si la proyección falla (atomicidad)', () => {

@@ -23,6 +23,7 @@ import type {
 
 interface AgentRow extends SqliteRow {
   id: string;
+  project_id: string | null;
   name: string;
   role: string;
   model_ref_json: string;
@@ -77,8 +78,39 @@ function rowToConfig(row: AgentRow): AgentConfig {
   };
 }
 
+type StoredMemoryPolicy = AgentConfig['memory'] & { memoryScope?: 'global' | 'project' };
+
+/** El JSON de memoria existía antes de que el perfil expusiera un alcance. Si no declara uno,
+ * conservamos la ausencia para que una fila histórica no se anuncie engañosamente como global. */
+function memoryScopeFromRow(row: AgentRow): 'global' | 'project' | undefined {
+  if (!row.memory_policy_json) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(row.memory_policy_json);
+    const memoryScope = typeof parsed === 'object' && parsed !== null
+      ? (parsed as { memoryScope?: unknown }).memoryScope
+      : undefined;
+    return memoryScope === 'global' || memoryScope === 'project' ? memoryScope : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function memoryPolicyJsonWithScope(row: AgentRow, memoryScope: 'global' | 'project'): string {
+  let policy: StoredMemoryPolicy = { readProjectMemory: true, writeProjectMemory: false };
+  if (row.memory_policy_json) {
+    try {
+      const parsed: unknown = JSON.parse(row.memory_policy_json);
+      if (typeof parsed === 'object' && parsed !== null) policy = parsed as StoredMemoryPolicy;
+    } catch {
+      // Una política histórica inválida no se puede conservar al elegir explícitamente un alcance.
+    }
+  }
+  return JSON.stringify({ ...policy, memoryScope });
+}
+
 function rowToProfile(row: AgentRow): AgentProfile {
   const permissions = JSON.parse(row.permission_policy_json) as PermissionPolicy;
+  const memoryScope = memoryScopeFromRow(row);
   return {
     id: row.id,
     ownerKind: row.owner_kind as AgentOwnerKind,
@@ -92,6 +124,8 @@ function rowToProfile(row: AgentRow): AgentProfile {
     systemPrompt: row.system_prompt,
     allowedTools: JSON.parse(row.allowed_tools_json) as string[],
     permissionPreset: toAgentLevelPreset(permissions.preset),
+    ...(memoryScope ? { memoryScope } : {}),
+    ...(memoryScope === 'project' && row.project_id ? { projectId: row.project_id } : {}),
     createdAt: row.created_at ?? row.updated_at,
     archivedAt: row.archived_at ?? undefined,
   };
@@ -119,6 +153,8 @@ export interface AgentRepository extends AgentConfigResolver {
   /** Doc 19 §1.5: nunca borra la fila (la FK de `chats.agent_id`/`runs.agent_id` lo impediría de
    *  todas formas) — marca `archived_at` y `listProfiles` sin `includeArchived: true` la excluye. */
   archive(id: string): Promise<void>;
+  /** Revierte el archivo lógico sin tocar sus chats ni memorias. */
+  restore(id: string): Promise<void>;
   duplicate(id: string, name?: string): Promise<AgentProfile>;
 }
 
@@ -129,7 +165,8 @@ export function createAgentRepository(driver: SqliteDriver): AgentRepository {
     driver.prepare<AgentRow>('SELECT * FROM agents WHERE id = ?').get(id);
 
   function insertRow(row: {
-    id: string; name: string; role: string; model: ModelRef; systemPrompt: string; systemPromptHash: string;
+    id: string; projectId?: string; memoryPolicyJson?: string | null;
+    name: string; role: string; model: ModelRef; systemPrompt: string; systemPromptHash: string;
     allowedTools: string[]; permissions: PermissionPolicy; contextPolicy: ContextPolicy;
     defaultMode: string; temperature: number; thinking: string; toolTransport: string; maxIterations: number;
     ownerKind: AgentOwnerKind; avatarEmoji?: string; avatarColor?: string; description?: string;
@@ -141,13 +178,13 @@ export function createAgentRepository(driver: SqliteDriver): AgentRepository {
                            default_mode, temperature, thinking, tool_transport, max_iterations, working_dir,
                            file_scope, profile_id, is_builtin, updated_at,
                            owner_kind, avatar_emoji, avatar_color, description, model_mode, created_at, archived_at)
-       VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, NULL)`,
     ).run(
-      row.id, row.name, row.role, JSON.stringify(row.model), row.systemPrompt, row.systemPromptHash,
-      JSON.stringify(row.allowedTools), JSON.stringify(row.permissions), JSON.stringify(row.contextPolicy),
-      row.defaultMode, row.temperature, row.thinking, row.toolTransport, row.maxIterations, row.createdAt,
-      row.ownerKind, row.avatarEmoji ?? null, row.avatarColor ?? null, row.description ?? null,
-      row.modelMode, row.createdAt,
+      row.id, row.projectId ?? null, row.name, row.role, JSON.stringify(row.model), row.systemPrompt,
+      row.systemPromptHash, JSON.stringify(row.allowedTools), JSON.stringify(row.permissions),
+      JSON.stringify(row.contextPolicy), row.memoryPolicyJson ?? null, row.defaultMode, row.temperature,
+      row.thinking, row.toolTransport, row.maxIterations, row.createdAt, row.ownerKind,
+      row.avatarEmoji ?? null, row.avatarColor ?? null, row.description ?? null, row.modelMode, row.createdAt,
     );
   }
 
@@ -214,6 +251,10 @@ export function createAgentRepository(driver: SqliteDriver): AgentRepository {
 
     async createProfile(input: AgentCreateInput, ownerKind: AgentOwnerKind = 'personal'): Promise<AgentProfile> {
       const config = createPersonalAgentDefaults(input);
+      const memoryScope = input.memoryScope ?? 'global';
+      if (memoryScope === 'project' && !input.projectId) {
+        throw new Error('saurio: la memoria de proyecto necesita un proyecto asociado');
+      }
       const now = Date.now();
       insertRow({
         id: config.id, name: config.name, role: config.role, model: config.model,
@@ -222,6 +263,8 @@ export function createAgentRepository(driver: SqliteDriver): AgentRepository {
         defaultMode: config.defaultMode, temperature: config.temperature, thinking: config.thinking,
         toolTransport: config.toolTransport, maxIterations: config.maxIterations,
         ownerKind, avatarEmoji: input.avatarEmoji, avatarColor: input.avatarColor, description: input.description,
+        memoryPolicyJson: JSON.stringify({ ...config.memory, memoryScope }),
+        projectId: memoryScope === 'project' ? input.projectId : undefined,
         modelMode: input.modelMode ?? 'fixed', createdAt: now,
       });
       const profile = await repo.getProfile(config.id);
@@ -238,25 +281,34 @@ export function createAgentRepository(driver: SqliteDriver): AgentRepository {
         : currentPermissions;
       const nextModel = patch.model ?? (JSON.parse(row.model_ref_json) as ModelRef);
       const nextTools = patch.allowedTools ?? (JSON.parse(row.allowed_tools_json) as string[]);
-      const nextSystemPrompt = patch.systemPrompt ?? row.system_prompt;
+      const nextSystemPrompt = patch.systemPrompt !== undefined ? patch.systemPrompt : row.system_prompt;
       const nextName = patch.name ?? row.name;
       const nextRole = patch.role ?? row.role;
       const nextDescription = patch.description !== undefined ? patch.description : (row.description ?? undefined);
       const nextAvatarEmoji = patch.avatarEmoji !== undefined ? patch.avatarEmoji : (row.avatar_emoji ?? undefined);
       const nextAvatarColor = patch.avatarColor !== undefined ? patch.avatarColor : (row.avatar_color ?? undefined);
       const nextModelMode = patch.modelMode ?? (row.model_mode as ModelMode);
+      if (patch.memoryScope === 'project' && !patch.projectId && !row.project_id) {
+        throw new Error('saurio: la memoria de proyecto necesita un proyecto asociado');
+      }
+      const nextMemoryPolicyJson = patch.memoryScope === undefined
+        ? row.memory_policy_json
+        : memoryPolicyJsonWithScope(row, patch.memoryScope);
+      const nextProjectId = patch.memoryScope === undefined
+        ? row.project_id
+        : patch.memoryScope === 'project' ? (patch.projectId ?? row.project_id) : null;
 
       driver.prepare(
         `UPDATE agents SET name = ?, role = ?, model_ref_json = ?, system_prompt = ?, system_prompt_hash = ?,
                            allowed_tools_json = ?, permission_policy_json = ?, avatar_emoji = ?, avatar_color = ?,
-                           description = ?, model_mode = ?, updated_at = ?
+                           description = ?, model_mode = ?, memory_policy_json = ?, project_id = ?, updated_at = ?
          WHERE id = ?`,
       ).run(
         nextName, nextRole, JSON.stringify(nextModel), nextSystemPrompt,
         createHash('sha256').update(nextSystemPrompt, 'utf8').digest('hex'),
         JSON.stringify(nextTools), JSON.stringify(nextPermissions),
         nextAvatarEmoji ?? null, nextAvatarColor ?? null, nextDescription ?? null, nextModelMode,
-        Date.now(), id,
+        nextMemoryPolicyJson, nextProjectId, Date.now(), id,
       );
       const updated = await repo.getProfile(id);
       if (!updated) throw new Error(`saurio: el agente "${id}" desapareció durante la actualización`);
@@ -265,6 +317,10 @@ export function createAgentRepository(driver: SqliteDriver): AgentRepository {
 
     async archive(id: string): Promise<void> {
       driver.prepare('UPDATE agents SET archived_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), id);
+    },
+
+    async restore(id: string): Promise<void> {
+      driver.prepare('UPDATE agents SET archived_at = NULL, updated_at = ? WHERE id = ?').run(Date.now(), id);
     },
 
     async duplicate(id: string, name?: string): Promise<AgentProfile> {
@@ -282,6 +338,7 @@ export function createAgentRepository(driver: SqliteDriver): AgentRepository {
         toolTransport: row.tool_transport, maxIterations: row.max_iterations,
         ownerKind: row.owner_kind as AgentOwnerKind, avatarEmoji: row.avatar_emoji ?? undefined,
         avatarColor: row.avatar_color ?? undefined, description: row.description ?? undefined,
+        memoryPolicyJson: row.memory_policy_json, projectId: row.project_id ?? undefined,
         modelMode: row.model_mode as ModelMode, createdAt: now,
       });
       const profile = await repo.getProfile(newId);

@@ -6,7 +6,7 @@
 // AppLayout.tsx: agrupa esas dos piezas más la barra lateral (`Sidebar.tsx`) bajo una sola sección de
 // la navegación principal, y agrega lo que pedía el encargo: ocultar el panel contextual, arrastrar
 // para cambiar su ancho.
-import { useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Project } from '@saurio/shared';
 import { Sidebar } from './Sidebar.js';
 import { ChatCenter } from './ChatCenter.js';
@@ -21,10 +21,20 @@ export interface ChatsViewProps {
 }
 
 export function ChatsView({ project, onProjectChange, activeChatId, onSelectChat }: ChatsViewProps): React.JSX.Element {
+  const [compactPane, setCompactPane] = useState<'sidebar' | 'chat' | 'context'>('chat');
+  const [isCompact, setIsCompact] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 1100px)').matches);
   const contextOpen = useUiNavStore((s) => s.contextOpen);
   const contextWidth = useUiNavStore((s) => s.contextWidth);
   const setContextWidth = useUiNavStore((s) => s.setContextWidth);
   const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 1100px)');
+    const update = (): void => setIsCompact(media.matches);
+    update();
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
 
   // Arrastrar el borde izquierdo del panel contextual para cambiar su ancho (punto 2 del encargo:
   // "ancho redimensionable"). El panel está pegado al borde derecho de la ventana, así que achicar X
@@ -49,13 +59,34 @@ export function ChatsView({ project, onProjectChange, activeChatId, onSelectChat
     document.body.classList.add('saurio-resizing');
   }
 
+  function showContextPane(): void {
+    setCompactPane('context');
+  }
+
+  const showContext = isCompact ? compactPane === 'context' : contextOpen;
+
+  function handleCompactTabKey(event: React.KeyboardEvent<HTMLButtonElement>): void {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = [...event.currentTarget.parentElement!.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    const current = tabs.indexOf(event.currentTarget);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[next]?.focus();
+    tabs[next]?.click();
+  }
+
   return (
-    <div className="saurio-chats-view">
+    <div className={`saurio-chats-view saurio-chats-view--compact-${compactPane}`}>
+      <div className="saurio-compact-tabs" role="tablist" aria-label="Vistas del chat">
+        <button type="button" role="tab" tabIndex={compactPane === 'sidebar' ? 0 : -1} aria-selected={compactPane === 'sidebar'} onKeyDown={handleCompactTabKey} onClick={() => setCompactPane('sidebar')}>Proyecto y chats</button>
+        <button type="button" role="tab" tabIndex={compactPane === 'chat' ? 0 : -1} aria-selected={compactPane === 'chat'} onKeyDown={handleCompactTabKey} onClick={() => setCompactPane('chat')}>Chat</button>
+        <button type="button" role="tab" tabIndex={compactPane === 'context' ? 0 : -1} aria-selected={compactPane === 'context'} onKeyDown={handleCompactTabKey} onClick={showContextPane}>Archivos y más</button>
+      </div>
       <Sidebar
         project={project}
-        onProjectChange={onProjectChange}
+        onProjectChange={(next) => { setCompactPane('chat'); onProjectChange(next); }}
         activeChatId={activeChatId}
-        onSelectChat={onSelectChat}
+        onSelectChat={(chatId) => { setCompactPane('chat'); onSelectChat(chatId); }}
       />
       <main className="saurio-main">
         <ChatCenter
@@ -67,7 +98,7 @@ export function ChatsView({ project, onProjectChange, activeChatId, onSelectChat
           onOpenDiff={() => { /* la pestaña "Cambios" del panel contextual ya lista los checkpoints del chat */ }}
         />
       </main>
-      {contextOpen ? (
+      {showContext ? (
         <>
           <div
             className="saurio-context-resize-handle"
@@ -76,7 +107,10 @@ export function ChatsView({ project, onProjectChange, activeChatId, onSelectChat
             aria-label="Cambiar el ancho del panel contextual"
             onPointerDown={handleResizeStart}
           />
-          <RightPanel projectId={project?.id ?? null} chatId={activeChatId} />
+          <RightPanel projectId={project?.id ?? null} chatId={activeChatId} onClose={() => {
+            if (isCompact) setCompactPane('chat');
+            else useUiNavStore.getState().setContextOpen(false);
+          }} />
         </>
       ) : (
         <ContextPanelRail />

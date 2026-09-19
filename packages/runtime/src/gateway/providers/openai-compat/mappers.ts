@@ -134,6 +134,65 @@ export function mapModelInfo(providerId: string, locality: Locality, model: Open
   };
 }
 
+/** Sólo el hostname público documentado. Un preset llamado OpenRouter con otra URL, un proxy o
+ * `openrouter.ai.ejemplo` no habilitan metadatos/costo atribuidos a OpenRouter. */
+export function isOfficialOpenRouterBaseUrl(baseUrl: string): boolean {
+  try {
+    const url = new URL(baseUrl);
+    return url.protocol === 'https:' && url.hostname.toLowerCase() === 'openrouter.ai';
+  } catch {
+    return false;
+  }
+}
+
+function nonNegativeNumber(value: string | number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/** Los detalles de pricing/capabilities no son parte del contrato OpenAI-compatible. Sólo se
+ * consumen de la respuesta de OpenRouter tras validar el host oficial; los demás proveedores
+ * conservan el mapper genérico y no reciben valores adivinados. */
+export function mapOpenRouterModelInfo(
+  providerId: string,
+  locality: Locality,
+  model: OpenAIModel,
+  metadataCheckedAt: number,
+): ModelInfo {
+  const pricingValues = {
+    promptUsdPerToken: nonNegativeNumber(model.pricing?.prompt),
+    completionUsdPerToken: nonNegativeNumber(model.pricing?.completion),
+    requestUsd: nonNegativeNumber(model.pricing?.request),
+    imageUsd: nonNegativeNumber(model.pricing?.image),
+  };
+  const pricing = Object.values(pricingValues).some((value) => value !== undefined)
+    ? pricingValues
+    : undefined;
+  const supported = new Set(model.supported_parameters ?? []);
+  const inputModalities = new Set(model.architecture?.input_modalities ?? []);
+  const outputModalities = new Set(model.architecture?.output_modalities ?? []);
+
+  return {
+    ref: { providerId, name: model.id, locality },
+    digest: '',
+    sizeBytes: 0,
+    family: '',
+    parameterSize: '',
+    quantization: '',
+    capabilities: {
+      tools: supported.has('tools'),
+      thinking: supported.has('reasoning'),
+      vision: inputModalities.has('image'),
+      embedding: outputModalities.has('embeddings'),
+    },
+    contextMax: extractContextLength(model),
+    pricing,
+    metadataSource: 'openrouter',
+    metadataCheckedAt,
+  };
+}
+
 function extractContextLength(model: OpenAIModel): number | undefined {
   return model.context_length ?? model.max_model_len ?? model.max_context_length;
 }

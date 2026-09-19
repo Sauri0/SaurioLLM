@@ -22,9 +22,9 @@ export interface OllamaProviderOptions {
 export class OllamaProvider implements Provider {
   readonly id: string;
   readonly kind = 'ollama' as const;
-  readonly locality: Locality;
-  private readonly client: OllamaClient;
-  private readonly baseUrl: string;
+  locality: Locality;
+  private client: OllamaClient;
+  private baseUrl: string;
 
   constructor(opts: OllamaProviderOptions) {
     this.id = opts.id;
@@ -33,12 +33,20 @@ export class OllamaProvider implements Provider {
     this.locality = classifyLocality(opts.baseUrl);
   }
 
+  /** El host cambia entre motor administrado y existente solamente cuando no hay trabajo activo. */
+  setBaseUrl(baseUrl: string): void {
+    if (baseUrl === this.baseUrl) return;
+    this.baseUrl = baseUrl;
+    this.client = new OllamaClient(baseUrl);
+    this.locality = classifyLocality(baseUrl);
+  }
+
   async health(signal?: AbortSignal): Promise<{ ok: boolean; version?: string; error?: string }> {
     return this.client.health(signal);
   }
 
-  async listModels(): Promise<ModelInfo[]> {
-    const { models } = await this.client.tags();
+  async listModels(signal?: AbortSignal): Promise<ModelInfo[]> {
+    const { models } = await this.client.tags(signal);
     return models.map((tag) => mapModelInfo(this.id, this.baseUrl, tag));
   }
 
@@ -62,8 +70,8 @@ export class OllamaProvider implements Provider {
     return mapModelDescription(base, show);
   }
 
-  async listLoaded(): Promise<LoadedModel[]> {
-    const { models } = await this.client.ps();
+  async listLoaded(signal?: AbortSignal): Promise<LoadedModel[]> {
+    const { models } = await this.client.ps(signal);
     return models.map(mapLoadedModel);
   }
 
@@ -80,6 +88,7 @@ export class OllamaProvider implements Provider {
         seed: req.options.seed,
         stop: req.options.stop,
         num_gpu: req.options.numGpu,
+        num_thread: req.options.numThreads,
       },
     };
     if (req.tools !== undefined) wire.tools = toOllamaTools(req.tools);

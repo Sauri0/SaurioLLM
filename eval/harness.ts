@@ -15,6 +15,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { answerKnownFixtureTestPermission, CODER_FIXTURE_TEST_SCRIPT, driveThroughPermissionAsks } from './runWatcher.js';
+import { checkExportedSumFunction } from './harnessAssertions.js';
 
 import {
   createGlobalRuntime, initGlobalRuntime, createProjectRuntime, OLLAMA_BASE_URL,
@@ -384,97 +386,7 @@ async function findAwaitingPermissionCall(
   return calls.find((c) => c.status === 'awaiting_permission');
 }
 
-/** Hallazgo real (debug de esta sesión, ver TRASPASO.md): (g.1)/(g.3)/(q) reportaban "final=timeout"
- *  con el archivo sin tocar / la delegación sin cerrar, pero NO por un run colgado — `RunController`
- *  maneja correctamente cualquier cantidad de rondas ask/allow dentro de un mismo run (confirmado con
- *  instrumentación + reproducción real contra Ollama: cuando se contestan TODAS las rondas, el
- *  archivo se edita y el run llega a `completed`; ver también `RunController.test.ts`, "segundo
- *  permiso dentro del mismo run"). La causa real es que estos pasos solo contestaban la PRIMERA
- *  `awaiting_permission`: si el modelo falla el primer intento (ej. `edit_file` sin `read_file` previo
- *  → "el archivo cambió desde que lo leíste") y reintenta con una tool call nueva, esa segunda
- *  también es 'ask' bajo el preset 'strict' — y nadie la contestaba, dejando el run legítimamente
- *  esperando para siempre (igual que en la UI real: un segundo permiso necesita una segunda
- *  respuesta del usuario). `waitForRunState`/`waitForRunTerminalTolerant` (arriba) no sirven para un
- *  loop de rondas porque cada llamada abre una suscripción NUEVA — si el run ya llegó a un estado
- *  terminal entre rondas, esa suscripción tardía nunca ve el evento (ya se emitió) y reporta un
- *  falso "timeout" (reproducido acá mismo durante el debug). Esta función usa una ÚNICA suscripción
- *  para toda la vida del run, así ningún evento se pierde entre rondas. */
-function watchRun(runtime: GlobalRuntime, runId: string): {
-  collected: RunEvent[];
-  waitFor(predicate: (e: RunEvent) => boolean, timeoutMs: number): Promise<RunEvent>;
-  unsubscribe(): void;
-} {
-  const collected: RunEvent[] = [];
-  let onEvent: (() => void) | undefined;
-  const unsubscribe = runtime.events.subscribe((event) => {
-    if (event.runId !== runId) return;
-    collected.push(event);
-    onEvent?.();
-  });
-  function waitFor(predicate: (e: RunEvent) => boolean, timeoutMs: number): Promise<RunEvent> {
-    const already = collected.find(predicate);
-    if (already) return Promise.resolve(already);
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { onEvent = undefined; reject(new Error(`timeout esperando evento en el run ${runId} (${timeoutMs}ms)`)); }, timeoutMs);
-      onEvent = () => {
-        const hit = collected.find(predicate);
-        if (hit) { clearTimeout(timer); onEvent = undefined; resolve(hit); }
-      };
-    });
-  }
-  return { collected, waitFor, unsubscribe };
-}
 
-const TERMINAL_RUN_STATES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
-
-/** Contesta TODAS las rondas de `awaiting_permission` que aparezcan en el run (no solo la primera,
- *  ver comentario de `watchRun`) hasta que llegue a un estado terminal o se agote `maxRounds`.
- *  `answer` decide la respuesta para cada ronda (típicamente la misma para todas, `allow_once`). */
-async function driveThroughPermissionAsks(
-  runtime: GlobalRuntime, controller: RunController, runId: string,
-  answer: (toolCallId: string) => PermissionAnswer,
-  opts: { maxRounds?: number; perRoundTimeoutMs?: number } = {},
-): Promise<{ rounds: number; firstToolCallId: string | undefined; finalState: string }> {
-  const maxRounds = opts.maxRounds ?? 5;
-  const perRoundTimeoutMs = opts.perRoundTimeoutMs ?? 90_000;
-  const watch = watchRun(runtime, runId);
-  let rounds = 0;
-  let firstToolCallId: string | undefined;
-  let finalState = 'timeout';
-  try {
-    for (let i = 0; i < maxRounds; i += 1) {
-      let ev: RunEvent;
-      try {
-        ev = await watch.waitFor(
-          (e) => e.type === 'tool.permission' || (e.type === 'run.state' && TERMINAL_RUN_STATES.has(e.to)),
-          perRoundTimeoutMs,
-        );
-      } catch {
-        finalState = 'timeout';
-        break;
-      }
-      if (ev.type === 'run.state') { finalState = ev.to; break; }
-      // ev.type === 'tool.permission': puede que ya se haya contestado (si la proyección de
-      // tool_calls todavía no vio el evento) — `findAwaitingPermissionCall` confirma el estado real.
-      const pending = await findAwaitingPermissionCall(runtime, runId);
-      if (!pending || pending.id !== ev.request.toolCallId) continue; // ya no está pendiente, sigue el loop
-      if (rounds === 0) firstToolCallId = pending.id;
-      rounds += 1;
-      await controller.answerPermission(pending.id, answer(pending.id));
-    }
-    if (!TERMINAL_RUN_STATES.has(finalState)) {
-      try {
-        const ev = await watch.waitFor((e) => e.type === 'run.state' && TERMINAL_RUN_STATES.has(e.to), perRoundTimeoutMs);
-        if (ev.type === 'run.state') finalState = ev.to;
-      } catch {
-        finalState = 'timeout';
-      }
-    }
-  } finally {
-    watch.unsubscribe();
-  }
-  return { rounds, firstToolCallId, finalState };
-}
 
 // ── main ─────────────────────────────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
@@ -519,7 +431,7 @@ async function main(): Promise<void> {
     modelRef = found.ref;
     const fit = await runtime.modelManager.fits(modelRef, 8192);
     report(
-      '(a) listar modelos y elegir qwen3:8b (numCtx 8192)',
+      `(a) listar modelos y elegir ${MODEL_NAME} (estimación de memoria a 8192; contexto del run automático)`,
       true,
       `instalados: ${names}\nelegido: ${JSON.stringify(modelRef)}\n` +
         `fit(numCtx=8192): fitClass=${fit.fitClass} quality=${fit.quality} source=${fit.source} ` +
@@ -559,13 +471,20 @@ async function main(): Promise<void> {
         .map((m) => (m.evalTokens! / (m.evalMs! / 1000)).toFixed(1));
 
       const errorEvents = wait.events.filter((e) => e.type === 'run.error') as Extract<RunEvent, { type: 'run.error' }>[];
-      const ok = wait.finalState === 'completed' && readCalls.length > 0;
+      const contextReports = wait.events.filter((event) => event.type === 'context.built').map((event) => event.budget);
+      const effective = (await runtime.persistence.repositories.runs.get(runId))?.effectiveConfig;
+      const maximum = (await runtime.modelManager.describeModel(modelRef)).contextMax;
+      const contextMatches = maximum !== undefined && effective?.numCtx === maximum
+        && contextReports.length > 0 && contextReports.every((budget) =>
+          budget.numCtx === maximum && budget.effectiveNumCtx === maximum && budget.contextLimitSource === 'reported');
+      const ok = wait.finalState === 'completed' && readCalls.length > 0 && contextMatches;
       report(
         '(b) run modo plan hasta completed, con tool calls de lectura y plan/tasks',
         ok,
         `runId=${runId} estado final=${wait.finalState} duración=${elapsedS.toFixed(1)}s\n` +
           `tool calls totales=${toolCalls.length} (lectura: ${readCalls.map((c) => c.toolName).join(', ') || '(ninguna)'})\n` +
           `tasks persistidas=${tasks.length} (${tasks.map((t) => `${t.id}:${t.status}`).join(', ') || '(ninguna)'})\n` +
+          `presupuestos reales: ${JSON.stringify(contextReports)}; coincide con máximo del modelo (${maximum}): ${contextMatches}\n` +
           `tok/s medidos por respuesta: ${tokPerSec.join(', ') || '(sin evalTokens/evalMs)'}\n` +
           `run.error: ${errorEvents.map((e) => JSON.stringify(e.error)).join(' | ') || '(ninguno)'}\n` +
           `secuencia de eventos: ${wait.events.map((e) => e.type).join(' -> ')}`,
@@ -605,6 +524,7 @@ async function main(): Promise<void> {
 
       const newMathTs = readFileSync(path.join(projectDir, 'src', 'math.ts'), 'utf8');
       const fileChanged = newMathTs !== originalMathTs;
+      const semanticCheck = checkExportedSumFunction(newMathTs);
 
       const doneMsgs = wait.events.filter((e) => e.type === 'message.done') as Extract<RunEvent, { type: 'message.done' }>[];
       const metricsPresent = doneMsgs.length > 0 && doneMsgs.every((e) => e.metrics !== undefined);
@@ -615,21 +535,22 @@ async function main(): Promise<void> {
 
       const errorEvents = wait.events.filter((e) => e.type === 'run.error') as Extract<RunEvent, { type: 'run.error' }>[];
       const ok = wait.finalState === 'completed' && registeredPending === true
-        && checkpointId !== undefined && fileChanged && metricsPresent;
+        && checkpointId !== undefined && fileChanged && semanticCheck.ok && metricsPresent;
       report(
-        '(c) run modo agent: edit_file pending->ejecutado, checkpoint creado, archivo cambiado, métricas presentes',
+        '(c) run modo agent: edit_file ejecutado, checkpoint y corrección semántica de suma verificados',
         ok,
         `runId=${runId} estado final=${wait.finalState} duración=${elapsedS.toFixed(1)}s\n` +
           `edit_file registrado con status inicial=${editRegistered?.call.status ?? '(no se registró edit_file)'}\n` +
           `checkpoint creado: ${checkpointId ?? '(ninguno)'} stats=${checkpointCreated ? JSON.stringify(checkpointCreated.checkpoint.stats) : '-'}\n` +
           `archivo src/math.ts cambió: ${fileChanged}\n` +
+          `corrección semántica de suma: ${semanticCheck.ok} (${semanticCheck.reason}); ejemplos demostrados: ${semanticCheck.examples.join(', ') || '(ninguno)'}\n` +
           `contenido nuevo de src/math.ts:\n${newMathTs}\n` +
           `mensajes con métricas: ${doneMsgs.length}, tok/s medidos: ${tokPerSec.join(', ') || '(sin evalTokens/evalMs)'}\n` +
           `run.error: ${errorEvents.map((e) => JSON.stringify(e.error)).join(' | ') || '(ninguno)'}\n` +
           `secuencia de eventos: ${wait.events.map((e) => e.type).join(' -> ')}`,
       );
     } catch (err) {
-      report('(c) run modo agent: edit_file pending->ejecutado, checkpoint creado, archivo cambiado, métricas presentes', false, String((err as Error).stack ?? err));
+      report('(c) run modo agent: edit_file ejecutado, checkpoint y corrección semántica de suma verificados', false, String((err as Error).stack ?? err));
     }
 
     // ── (d) diff del checkpoint ─────────────────────────────────────────────────────────────────
@@ -1012,7 +933,14 @@ async function main(): Promise<void> {
         // vez de detectar el conflicto real contra lo que pasó afuera.
         await controller6.answerPermission(pending5.id, { toolCallId: pending5.id, answer: 'allow_once' } as PermissionAnswer);
         const term6 = await waitForRunTerminalTolerant(runtime6.events, run5.runId, 90_000);
-        if (term6.finalState === 'timeout') await controller6.cancel(run5.runId).catch(() => {});
+        let cleanupState: string | undefined;
+        if (term6.finalState === 'timeout') {
+          // `cancel()` marca/aborta, pero el runLoop termina en background. Suscribirse ANTES de
+          // cancelar y esperar el terminal evita cerrar SQLite mientras fail/finish aún persiste.
+          const terminalAfterCancel = waitForRunTerminal(runtime6.events, run5.runId, 15_000);
+          await controller6.cancel(run5.runId);
+          cleanupState = (await terminalAfterCancel).finalState;
+        }
 
         const toolCallsAfter6 = await runtime6.persistence.repositories.toolCalls.listByRun(run5.runId);
         const editCall = toolCallsAfter6.find((c) => c.id === pending5.id);
@@ -1030,6 +958,7 @@ async function main(): Promise<void> {
           ok,
           `expected_pre_hash persistido antes del reinicio: ${expectedPreHashBeforeRestart ?? '(ninguno)'}\n` +
             `tras reabrir en OTRA instancia y responder allow_once (sin volver a leer): estado del run=${term6.finalState}\n` +
+            (cleanupState ? `cleanup tras timeout=${cleanupState}\n` : '') +
             `tool call edit_file original (${pending5.id}) status=${editCall?.status ?? '(no encontrada)'} preview="${editCall?.resultPreview ?? ''}"\n` +
             `contenido del archivo al terminar: "${finalContent.trim()}" (== cambio externo: ${finalContent === externalContent})`,
         );
@@ -1063,12 +992,20 @@ async function main(): Promise<void> {
           modelRef: coderRef, createdAt: Date.now(), updatedAt: Date.now(), archived: false,
         });
         writeFileSync(path.join(projectDir, 'src', 'coder.ts'), 'export function doble(n: number): number {\n  return n; // BUG: debería devolver n * 2\n}\n', 'utf8');
+        writeFileSync(path.join(projectDir, 'package.json'), `${JSON.stringify({ private: true, scripts: { test: CODER_FIXTURE_TEST_SCRIPT } }, null, 2)}\n`, 'utf8');
         const runCoder = await coderController.start(coderChat.id, 'Arreglá el bug de la función doble en src/coder.ts: tiene que devolver n * 2.', 'agent');
-        const waitCoder = await waitForRunTerminal(runtime.events, runCoder.runId, 180_000);
+        const waitCoder = await driveThroughPermissionAsks(
+          runtime,
+          coderController,
+          runCoder.runId,
+          (_id, call) => answerKnownFixtureTestPermission(call, projectDir, CODER_FIXTURE_TEST_SCRIPT),
+          { perRoundTimeoutMs: 180_000 },
+        );
         const coderToolCalls = await runtime.persistence.repositories.toolCalls.listByRun(runCoder.runId);
         const textEditCalls = coderToolCalls.filter((c) => c.toolName === 'edit_file' && c.transport === 'text');
         const newCoderContent = readFileSync(path.join(projectDir, 'src', 'coder.ts'), 'utf8');
-        const ok = waitCoder.finalState === 'completed' && textEditCalls.some((c) => c.status === 'done') && /n\s*\*\s*2/.test(newCoderContent);
+        // Exigir la operación en el return: el fixture inicial ya menciona n * 2 en un comentario.
+        const ok = waitCoder.finalState === 'completed' && textEditCalls.some((c) => c.status === 'done') && /return\s+n\s*\*\s*2\s*;/.test(newCoderContent);
         const assistantMsgs = (runtime.events.since(runCoder.runId, 0).filter((e) => e.type === 'message.done') as Extract<RunEvent, { type: 'message.done' }>[])
           .filter((e) => e.message.role === 'assistant');
         report(
@@ -1311,11 +1248,30 @@ async function main(): Promise<void> {
       const delegateToolCalls = (await runtime.persistence.repositories.toolCalls.listByRun(runDelegator.runId))
         .filter((c) => c.toolName === 'delegate');
       let childOk = false;
+      let deliveredContentOk = false;
       let childEvidence = '(no se emitió run.delegated)';
       if (delegatedEvent) {
         const childRun = await runtime.persistence.repositories.runs.get(delegatedEvent.childRunId);
         const childChat = await runtime.persistence.repositories.chats.get(delegatedEvent.childChatId);
         const workerProfile = await runtime.persistence.repositories.agents.getProfile(delegatedEvent.targetAgentId);
+        const childMessages = await runtime.persistence.repositories.messages.listByChat(delegatedEvent.childChatId);
+        const finishMessage = [...childMessages].reverse().find((message) => message.role === 'assistant'
+          && message.toolCalls?.some((call) => call.name === 'finish'));
+        let workerText = finishMessage?.content.trim();
+        try {
+          const structuredText = JSON.parse(workerText ?? '') as { summary?: unknown };
+          if (typeof structuredText.summary === 'string') workerText = structuredText.summary;
+        } catch { /* prosa del entregable */ }
+        try {
+          const delivered = JSON.parse(delegateToolCalls[0]?.resultPreview ?? '{}') as { summary?: string; artifacts?: { path: string }[] };
+          deliveredContentOk = Boolean(delivered.summary?.trim())
+            && (!workerText || Boolean(delivered.summary?.includes(workerText)))
+            && (delivered.artifacts ?? []).every((artifact) => {
+              const absolute = path.resolve(projectDir, artifact.path);
+              const relative = path.relative(projectDir, absolute);
+              return !relative.startsWith('..') && !path.isAbsolute(relative) && existsSync(absolute);
+            });
+        } catch { deliveredContentOk = false; }
         childOk = childRun?.state === 'completed' && childRun?.parentRunId === runDelegator.runId
           && childRun?.delegationDepth === 1 && childChat?.originRunId === runDelegator.runId
           && workerProfile?.ownerKind === 'worker';
@@ -1324,7 +1280,7 @@ async function main(): Promise<void> {
           `worker.ownerKind=${workerProfile?.ownerKind}`;
       }
       const ok = waitDelegator.finalState === 'completed' && delegateToolCalls.length > 0
-        && delegateToolCalls[0]?.category === 'delegate' && delegateToolCalls[0]?.resultIsError === false && childOk;
+        && delegateToolCalls[0]?.category === 'delegate' && delegateToolCalls[0]?.resultIsError === false && childOk && deliveredContentOk;
       report(
         '(q) doc 19 T06/T07: delegación a un worker temporal — entregable estructurado vuelve al padre',
         ok,
@@ -1332,6 +1288,7 @@ async function main(): Promise<void> {
           `run padre estado final=${waitDelegator.finalState}\n` +
           `tool calls delegate: ${delegateToolCalls.length} (status=${delegateToolCalls.map((c) => c.status).join(',')}, resultIsError=${delegateToolCalls.map((c) => c.resultIsError).join(',')})\n` +
           `run.delegated: ${childEvidence}\n` +
+          `entregable del worker conservado y artifacts existentes: ${deliveredContentOk}\n` +
           `resultPreview del delegate: ${delegateToolCalls[0]?.resultPreview ?? '(ninguno)'}`,
       );
     } catch (err) {
@@ -1340,7 +1297,7 @@ async function main(): Promise<void> {
   } else {
     for (const step of [
       '(b) run modo plan hasta completed, con tool calls de lectura y plan/tasks',
-      '(c) run modo agent: edit_file pending->ejecutado, checkpoint creado, archivo cambiado, métricas presentes',
+      '(c) run modo agent: edit_file ejecutado, checkpoint y corrección semántica de suma verificados',
       '(d) diff del checkpoint (+N -M)',
       '(e) revert del checkpoint: el archivo vuelve a su contenido exacto',
       '(g.1) permiso ask -> allow_once: awaiting_permission, se aplica, permission_decisions registrada',

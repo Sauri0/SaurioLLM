@@ -76,6 +76,26 @@ describe('groupMessagesIntoTurns', () => {
     expect(turns[1]!.checkpoints.map((c) => c.id)).toEqual(['cp1']);
   });
 
+  it('separa una respuesta regenerada sin ocultar el original ni duplicar el pedido', () => {
+    const messages = [
+      { ...userMsg('u1', 'explicalo'), originRunId: 'run-original' },
+      assistantMsg('a1', { content: 'Primera respuesta.', originRunId: 'run-original' }),
+      assistantMsg('a2', { content: 'Respuesta regenerada.', originRunId: 'run-regenerado' }),
+    ];
+    const checkpoints: Checkpoint[] = [
+      { id: 'cp-original', runId: 'run-original', chatId: 'c1', kind: 'tool', files: [], stats: { files: 1, added: 1, removed: 0 }, status: 'active' },
+      { id: 'cp-regenerado', runId: 'run-regenerado', chatId: 'c1', kind: 'tool', files: [], stats: { files: 1, added: 1, removed: 0 }, status: 'active' },
+    ];
+
+    const turns = groupMessagesIntoTurns(messages, {}, checkpoints);
+
+    expect(turns).toHaveLength(2);
+    expect(turns[0]).toMatchObject({ alternative: false, userMessage: { id: 'u1' }, finalMessage: { content: 'Primera respuesta.' }, runId: 'run-original' });
+    expect(turns[0]!.checkpoints.map((checkpoint) => checkpoint.id)).toEqual(['cp-original']);
+    expect(turns[1]).toMatchObject({ alternative: true, userMessage: undefined, finalMessage: { content: 'Respuesta regenerada.' }, runId: 'run-regenerado' });
+    expect(turns[1]!.checkpoints.map((checkpoint) => checkpoint.id)).toEqual(['cp-regenerado']);
+  });
+
   it('turno en curso (mensaje vacío al final) queda sin finalMessage — el llamador sabe que sigue vivo', () => {
     const messages = [userMsg('u1', 'hacé algo'), assistantMsg('a1', { content: '' })];
     const turns = groupMessagesIntoTurns(messages, {}, []);

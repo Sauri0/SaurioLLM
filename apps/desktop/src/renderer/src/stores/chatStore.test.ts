@@ -7,7 +7,8 @@
 // que ya no está "activo").
 import { describe, expect, it } from 'vitest';
 import type { ToolCallRecord } from '@saurio/shared';
-import { buildToolCallOrderByRun } from './chatStore.js';
+import { buildToolCallOrderByRun, orderChatsByPin } from './chatStore.js';
+import type { Chat } from '@saurio/shared';
 
 function call(overrides: Partial<ToolCallRecord> & Pick<ToolCallRecord, 'id' | 'runId' | 'iteration'>): ToolCallRecord {
   return {
@@ -50,5 +51,19 @@ describe('buildToolCallOrderByRun', () => {
     ];
     expect(buildToolCallOrderByRun(calls)).toEqual({ 'run-1': ['c1'] });
     expect(buildToolCallOrderByRun([])).toEqual({});
+  });
+});
+
+describe('orderChatsByPin', () => {
+  const chat = (id: string, updatedAt: number, title?: string): Chat => ({
+    id, projectId: 'project_1', agentId: 'agent_builtin_lead', mode: 'agent', createdAt: 1, updatedAt, archived: false, title,
+  });
+
+  it('prioriza pines y después actividad con título como desempate', () => {
+    const chats = [chat('normal-reciente', 30, 'Zeta'), chat('pin-viejo', 10, 'Beta'), chat('pin-nuevo', 20, 'Alfa')];
+    expect(orderChatsByPin(chats, ['pin-viejo', 'pin-nuevo']).map((item) => item.id))
+      .toEqual(['pin-nuevo', 'pin-viejo', 'normal-reciente']);
+    expect(orderChatsByPin([chat('z', 1, 'Zeta'), chat('a', 1, 'Alfa')], []).map((item) => item.id))
+      .toEqual(['a', 'z']);
   });
 });

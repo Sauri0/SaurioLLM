@@ -24,8 +24,10 @@ type RuntimeHost = import('../host/RuntimeHost.js').RuntimeHost;
 function makeFakeHost() {
   const start = vi.fn(async (chatId: string, text: string, mode: string, attachments?: Attachment[]) =>
     ({ runId: 'run_1', received: { chatId, text, mode, attachments } }));
-  const host = { runController: { start, cancel: vi.fn(), continueRun: vi.fn() } };
-  return { host, start };
+  const regenerate = vi.fn(async (runId: string) => ({ runId: `${runId}_regenerated` }));
+  const cancelChild = vi.fn(async () => undefined);
+  const host = { runController: { start, cancel: vi.fn(), cancelChild, continueRun: vi.fn(), regenerate } };
+  return { host, start, regenerate, cancelChild };
 }
 
 async function invoke(channel: string, payload: unknown): Promise<unknown> {
@@ -85,5 +87,22 @@ describe('ipc/run — adjuntos', () => {
     }));
     await expect(invoke('run:start', { chatId: 'c1', text: 'x', mode: 'agent', attachments }))
       .rejects.toThrow(/máximo 10 adjuntos/);
+  });
+
+  it('delega run:regenerate y devuelve el nuevo runId', async () => {
+    const { host, regenerate } = makeFakeHost();
+    registerRunHandlers(host as unknown as RuntimeHost);
+    await expect(invoke('run:regenerate', { runId: 'run_original' }))
+      .resolves.toEqual({ runId: 'run_original_regenerated' });
+    expect(regenerate).toHaveBeenCalledOnce();
+    expect(regenerate).toHaveBeenCalledWith('run_original');
+  });
+
+  it('delega run:cancelChild con la relación padre/hijo explícita', async () => {
+    const { host, cancelChild } = makeFakeHost();
+    registerRunHandlers(host as unknown as RuntimeHost);
+    await expect(invoke('run:cancelChild', { parentRunId: 'run_parent', childRunId: 'run_child' }))
+      .resolves.toBeUndefined();
+    expect(cancelChild).toHaveBeenCalledWith('run_parent', 'run_child');
   });
 });

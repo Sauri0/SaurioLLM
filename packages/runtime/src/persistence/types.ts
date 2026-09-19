@@ -33,6 +33,8 @@ export interface ProjectRepository {
   /** `project:remove`/reabrir desde la lista: no borra la fila (preserva chats/historial). */
   setRemovedFromRecents(id: string, removed: boolean): Promise<void>;
   rename(id: string, name: string): Promise<Project>;
+  /** Reasocia una carpeta sin cambiar identidad, chats ni archivos. */
+  relocate?(id: string, path: string): Promise<Project>;
 }
 
 export interface ChatRepository {
@@ -73,6 +75,8 @@ export interface CheckpointRepository {
 }
 
 export interface TaskRepository {
+  /** Reemplaza atómicamente la lista completa de tareas de `chatId`; `[]` limpia el checklist.
+   *  No modifica las tareas de otros chats y revierte por completo ante un error de SQLite. */
   upsertMany(chatId: string, tasks: Task[]): Promise<Task[]>;
   listByChat(chatId: string): Promise<Task[]>;
 }

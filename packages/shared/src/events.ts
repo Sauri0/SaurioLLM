@@ -6,8 +6,50 @@ import { RunState, ToolCallStatus } from './enums.js';
 import {
   ChatMessageSchema, ResponseMetricsSchema, ToolCallRecordSchema, PermissionRequestSchema,
   PermissionDecisionSchema, PermissionAnswerSchema, CheckpointSchema, TaskSchema, AdjustmentSchema,
-  RunErrorSchema, ModelRefSchema,
+  RunErrorSchema, ModelRefSchema, ModelResolutionSchema,
 } from './domain.js';
+
+export const ContextInspectionReasonSchema = z.enum([
+  'not_connected', 'not_configured', 'disabled', 'empty', 'build_failed',
+  'budget', 'compaction', 'missing_data', 'truncated_for_limit', 'unavailable_after_restart',
+]);
+
+export const ContextInspectionSchema = z.object({
+  /** Único contenido potencialmente sensible del inspector: la raíz ya visible del proyecto. Los
+   * bloques nunca incluyen prompt, memoria, adjuntos ni secretos completos. */
+  projectRoot: z.string(),
+  tokenUsageQuality: z.literal('estimated'),
+  limitSource: z.enum(['reported', 'provisional']),
+  sources: z.array(z.object({
+    kind: z.enum([
+      'system_prompt', 'environment', 'tools', 'project_instructions',
+      'repo_map', 'agent_memory', 'history', 'summary',
+    ]),
+    status: z.enum(['included', 'absent', 'pruned', 'compacted', 'unavailable']),
+    tokens: z.number().int().nonnegative().optional(),
+    itemCount: z.number().int().nonnegative().optional(),
+    omittedCount: z.number().int().nonnegative().optional(),
+    reason: ContextInspectionReasonSchema.optional(),
+    provenance: z.string().optional(),
+  })),
+  /** false en runs rehidratados/continuados que no conservan metadata estructurada de adjuntos. */
+  attachmentsKnown: z.boolean(),
+  attachments: z.array(z.object({
+    name: z.string(),
+    kind: z.enum(['file', 'image']),
+    status: z.enum(['included', 'excluded']),
+    reason: ContextInspectionReasonSchema.optional(),
+    truncated: z.boolean(),
+  })),
+  history: z.object({
+    inputMessages: z.number().int().nonnegative(),
+    includedMessages: z.number().int().nonnegative(),
+    prunedMessages: z.number().int().nonnegative(),
+    compactedMessages: z.number().int().nonnegative(),
+    summaryIncluded: z.boolean(),
+  }),
+});
+export type ContextInspection = z.infer<typeof ContextInspectionSchema>;
 
 export const ContextBudgetReportSchema = z.object({
   numCtx: z.number(),
@@ -18,12 +60,16 @@ export const ContextBudgetReportSchema = z.object({
    *  falta, un consumidor puede seguir cayendo a `numCtx` (mismo comportamiento previo).
    */
   effectiveNumCtx: z.number().optional(),
+  /** Ausente en eventos anteriores: no certifica el límite del proveedor. */
+  contextLimitSource: z.enum(['reported', 'provisional']).optional(),
   reserveForResponse: z.number(),
   used: z.object({
     system: z.number(), tools: z.number(), repoMap: z.number(), memory: z.number(), history: z.number(),
   }),
   totalUsed: z.number(),
   fits: z.boolean(),
+  /** Inspector P4 aditivo. Ausente en eventos legacy. */
+  inspection: ContextInspectionSchema.optional(),
 });
 export type ContextBudgetReport = z.infer<typeof ContextBudgetReportSchema>;
 
@@ -45,7 +91,10 @@ const runEventBase = {
 
 export const RunEventSchema = z.discriminatedUnion('type', [
   z.object({ ...runEventBase, type: z.literal('run.state'), from: RunState, to: RunState, reason: z.string().optional() }),
-  z.object({ ...runEventBase, type: z.literal('context.built'), budget: ContextBudgetReportSchema }),
+  z.object({
+    ...runEventBase, type: z.literal('context.built'), budget: ContextBudgetReportSchema,
+    modelResolution: ModelResolutionSchema.optional(),
+  }),
   z.object({ ...runEventBase, type: z.literal('context.usage'), used: z.number(), budget: z.number(), cacheHitRatio: z.number().optional() }),
   z.object({
     ...runEventBase, type: z.literal('context.compacted'), summaryMessageId: z.string().optional(),
@@ -79,6 +128,7 @@ export const RunEventSchema = z.discriminatedUnion('type', [
     ...runEventBase, type: z.literal('run.delegated'),
     parentRunId: z.string(), childRunId: z.string(), childChatId: z.string(),
     targetAgentId: z.string(), task: z.string(),
+    toolCallId: z.string().optional(),
   }),
   // Feedback real v0.2.1, punto 1d: reusa RunEvent en vez de un canal aparte — la UI arma una línea
   // de estado simple ("Leyendo archivo.ts…", "Ejecutando comando…") sin tener que traducir RunState.

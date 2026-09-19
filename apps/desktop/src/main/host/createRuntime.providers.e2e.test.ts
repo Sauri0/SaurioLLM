@@ -50,7 +50,7 @@ async function collectContent(iter: AsyncIterable<{ type: string }>): Promise<{ 
 
 const openrouterKey = process.env.OPENROUTER_API_KEY;
 
-describe.skipIf(openrouterKey === undefined || openrouterKey.length === 0)(
+describe.skipIf(process.env.SAURIO_TEST_EXTERNAL !== '1' || openrouterKey === undefined || openrouterKey.length === 0)(
   'createRuntime + providers (integración real con OpenRouter, opcional — requiere OPENROUTER_API_KEY)',
   () => {
     let tmp: string;

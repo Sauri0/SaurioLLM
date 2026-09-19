@@ -4,13 +4,19 @@ Guía para usuarios finales: cómo descargar e instalar SaurioLLM en Windows sin
 compilar nada. Si en cambio querés compilar el proyecto vos mismo, mirá la sección "Desarrolladores"
 del [`README.md`](../README.md).
 
+Esta guía corresponde a **v0.2.3**. Las pruebas del instalador no sustituyen una validación en Windows limpio.
+La prueba en Windows limpio y notebook con gráficos integrados está programada para **v0.2.4** por
+decisión del dueño; v0.2.3 no debe presentarse como certificada para cualquier PC.
+
 ## 1. Requisitos antes de instalar
 
-- **Windows 11** (target principal de esta versión; no probado en Windows 10).
-- Espacio libre en disco: el instalador pesa alrededor de 125 MB y la app instalada ronda los 450-500
-  MB. Sumale el espacio de los modelos que instales en Ollama (varios GB cada uno).
-- Para usar modelos locales gratis: [Ollama](https://ollama.com/download) instalado y corriendo en
-  esta misma máquina. Alternativa sin instalar nada más: usar un proveedor por API (ver paso 6).
+- **Windows x64** (Windows 11 es el target principal; todavía no hay validación en una instalación
+  Windows limpia ni en Windows 10).
+- Conexión a Internet durante la primera preparación si vas a descargar el motor administrado, el
+  catálogo o un modelo; también necesitás espacio para el instalador, el runtime incluido y los
+  modelos (varios GB cada uno).
+- Ollama instalado y corriendo es una opción para usar un motor local existente. También podés usar el
+  motor administrado por SaurioLLM o un proveedor por API (ver paso 6).
 
 ## 2. Descargar el instalador
 
@@ -19,20 +25,21 @@ del [`README.md`](../README.md).
 3. No hace falta descargar nada más que ese `.exe` para instalar (los otros dos archivos del Release,
    `latest.yml` y `SaurioLLM-Setup-<versión>.exe.blockmap`, son solo para que las versiones futuras se
    actualicen solas — ver paso 5 — no hacen falta para instalar por primera vez). El instalador ya trae
-   todo lo necesario (no requiere .NET, Visual C++ Redistributable ni ningún otro runtime aparte).
+   el runtime de Electron y los recursos de la aplicación. El motor administrado y los modelos se
+   preparan desde el asistente después de instalar; la compatibilidad en una instalación Windows limpia
+   todavía está pendiente de validación.
 
 ## 3. Instalar
 
 1. Ejecutá el `.exe` que descargaste.
 2. **Windows SmartScreen puede mostrar una advertencia** ("Windows protegió su PC" / "Windows
-   protected your PC"). Esto pasa porque el instalador **no está firmado digitalmente** (firmar
-   binarios en Windows requiere un certificado de firma de código pago, que este proyecto — gratuito y
-   de código abierto — no tiene). El instalador no es más inseguro por eso; simplemente Windows no
-   reconoce todavía al editor porque nadie pagó por esa verificación. Para continuar:
+   protected your PC"). Este instalador **no está firmado digitalmente**, por lo que Windows no puede
+   verificar la identidad del editor mediante una firma. Para
+   continuar, verificá que descargaste el archivo desde Releases y:
    - Hacé clic en **"Más información"** ("More info").
    - Hacé clic en **"Ejecutar de todas formas"** ("Run anyway").
-   Si preferís no confiar en un instalador sin firma, podés compilarlo vos mismo desde el código
-   fuente (ver "Desarrolladores" en el `README.md`) — el resultado es exactamente el mismo binario.
+   Si preferís no ejecutar un instalador sin firma, podés compilarlo vos mismo desde el código fuente
+   (ver "Desarrolladores" en el `README.md`).
 3. El instalador te deja elegir la carpeta de instalación (no es "un clic", `oneClick: false`).
    Seguí el asistente hasta el final.
 4. Al terminar, SaurioLLM queda disponible en el menú Inicio y con un acceso directo.
@@ -41,8 +48,10 @@ del [`README.md`](../README.md).
 
 Al abrir SaurioLLM por primera vez te recibe un asistente de primer arranque que te ayuda a:
 
-- Elegir o instalar un modelo local (si tenés Ollama corriendo, lo detecta y te recomienda modelos
-  según tu placa de video y memoria disponible).
+- Preparar el motor administrado dentro del espacio de SaurioLLM o detectar una instalación existente
+  de Ollama; la preparación descarga y verifica el motor dentro de la app.
+- Elegir y descargar el primer modelo local, con progreso, cancelación y reintento, según tu placa de
+  video y memoria disponible.
 - O configurar una clave de API de un proveedor compatible (OpenAI-compatible o Anthropic) si preferís
   no correr modelos localmente.
 
@@ -71,17 +80,17 @@ SaurioLLM se actualiza sola, sin que tengas que volver a esta página de Release
   poné la clave `updates.auto` en `false`. También podés desactivarlo por sesión con la variable de
   entorno `SAURIO_NO_UPDATE=1` antes de abrir la app.
 - **Nota de firma** (mismo tema que el paso 3, aplicado ahora a la actualización): SaurioLLM verifica
-  que el archivo que descargó sea EXACTAMENTE el que se publicó (compara un hash `sha512`), pero eso no
-  es una firma de editor — Windows sigue sin reconocer una identidad verificada detrás del binario. Es
-  la misma limitación de siempre (sin certificado de firma de código pago), no algo nuevo que introduzca
-  la actualización automática.
+  que el archivo que descargó coincida con el hash `sha512` publicado, pero eso no reemplaza una firma
+  de editor reconocida por Windows. La validación completa del flujo en Windows limpio sigue pendiente.
 
-## 6. Modelos: local (Ollama) o por API
+## 6. Modelos: motor administrado, Ollama existente o API
 
-- **Local con Ollama (gratis, corre en tu máquina):** instalá [Ollama](https://ollama.com/download),
-  dejalo corriendo, y desde el asistente de primer arranque o el Centro de modelos de SaurioLLM
-  instalá un modelo (por ejemplo `qwen3:8b`). Requiere una placa de video con memoria suficiente para
-  el modelo elegido; sin GPU también funciona pero más lento (CPU).
+- **Motor administrado por SaurioLLM (local):** el asistente descarga y verifica el motor dentro del
+  espacio de la app y luego permite descargar un modelo desde el Centro de modelos. Requiere Internet
+  durante la descarga y espacio para el motor y el modelo; ambos corren en tu máquina.
+- **Ollama existente (local):** instalá [Ollama](https://ollama.com/download), dejalo corriendo, y
+  SaurioLLM lo detecta sin cambiar su configuración. Desde el asistente o el Centro de modelos podés
+  instalar un modelo (por ejemplo `qwen3:8b`). Sin GPU también funciona, pero más lento (CPU).
 - **Por API (sin instalar nada más, con costo según el proveedor):** cargá una clave de API de un
   proveedor compatible con la API de OpenAI o de Anthropic en Ajustes. SaurioLLM no guarda ni envía esa
   clave a nadie más que al proveedor que elijas.
@@ -98,3 +107,33 @@ SaurioLLM → Desinstalar**, o ejecutá el desinstalador desde la carpeta de ins
   ver la sección de solución de problemas del [`MANUAL.md`](MANUAL.md).
 - Para reportar un problema, abrí un issue en este repositorio describiendo qué esperabas que pasara,
   qué pasó en realidad, y tu versión de Windows.
+- **Prueba pendiente en Windows limpio:** para validar una versión publicada, usar una máquina o VM
+  Windows x64 sin Node, pnpm ni Ollama; instalar solo el `.exe`, preparar el motor administrado,
+  descargar un modelo, abrir un proyecto y crear un chat. Registrar versión, espacio usado, errores de
+  SmartScreen y resultado de actualización. Este procedimiento queda documentado para ejecutar; no
+  implica que esa corrida ya se haya realizado.
+
+### Registro de aceptación en otro equipo
+
+Usar una cuenta de prueba sin datos personales. Registrar la versión/build de Windows, CPU, RAM,
+GPU, espacio libre inicial y SHA-256 del instalador (`Get-FileHash <ruta-del-exe> -Algorithm SHA256`).
+El hash debe coincidir con el candidato vigente de `PROYECTO.md`; una prueba de otro build no cierra
+la aceptación de éste. No hace falta instalar herramientas de desarrollo para realizar este recorrido.
+
+| Paso | Resultado que debe comprobarse |
+|---|---|
+| Instalar como usuario estándar | El asistente termina y la app abre sin exigir Node, pnpm ni Ollama instalado. Registrar cualquier elevación o error. |
+| Preparar motor y modelo | Progreso visible; cancelar y reintentar funciona. El modelo recomendado identifica límite de contexto y compatibilidad estimada. Registrar modelo elegido y espacio final. |
+| Trabajar en un proyecto | Abrir una carpeta con espacios en la ruta, crear chat y pedir leer un archivo de prueba. La raíz del inspector y la usada por herramientas coinciden con esa carpeta. |
+| Aprobar una edición | Con permisos de preguntar, aprobar una edición de un archivo de prueba. La ejecución continúa, cambia ese archivo y conserva el resultado. |
+| Reiniciar y desconectar red | Proyecto, chat e historial se recuperan. Con motor/modelo ya preparados, un chat local responde sin red. |
+| Cerrar | En reposo cierra en menos de 2 segundos. Durante una respuesta, cancelar el cierre conserva el trabajo; detener y cerrar termina el motor propio sin dejarlo consumiendo memoria. |
+| Desinstalar y reinstalar | Registrar qué opciones ofrece y cuáles se eligieron; comprobar conservación de proyectos/chats al mantener datos. No seleccionar borrado de datos para este caso. |
+| Accesibilidad | Con lector de pantalla, recorrer proyecto, chat, selector de modelos y permisos; registrar controles sin nombre, foco perdido o anuncios repetidos. |
+
+Para actualización, usar otro perfil de prueba con v0.2.2 y datos sintéticos, y actualizar con el
+instalador candidato; comprobar proyectos, chats, agentes y preferencias. Esto prueba la actualización
+manual: la descarga automática requiere una versión publicada y debe registrarse por separado.
+
+Anotar por paso **aprobado, fallido o no ejecutado**, con captura/error y tiempo cuando corresponda.
+Una VM sirve para Windows limpio; no reemplaza el recorrido en hardware integrado representativo.

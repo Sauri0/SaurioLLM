@@ -2,6 +2,15 @@
    "quitar estilos inline que queden"). Consume los tokens de layout/theme.css. */
 
 .saurio-settings-title-icon { margin-right: 6px; }
+.saurio-settings-panel { display: flex; flex-direction: column; gap: var(--space-4); max-width: 1000px; margin: 0 auto; }
+.saurio-settings-card { padding: var(--space-5, 20px); background: var(--bg-1); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg, 12px); }
+.saurio-settings-card > h3:first-child { margin-top: 0; }
+.saurio-settings-card p { line-height: 1.6; }
+.saurio-settings-advanced > summary { cursor: pointer; color: var(--text-secondary); }
+.saurio-settings-panel > h3 { margin: var(--space-4) 0 0; padding-top: var(--space-3); border-top: 1px solid var(--border-subtle, #343434); font-size: var(--text-md); }
+.saurio-settings-panel > p { margin: 0; line-height: 1.6; }
+.saurio-settings-label { line-height: 1.6; }
+.saurio-settings-context-row { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); overflow-wrap: anywhere; }
 .saurio-settings-empty { padding: var(--space-4); }
 .saurio-settings-hint { font-size: var(--text-sm); color: var(--text-secondary); }
 .saurio-settings-label { display: block; font-size: var(--text-sm); margin: var(--space-2) 0; }
@@ -14,8 +23,23 @@
 .saurio-providers-form { display: flex; flex-direction: column; gap: var(--space-2); }
 .saurio-providers-form__grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
   gap: var(--space-2) var(--space-3);
+}
+.saurio-providers-form .saurio-settings-label {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1);
+  min-width: 0;
+  margin: 0;
+}
+.saurio-providers-form input,
+.saurio-providers-form select {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 .saurio-providers-row { display: flex; flex-direction: column; gap: var(--space-2); }
 .saurio-providers-enable { display: inline-flex; align-items: center; gap: 4px; margin: 0; }
@@ -34,3 +58,23 @@
   align-items: center;
 }
 .saurio-providers-audit__ts { color: var(--text-secondary); min-width: 160px; }
+.saurio-providers-audit__filters {
+  display: grid;
+  grid-template-columns: minmax(140px, 2fr) repeat(3, minmax(100px, 1fr)) auto;
+  gap: var(--space-2);
+  align-items: end;
+  margin: var(--space-2) 0;
+}
+.saurio-providers-audit__filters label { display: grid; gap: var(--space-1); min-width: 0; color: var(--text-muted); font-size: var(--text-xs); }
+.saurio-providers-audit__filters input,
+.saurio-providers-audit__filters select { width: 100%; min-width: 0; }
+.saurio-providers-audit__pagination { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding-top: var(--space-2); color: var(--text-muted); font-size: var(--text-xs); }
+@media (max-width: 760px) {
+  .saurio-providers-audit__filters { grid-template-columns: 1fr 1fr; }
+  .saurio-providers-audit__filters label:first-child { grid-column: 1 / -1; }
+}
+.saurio-settings-nav { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-3); }
+.saurio-settings-nav button { min-height: 36px; padding: var(--space-2) var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); color: var(--text-secondary); background: var(--bg-2); cursor: pointer; }
+.saurio-settings-nav button[aria-pressed="true"] { color: var(--text-primary); background: var(--bg-3); border-color: var(--accent); }
+/* Fechas coherentes con los demás filtros, incluido el selector nativo del calendario. */
+.saurio-providers-audit__filters input[type="date"] { color-scheme: dark; color: var(--text-primary); background: var(--bg-1); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 6px; font: inherit; }

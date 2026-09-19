@@ -23,6 +23,9 @@ export interface ChatRequest {                // puro y serializable; se graba t
      *  automáticamente (~75% -> ~50% -> 0 = solo CPU) cuando el provider devuelve `oom_load`, doc
      *  16 "Cerrá lo que falta" punto 1. Mapeado a `num_gpu` en OllamaProvider. */
     numGpu?: number;
+    /** Hilos de cómputo para una petición local de Ollama. `undefined` conserva la detección
+     *  automática de Ollama; sólo se completa desde una preferencia explícita del usuario. */
+    numThreads?: number;
   };
   think?: boolean | 'low' | 'medium' | 'high' | 'max';
   format?: 'json' | object;                    // rescate de formato tras 2 fallos de parseo (columna §6.5)
@@ -77,3 +80,10 @@ export interface InferenceScheduler {
 
 /** settings.inference.slots por provider; 'auto' = 1 para local con VRAM < 24 GB [DECISIÓN DE DISEÑO]. */
 export interface SchedulerConfig { slots: 'auto' | number; groupByModel: true }
+
+/** Preferencias por request que sólo entiende el backend Ollama local. `numGpu` es opcional para
+ * que el modo automático no fuerce offload; `0` representa Solo CPU y es un valor válido. */
+export interface LocalChatOptions {
+  numThreads?: number;
+  numGpu?: number;
+}
