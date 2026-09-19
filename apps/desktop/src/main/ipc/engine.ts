@@ -38,7 +38,21 @@ export function registerEngineHandlers(installer: ManagedOllamaInstaller, manage
         mode === 'external' && Boolean(process.env['SAURIO_OLLAMA_URL']));
       configured = true;
       const result = await manager.ensureRunning();
-      if (!result.running) throw new Error(result.error ?? 'El motor nuevo no respondió.');
+      if (!result.running) {
+        const detail = result.error ?? 'sin detalle del sistema';
+        const explanation = detail === 'timeout_starting'
+          ? 'El motor local no respondió dentro del tiempo de arranque. Podés reintentar sin volver a descargarlo.'
+          : detail === 'ollama_not_installed'
+            ? 'No encontramos Ollama instalado. Elegí Preparar motor local para usar el motor de SaurioLLM.'
+            : detail === 'external_unavailable'
+              ? 'El motor externo no respondió. Comprobá que esté iniciado y que su dirección sea correcta.'
+              : detail.startsWith('spawn_failed:')
+                ? 'Windows no pudo abrir el proceso del motor local.'
+                : detail.startsWith('process_exited:')
+                  ? 'El motor local se cerró antes de quedar listo.'
+                  : 'No se pudo iniciar el motor local.';
+        throw new Error(`${explanation} Si el problema continúa, compartí las últimas líneas de logs/ollama-serve.log en la carpeta de datos de SaurioLLM. Detalle: ${detail}`);
+      }
       runtime.providersRepository.update('ollama', { baseUrl, enabled: true,
         label: mode === 'managed' ? 'Motor local de SaurioLLM' : 'Ollama existente' });
       runtime.modelManager.setManagedModelsFolder(mode === 'managed' ? installer.modelsDir : undefined);

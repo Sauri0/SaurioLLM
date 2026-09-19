@@ -55,7 +55,7 @@ describe('engine IPC', () => {
   it('restores the previous engine when the new one fails to start', async () => {
     const { manager, settings, runtime } = fixture();
     manager.ensureRunning.mockResolvedValueOnce({ running: false, startedByApp: true, error: 'timeout_starting' });
-    await expect(invoke('engine:select', { mode: 'managed' })).rejects.toThrow('timeout_starting');
+    await expect(invoke('engine:select', { mode: 'managed' })).rejects.toThrow(/reintentar sin volver a descargarlo.*ollama-serve\.log.*timeout_starting/);
     expect(settings.get('engine.mode')).toBeUndefined();
     expect(manager.configure).toHaveBeenLastCalledWith('http://127.0.0.1:11434', undefined, undefined, false);
     expect(manager.ensureRunning).toHaveBeenCalledTimes(2);

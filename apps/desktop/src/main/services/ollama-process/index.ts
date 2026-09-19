@@ -28,13 +28,15 @@ export interface EnsureRunningResult {
   running: boolean;
   startedByApp: boolean;
   /** Código estable para que la UI decida el copy, no un mensaje para mostrar directo:
-   *  'ollama_not_installed' | 'external_unavailable' | 'timeout_starting' | texto crudo de un
-   *  error de SO al spawnear. */
+   *  'ollama_not_installed' | 'external_unavailable' | 'timeout_starting' |
+   *  'spawn_failed:<detalle SO>' | 'process_exited:<código>'. */
   error?: string;
 }
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:11434';
-const START_TIMEOUT_MS = 15_000;
+// El primer arranque del portable en Windows puede incluir detección de hardware y antivirus. El
+// manual ya declara hasta ~30 s; el manager debe conceder esa misma ventana antes de matar su child.
+const START_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 500;
 const LOG_FILE_NAME = 'ollama-serve.log';
 /** Nombre real del log de la app de bandeja oficial de Ollama en Windows [COMPROBADO EN EQUIPO,
@@ -192,6 +194,7 @@ export class OllamaProcessManager {
     const binary = await this.resolveBinaryPath();
     if (!binary) return { running: false, startedByApp: false, error: 'ollama_not_installed' };
 
+    let startupFailure: { error: string; startedByApp: boolean } | undefined;
     try {
       // Tarea "carga de modelo/oom_load" punto 4: si hay `logsDir`, se captura stdout/stderr en
       // `ollama-serve.log` (append — no se pisa entre arranques) en vez de `stdio: 'ignore'`. Sin
@@ -214,11 +217,16 @@ export class OllamaProcessManager {
           detached: true,
           windowsHide: true,
           env: this.processEnv ?? this.env,
+          // El portable trae binarios auxiliares junto a ollama.exe. Electron puede heredar un cwd
+          // arbitrario (por ejemplo System32 al abrir desde un acceso directo); para una ruta
+          // absoluta administrada, el directorio del ejecutable es el contexto determinista.
+          cwd: path.isAbsolute(binary) ? path.dirname(binary) : undefined,
           stdio: logStream ? ['ignore', 'pipe', 'pipe'] : 'ignore',
         });
       } catch (err) {
         if (logStream) this.endLogStream(logStream);
-        throw err;
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(`spawn_failed:${detail}`, { cause: err });
       }
       if (logStream) {
         const onStdout = (chunk: Buffer) => logStream.write(chunk);
@@ -239,8 +247,12 @@ export class OllamaProcessManager {
       // este hijo — no lo desactiva `stop()`, que sigue pudiendo matarlo explícitamente antes de salir.
       this.child = child;
       child.unref();
-      child.on('error', () => { /* superficie por el timeout de abajo (health nunca pasa) */ });
-      child.on('exit', () => {
+      child.once('error', (error) => {
+        startupFailure ??= { error: `spawn_failed:${error.message}`, startedByApp: false };
+      });
+      child.on('exit', (code, signal) => {
+        const detail = code === null ? `signal=${signal ?? 'unknown'}` : String(code);
+        startupFailure ??= { error: `process_exited:${detail}`, startedByApp: true };
         if (this.child === child) {
           this.child = undefined;
           this.closeChildLog();
@@ -252,9 +264,18 @@ export class OllamaProcessManager {
 
     const deadline = Date.now() + this.startTimeoutMs;
     while (Date.now() < deadline) {
+      if (startupFailure && !startupFailure.startedByApp) {
+        this.child = undefined;
+        this.closeChildLog();
+        return { running: false, ...startupFailure };
+      }
       if (await this.checkHealth(1000)) return { running: true, startedByApp: true };
+      if (startupFailure) {
+        return { running: false, ...startupFailure };
+      }
       await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs));
     }
+    if (startupFailure) return { running: false, ...startupFailure };
     const timedOutChild = this.child;
     if (timedOutChild) await this.stopOwnedChildAndWait(timedOutChild);
     return { running: false, startedByApp: true, error: 'timeout_starting' };

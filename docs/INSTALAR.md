@@ -137,3 +137,11 @@ manual: la descarga automática requiere una versión publicada y debe registrar
 
 Anotar por paso **aprobado, fallido o no ejecutado**, con captura/error y tiempo cuando corresponda.
 Una VM sirve para Windows limpio; no reemplaza el recorrido en hardware integrado representativo.
+
+## Si el motor no arranca en una PC nueva
+
+No necesitás instalar Ollama por separado ni iniciar sesión. SaurioLLM descarga un motor portable propio después de instalar la app: elegí **Preparar motor local** y, cuando termine, **Usar motor de SaurioLLM**. Ese motor no aparece como una instalación global de Ollama en Windows.
+
+El arranque espera hasta 30 segundos y distingue fallos al abrir el proceso, cierre temprano y falta de respuesta. Si continúa fallando, el mensaje conserva el detalle del sistema. El registro está en `%APPDATA%\SaurioLLM\logs\ollama-serve.log`; conservá sus últimas líneas para diagnosticar el problema. No borres tus proyectos ni vuelvas a descargar modelos para resolver un fallo de arranque.
+
+Si instalaste una entrega anterior de v0.2.3, descargá y ejecutá nuevamente el instalador actualizado: conservar el mismo número de versión impide que se ofrezca automáticamente como una versión nueva.

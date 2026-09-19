@@ -175,8 +175,8 @@ implementación ni de los gates de v0.2.3.
 |---|---|
 | Versión | v0.2.3 |
 | Distribución | [Release](https://github.com/Sauri0/SaurioLLM/releases/tag/v0.2.3) |
-| Build final | Verificado — 132.224.974 bytes |
-| SHA-256 | a7240f826b4fcb73db743b78a930858e76950c0cc7399bb1a04017b8aa0241cc |
+| Build final | Verificado — 132.225.166 bytes |
+| SHA-256 | 65672b5cc276f6533d6db46b3f99b2de47a1403177bf7ccc0a8224a3ddd080d0 |
 | Firma | No firmado |
 
 Este resumen no incluye rutas locales, identificadores de procesos, inventario de hardware ni nombres
@@ -185,3 +185,7 @@ de logs del entorno de desarrollo.
 Alcance de la corrección final: la suite de 1.359 pruebas incluye recomendaciones sin motor. La evaluación real 20/20 y los smokes de API, permisos, migración y zoom corresponden al corte anterior, cuyos módulos no cambiaron. Persistencia/reinicio se verificaron nuevamente sobre el instalador corregido.
 
 Recorrido UI completo repetido sobre el instalador corregido: 12 pantallas, recomendaciones con motor apagado, chat del Director y colaboradores persistidos, borrador conservado ante error y cero excepciones del renderer.
+
+## Actualización por incidente de primer arranque
+
+La revisión actual corrige la carpeta de ejecución del motor portable, amplía el margen inicial de 15 a 30 segundos y conserva errores de apertura/cierre del proceso. El motor se descarga desde la app, no requiere Ollama global ni login. Se verificaron typecheck, lint y 468 pruebas de escritorio (2 omitidas). El fallo reportado en una PC nueva aún necesita confirmación en ese equipo; esta entrega no certifica Windows limpio. Descargá y ejecutá nuevamente el instalador si tenías una entrega anterior de v0.2.3.

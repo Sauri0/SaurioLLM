@@ -144,8 +144,8 @@ se presenta como aprobado ni se promete compatibilidad universal.
 |---|---|
 | Versión | v0.2.3 |
 | Publicación | [Release v0.2.3](https://github.com/Sauri0/SaurioLLM/releases/tag/v0.2.3) |
-| Instalador | SaurioLLM-Setup-0.2.3.exe — 132.224.974 bytes |
-| SHA-256 | a7240f826b4fcb73db743b78a930858e76950c0cc7399bb1a04017b8aa0241cc |
+| Instalador | SaurioLLM-Setup-0.2.3.exe — 132.225.166 bytes |
+| SHA-256 | 65672b5cc276f6533d6db46b3f99b2de47a1403177bf7ccc0a8224a3ddd080d0 |
 | Firma | No firmado |
 | Versión publicada anterior | v0.2.2 |
 
@@ -168,3 +168,9 @@ Alcance de la corrección final: la suite de 1.359 pruebas incluye recomendacion
 Recorrido UI completo repetido sobre el instalador corregido: 12 pantallas, recomendaciones con motor apagado, chat del Director y colaboradores persistidos, borrador conservado ante error y cero excepciones del renderer.
 
 Matriz local/API repetida y aprobada sobre el instalador corregido: selección y persistencia, respuestas sintéticas, retiro de modelo con error 404 visible y cero fallback o llamadas externas. Se mantiene la limitación del consentimiento preparado por IPC.
+
+## Actualización por incidente de primer arranque
+
+La revisión actual corrige la carpeta de ejecución del motor portable, amplía el margen inicial de 15 a 30 segundos y conserva errores de apertura/cierre del proceso. El motor se descarga desde la app, no requiere Ollama global ni login. Se verificaron typecheck, lint y 468 pruebas de escritorio (2 omitidas). El fallo reportado en una PC nueva aún necesita confirmación en ese equipo; esta entrega no certifica Windows limpio. Descargá y ejecutá nuevamente el instalador si tenías una entrega anterior de v0.2.3.
+
+Prueba del paquete sin Ollama global aprobada: entorno de usuario aislado, arranque del motor administrado, health/catálogo, persistencia, reapertura y cierre limpio. Usó una copia del portable oficial descargado previamente; no sustituye la validación en un Windows limpio ni confirma todavía el caso de la PC reportada.

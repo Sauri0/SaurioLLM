@@ -19,6 +19,7 @@ describe('OllamaProcessManager', () => {
   const originalFetch = global.fetch;
 
   afterEach(() => {
+    vi.useRealTimers();
     global.fetch = originalFetch;
     vi.restoreAllMocks();
   });
@@ -66,6 +67,82 @@ describe('OllamaProcessManager', () => {
       detached: true, windowsHide: true,
     }));
     expect(child.unref).toHaveBeenCalled();
+  });
+
+  it('un portable administrado arranca desde su propio directorio y tolera más de 15 s de cold start', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    global.fetch = vi.fn(async () => {
+      if (Date.now() < 16_000) throw new Error('fetch failed: ECONNREFUSED');
+      return { ok: true } as Response;
+    }) as unknown as typeof fetch;
+    const child = new EventEmitter() as EventEmitter & { unref: () => void };
+    child.unref = vi.fn();
+    const spawnFn = vi.fn(() => child);
+    const manager = new OllamaProcessManager({
+      binaryPath: () => 'C:\\Saurio\\engines\\ollama\\v1\\ollama.exe',
+      spawnFn: spawnFn as never,
+    });
+
+    const resultPromise = manager.ensureRunning();
+    await vi.advanceTimersByTimeAsync(16_500);
+
+    await expect(resultPromise).resolves.toEqual({ running: true, startedByApp: true });
+    expect(spawnFn).toHaveBeenCalledWith(
+      'C:\\Saurio\\engines\\ollama\\v1\\ollama.exe', ['serve'],
+      expect.objectContaining({ cwd: 'C:\\Saurio\\engines\\ollama\\v1' }),
+    );
+  });
+
+  it('informa un error asíncrono de spawn sin degradarlo a timeout_starting', async () => {
+    global.fetch = fakeFetchSequence(['throw']);
+    const child = makeFakeChild();
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')));
+      return child;
+    });
+    const manager = new OllamaProcessManager({
+      binaryPath: () => 'C:\\managed\\ollama.exe', spawnFn: spawnFn as never,
+    });
+
+    await expect(manager.ensureRunning()).resolves.toEqual({
+      running: false, startedByApp: false, error: 'spawn_failed:spawn ENOENT',
+    });
+  });
+
+  it('informa la salida temprana del proceso sin esperar el timeout completo', async () => {
+    global.fetch = fakeFetchSequence(['throw']);
+    const child = makeFakeChild();
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => {
+        child.exitCode = 3221225781;
+        child.emit('exit', 3221225781);
+      });
+      return child;
+    });
+    const manager = new OllamaProcessManager({
+      binaryPath: () => 'C:\\managed\\ollama.exe', spawnFn: spawnFn as never,
+    });
+
+    await expect(manager.ensureRunning()).resolves.toEqual({
+      running: false, startedByApp: true, error: 'process_exited:3221225781',
+    });
+  });
+
+  it('conserva la señal si el proceso termina sin exit code', async () => {
+    global.fetch = fakeFetchSequence(['throw']);
+    const child = makeFakeChild();
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => child.emit('exit', null, 'SIGABRT'));
+      return child;
+    });
+    const manager = new OllamaProcessManager({
+      binaryPath: () => 'C:\\managed\\ollama.exe', spawnFn: spawnFn as never,
+    });
+
+    await expect(manager.ensureRunning()).resolves.toEqual({
+      running: false, startedByApp: true, error: 'process_exited:signal=SIGABRT',
+    });
   });
 
   it('dos llamadas concurrentes coalescen en una sola corrida (no spawnea dos veces)', async () => {
@@ -206,7 +283,7 @@ describe('OllamaProcessManager', () => {
     await expect(manager.ensureRunning()).resolves.toEqual({
       running: false,
       startedByApp: false,
-      error: 'spawn EACCES',
+      error: 'spawn_failed:spawn EACCES',
     });
     expect(end).toHaveBeenCalledTimes(1);
   });
