@@ -4,10 +4,28 @@
 // el renderer es derivado de acá o de `chat:history` (doc 01 §4.1 "todo derivado, reconstruible").
 import { create } from 'zustand';
 import type {
-  Adjustment, ChatMessage, Checkpoint, PermissionRequest, ResponseMetrics, RunError, Task,
+  Adjustment, ChatMessage, Checkpoint, ModelRef, PermissionRequest, ResponseMetrics, RunError, Task,
   ToolCallRecord,
 } from '@saurio/shared';
-import type { RunEvent, RunState } from '@saurio/shared';
+import type { ContextBudgetReport, RunActivityPhase, RunEvent, RunState } from '@saurio/shared';
+
+/** Última "línea viva" conocida de un run (`run.activity`, contrato aditivo del feedback real
+ *  v0.2.1 punto 1d: "el agente ya la calcula del lado del runtime — Leyendo X, Ejecutando Y..." —
+ *  antes esto no existía y la UI no tenía de dónde sacar una sola línea de estado sin traducir
+ *  RunState/tool.status a mano). `ActivityBlock` (features/chat) la usa para la línea plegada. */
+export interface RunActivity {
+  phase: RunActivityPhase;
+  label: string;
+  toolCallId: string | undefined;
+  ts: number;
+}
+
+/** Aviso "modelo chico para modo Agente" (`run.smallModelWarning`, feedback real v0.2.1 punto 10):
+ *  guardado por run porque el runtime lo emite una sola vez por run, no repetido en cada iteración. */
+export interface SmallModelWarning {
+  modelRef: ModelRef;
+  parameterSize: string | undefined;
+}
 
 /** Estado de un run interrumpido (doc 05 §1 `run.recovered`): tool calls que quedaron
  *  `running -> orphaned` o `pending/approved -> abandoned` cuando la app se reinició a mitad de
@@ -72,6 +90,15 @@ export interface RunStoreState {
   /** `childChatId` de cada `childRunId` visto en `run.delegated` — `DelegationCard` lo necesita para
    *  el link "ver conversación completa" sin escanear el stream de eventos del hijo. */
   childChatIdByRun: Record<string, string>;
+  /** Última `run.activity` de cada run — línea viva del bloque "Actividad" (rediseño del chat,
+   *  feedback real v0.2.1: "una sola línea plegable que va contando qué hace"). */
+  activityByRun: Record<string, RunActivity>;
+  /** `run.smallModelWarning` visto por run — un único aviso no bloqueante por run (punto 6 del
+   *  rediseño), nunca repetido aunque el runtime lo reemita en cada iteración de ese mismo run. */
+  smallModelWarningByRun: Record<string, SmallModelWarning>;
+  /** Último `context.built` por CHAT — `effectiveNumCtx` es el numCtx REAL (rediseño del chat,
+   *  punto 1: "indicador de contexto REAL, nunca el máximo teórico del modelo"). */
+  contextBudgetByChat: Record<string, ContextBudgetReport>;
 
   applyEvents: (events: RunEvent[]) => void;
   clearChat: (chatId: string) => void;
@@ -116,6 +143,14 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
       };
     }
     case 'context.built':
+      // Rediseño del chat, punto 1 ("indicador de contexto REAL — effectiveNumCtx, nunca el máximo
+      // teórico del modelo"): antes el compositor mostraba `activeModelInfo.contextMax` (el máximo
+      // que DECLARA el modelo, p.ej. 262k), no el numCtx real que de verdad se le manda al provider
+      // tras aplicar el cap (`defaultNumCtxFor`, ver comentario de `effectiveNumCtx` en
+      // packages/shared/src/events.ts). Se guarda por CHAT (no por run) para que el compositor lo
+      // siga mostrando entre un run y el siguiente, sin volver a mostrar el máximo teórico mientras
+      // tanto.
+      return { ...state, runChatIds, contextBudgetByChat: { ...state.contextBudgetByChat, [event.chatId]: event.budget } };
     case 'context.usage':
     case 'context.compacted':
       // El MVP muestra el resultado agregado bajo el mensaje (métricas), no cada evento de
@@ -216,6 +251,28 @@ export function reduceRunEvent(state: RunStoreState, event: RunEvent): RunStoreS
       };
       return { ...state, runChatIds, interrupted: { ...state.interrupted, [event.runId]: info } };
     }
+    case 'run.activity': {
+      return {
+        ...state,
+        runChatIds,
+        activityByRun: {
+          ...state.activityByRun,
+          [event.runId]: { phase: event.phase, label: event.label, toolCallId: event.toolCallId, ts: event.ts },
+        },
+      };
+    }
+    case 'run.smallModelWarning': {
+      // "una sola vez por run" (doc del punto 6): no se pisa si ya había una para este run.
+      if (state.smallModelWarningByRun[event.runId]) return { ...state, runChatIds };
+      return {
+        ...state,
+        runChatIds,
+        smallModelWarningByRun: {
+          ...state.smallModelWarningByRun,
+          [event.runId]: { modelRef: event.modelRef, parameterSize: event.parameterSize },
+        },
+      };
+    }
     case 'run.delegated': {
       const children = state.childRunsByParent[event.parentRunId] ?? [];
       return {
@@ -253,6 +310,9 @@ const initialState: Omit<RunStoreState, 'applyEvents' | 'clearChat' | 'dismissIn
   lastSeqByRun: {},
   childRunsByParent: {},
   childChatIdByRun: {},
+  activityByRun: {},
+  smallModelWarningByRun: {},
+  contextBudgetByChat: {},
 };
 
 export const useRunStore = create<RunStoreState>((set) => ({

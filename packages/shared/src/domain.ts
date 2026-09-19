@@ -8,6 +8,7 @@ import {
   Mode, Locality, ChatRole, ToolTransport, PermissionCategory,
   Risk, ToolCallStatus, MatchLevel, Quality, AgentRole,
   AgentOwnerKind, ModelMode, MemorySourceKind, MemoryConfidence, PermissionPreset,
+  ChatPermissionPreset, Effort,
 } from './enums.js';
 
 export const ProjectSchema = z.object({
@@ -166,8 +167,45 @@ export const ChatSchema = z.object({
    *  `RunController.runDelegateTool` crea para una delegación — apunta al run PADRE que la disparó.
    *  `undefined` para cualquier chat normal (comportamiento previo, todos los chats existentes). */
   originRunId: z.string().optional(),
+  /** Feedback real v0.2.1, punto 1a: preset de permisos vigente para ESTE chat (`chat:setPermissionPreset`).
+   *  `undefined` = chats creados antes de esta migración; el runtime cae a 'ask' (comportamiento más
+   *  conservador, nunca se asume un preset más permisivo por default). */
+  permissionPreset: ChatPermissionPreset.optional(),
+  /** Feedback real v0.2.1, punto 1b: nivel de esfuerzo vigente para ESTE chat (`chat:setEffort`).
+   *  `undefined` = default 'balanced' (packages/runtime/src/agent/modelPolicy.ts). */
+  effort: Effort.optional(),
 });
 export type Chat = z.infer<typeof ChatSchema>;
+
+// ── Feedback real v0.2.1, punto 1c: adjuntos de `run:start` ──────────────────────────────────────
+/** Un adjunto que el usuario sube junto con su mensaje. Exactamente uno de `path`/`dataBase64` debe
+ *  venir con contenido (el otro queda vacío) — `path` cuando el archivo ya está en disco (más liviano
+ *  para IPC), `dataBase64` cuando viene del portapapeles/drag-drop sin path real. Límites de tamaño
+ *  los aplica el handler de `run:start` (no el schema, que solo valida forma) antes de aceptar la tool
+ *  call — ver apps/desktop/src/main/ipc/run.ts. */
+export const AttachmentSchema = z.object({
+  kind: z.enum(['file', 'image']),
+  name: z.string(),
+  mime: z.string(),
+  path: z.string().optional(),
+  dataBase64: z.string().optional(),
+  sizeBytes: z.number().optional(),
+});
+export type Attachment = z.infer<typeof AttachmentSchema>;
+
+// ── Feedback real v0.2.1, punto 12: proyectos persistentes ("como Claude Code/Codex") ────────────
+/** Fila de `project:recent` — igual que `Project` pero con lo que la lista de proyectos abiertos
+ *  necesita mostrar sin una llamada aparte por proyecto: cantidad de chats y si la carpeta todavía
+ *  existe en disco (para avisar "carpeta no encontrada" en vez de fallar `project:open` en silencio). */
+export const ProjectRecentSchema = z.object({
+  id: z.string(),
+  path: z.string(),
+  name: z.string(),
+  lastOpenedAt: z.number(),
+  chatCount: z.number(),
+  folderExists: z.boolean(),
+});
+export type ProjectRecent = z.infer<typeof ProjectRecentSchema>;
 
 // ── Formas cruzadas por RunEvent/IPC (doc 04 §5, §6, §7) ────────────────────
 // Regla de doc 02 §3 "Dónde van los schemas zod compartidos": un shape usado por más de una

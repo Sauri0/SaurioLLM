@@ -16,6 +16,7 @@ import type { AgentConfig, ContextPolicy } from '../../agent/types.js';
 import type { AgentConfigResolver } from '../../agent/ports.js';
 import { createPersonalAgentDefaults } from '../../agent/defaults.js';
 import type { PermissionPolicy } from '../../permissions/types.js';
+import { toAgentLevelPreset } from '../../permissions/engine.js';
 import type {
   AgentRole, Mode, ModelRef, AgentProfile, AgentCreateInput, AgentOwnerKind, ModelMode,
 } from '@saurio/shared';
@@ -90,7 +91,7 @@ function rowToProfile(row: AgentRow): AgentProfile {
     model: JSON.parse(row.model_ref_json) as ModelRef,
     systemPrompt: row.system_prompt,
     allowedTools: JSON.parse(row.allowed_tools_json) as string[],
-    permissionPreset: permissions.preset,
+    permissionPreset: toAgentLevelPreset(permissions.preset),
     createdAt: row.created_at ?? row.updated_at,
     archivedAt: row.archived_at ?? undefined,
   };

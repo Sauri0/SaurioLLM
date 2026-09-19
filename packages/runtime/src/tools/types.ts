@@ -53,6 +53,10 @@ export interface WorkspaceFs {
   readFile(relPath: string): Promise<{ content: string; hash: string; eol: 'LF' | 'CRLF'; bom: boolean }>;
   writeFileAtomic(relPath: string, content: string, opts?: { eol?: 'LF' | 'CRLF'; bom?: boolean }): Promise<void>;
   deleteFile(relPath: string): Promise<void>;
+  /** Punto 4 del encargo: crea `relPath` (y sus carpetas intermedias) dentro del workspace, sin
+   *  comandos de shell. No falla si la carpeta ya existe (mismo criterio que `fs.mkdir(...,
+   *  {recursive: true})` — "ya existe" no es un error para esta operación). */
+  makeDir(relPath: string): Promise<void>;
   listDir(relPath: string, depth: number): Promise<{ path: string; isDir: boolean }[]>;
   isProtected(relPath: string): boolean;             // .git/**, .saurio/**, .env*, *.pem, id_rsa*, .vscode/**, .idea/**
   isIgnored(relPath: string): boolean;               // .gitignore + .saurioignore
@@ -83,8 +87,9 @@ export interface ToolRegistry {
   onChanged(cb: () => void): () => void;             // MCP tools/list_changed; no-op hasta v0.3
 }
 
-/** Firma de las 10 builtins del registro (nombres únicos, implementación fuera de este documento). */
+/** Firma de las builtins del registro (nombres únicos, implementación fuera de este documento).
+ *  `make_dir` (punto 4 del encargo, feedback real v0.2.1) se agregó a las 10 originales del MVP. */
 export type BuiltinToolName =
   | 'list_files' | 'search_code' | 'read_file' | 'read_output'
   | 'edit_file' | 'write_file' | 'delete_file' | 'run_command'
-  | 'task_update' | 'finish';
+  | 'task_update' | 'finish' | 'make_dir';

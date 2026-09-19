@@ -88,6 +88,10 @@ export function makeFakeChatRepository(chats: Chat[]): ChatRepository {
       byId.set(id, updated);
       return updated;
     },
+    async softDelete(id) {
+      const current = byId.get(id);
+      if (current) byId.set(id, { ...current, archived: true });
+    },
   };
 }
 
@@ -261,6 +265,24 @@ export function makeAllowAllPermissionEngine(): PermissionEngine {
   };
 }
 
+/** Feedback real v0.2.1, punto 1a: registra el `PermissionPolicy` con el que `RunController` invoca
+ *  a `evaluate()` en cada tool call, para poder verificar que `Chat.permissionPreset`
+ *  (`applyChatPermissionPreset`) de verdad llega hasta acá — siempre `allow`, no ejercita el motor
+ *  real de decisión (eso ya lo cubre `permissions/engine.test.ts`). */
+export function makeRecordingPermissionEngine(): PermissionEngine & { seenPresets: string[] } {
+  const seenPresets: string[] = [];
+  return {
+    seenPresets,
+    evaluate: (call, _mode, policy) => {
+      seenPresets.push(policy.preset);
+      return { decision: 'allow', decidedBy: 'mode', reason: `${call.category} permitido en este test` };
+    },
+    isProtectedPath: () => false,
+    isCriticalCommand: () => false,
+    isBlockedByDefault: () => false,
+  };
+}
+
 /** Hallazgo #1/#4: antes este fake devolvía `toolCallId: 'pending'` fijo, sin mirar lo que le pasa el
  *  caller — eso hacía que un test no pudiera detectar una regresión donde RunController deja de
  *  pasar `toolCallId` en la evaluación (el bug real: `decision.request.toolCallId` terminaba en '').
@@ -287,18 +309,30 @@ export function makeAskThenRecordPermissionEngine(): PermissionEngine {
 // ── Checkpoint ───────────────────────────────────────────────────────────
 
 export function makeFakeCheckpointService(clock: Clock, ids: IdGenerator): CheckpointService {
+  // Feedback real v0.2.1, punto 5 ("checkpoints vacíos"): antes este fake siempre devolvía
+  // `files: []` con `stats.files: 1` (un checkpoint fantasma incluso en el "happy path" con
+  // `edit_file") — se arregla acá para reflejar lo que hace el `FsCheckpointService` real: los
+  // paths declarados por `classify()` en `begin()` terminan como archivos `modified` en `commit()`
+  // (RunController.runHandler ahora filtra por `checkpoint.files.length > 0` antes de emitir el
+  // evento, así que el fake tiene que ser realista para que ese gate se pueda probar).
+  const pending = new Map<string, string[]>();
   return {
-    async begin(_runId, _toolCallId, _paths) {
+    async begin(_runId, _toolCallId, paths) {
+      const checkpointId = ids.next();
+      pending.set(checkpointId, paths);
       return {
-        checkpointId: ids.next(),
+        checkpointId,
         before: async () => {},
         after: async () => {},
       };
     },
     async commit(handle) {
+      const paths = pending.get(handle.checkpointId) ?? [];
+      pending.delete(handle.checkpointId);
+      const files = paths.map((relPath) => ({ relPath, change: 'modified' as const, preHash: 'pre', postHash: 'post' }));
       const checkpoint: Checkpoint = {
         id: handle.checkpointId, runId: 'unused', chatId: 'unused', toolCallId: undefined,
-        kind: 'tool', files: [], stats: { files: 1, added: 1, removed: 0 }, status: 'active',
+        kind: 'tool', files, stats: { files: files.length, added: files.length, removed: 0 }, status: 'active',
       };
       return checkpoint;
     },

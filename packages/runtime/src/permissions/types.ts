@@ -17,8 +17,13 @@ export interface PermissionRule {
   source: 'user' | 'preset' | 'mode' | 'settings';
 }
 
+/** Feedback real v0.2.1, punto 1a/8: los 4 presets NUEVOS son por-CHAT (`Chat.permissionPreset` en
+ *  @saurio/shared, canal `chat:setPermissionPreset`) — una dimensión distinta de
+ *  `strict`/`balanced`/`trusting` (esos son por-AGENTE, `AgentProfile.permissionPreset`, sin
+ *  relación con "carpeta del proyecto"). `RunController` sobreescribe `preset` acá con el preset del
+ *  chat cuando el chat tiene uno seteado (`applyChatPermissionPreset`) — ver deviations. */
 export interface PermissionPolicy {
-  preset: 'strict' | 'balanced' | 'trusting';
+  preset: 'strict' | 'balanced' | 'trusting' | 'ask' | 'edit_in_folder' | 'full_in_folder' | 'unrestricted';
   rules: PermissionRule[];
   terminalAllowlist: string[];
 }

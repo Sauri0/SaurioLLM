@@ -59,12 +59,17 @@ asarUnpack:
   - "node_modules/@vscode/ripgrep*/**"
   - "**/*.wasm"
 win:
+  icon: build/icon.ico
   target:
     - target: nsis
       arch:
         - x64
 nsis:
   oneClick: false
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  createDesktopShortcut: always
+  shortcutName: SaurioLLM
   allowToChangeInstallationDirectory: true
   # Nombre estable y SIN espacios (auto-actualización, doc de esta tarea): el Release de v0.1.0 ya
   # mostró el problema real — GitHub reescribe los espacios del nombre de archivo a puntos al subir un

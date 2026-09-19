@@ -6,6 +6,7 @@ import type { Project } from '@saurio/shared';
 interface ProjectRow extends SqliteRow {
   id: string; path: string; name: string | null; created_at: number;
   last_opened_at: number | null; settings_json: string | null;
+  removed_from_recents: number;
 }
 
 function rowToProject(row: ProjectRow): Project {
@@ -40,6 +41,22 @@ export function createProjectRepository(driver: SqliteDriver): ProjectRepository
     },
     async touchLastOpened(id: string, at: number): Promise<void> {
       driver.prepare('UPDATE projects SET last_opened_at = ? WHERE id = ?').run(at, id);
+    },
+    async listRecent(): Promise<{ project: Project; chatCount: number }[]> {
+      const rows = driver.prepare<ProjectRow & { chat_count: number }>(
+        `SELECT p.*, (SELECT COUNT(*) FROM chats c WHERE c.project_id = p.id AND c.deleted_at IS NULL) AS chat_count
+         FROM projects p WHERE p.removed_from_recents = 0 ORDER BY p.last_opened_at DESC`,
+      ).all();
+      return rows.map((row) => ({ project: rowToProject(row), chatCount: row.chat_count }));
+    },
+    async setRemovedFromRecents(id: string, removed: boolean): Promise<void> {
+      driver.prepare('UPDATE projects SET removed_from_recents = ? WHERE id = ?').run(removed ? 1 : 0, id);
+    },
+    async rename(id: string, name: string): Promise<Project> {
+      driver.prepare('UPDATE projects SET name = ? WHERE id = ?').run(name, id);
+      const updated = await this.get(id);
+      if (!updated) throw new Error(`proyecto ${id} no existe`);
+      return updated;
     },
   };
 }

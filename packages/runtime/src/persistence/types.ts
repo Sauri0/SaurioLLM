@@ -26,13 +26,24 @@ export interface ProjectRepository {
   get(id: string): Promise<Project | undefined>;
   list(): Promise<Project[]>;
   touchLastOpened(id: string, at: number): Promise<void>;
+  /** Punto 12 del encargo (`project:recent`): proyectos no sacados de la lista
+   *  (`removedFromRecents === false`), más reciente primero, con la cantidad de chats de cada uno
+   *  (`folderExists` lo resuelve el handler de IPC con `fs.stat`, no esta capa de persistencia). */
+  listRecent(): Promise<{ project: Project; chatCount: number }[]>;
+  /** `project:remove`/reabrir desde la lista: no borra la fila (preserva chats/historial). */
+  setRemovedFromRecents(id: string, removed: boolean): Promise<void>;
+  rename(id: string, name: string): Promise<Project>;
 }
 
 export interface ChatRepository {
   create(chat: Chat): Promise<Chat>;
   get(id: string): Promise<Chat | undefined>;
+  /** Excluye por default los chats con `chat:delete` (soft-delete, migración 0006). */
   listByProject(projectId: string): Promise<Chat[]>;
   update(id: string, patch: Partial<Omit<Chat, 'id' | 'projectId'>>): Promise<Chat>;
+  /** Punto 12 del encargo (`chat:delete`): soft-delete — marca `deleted_at`, no borra la fila
+   *  (ver comentario de la migración 0006 sobre por qué no es un DELETE real). */
+  softDelete(id: string, deletedAt: number): Promise<void>;
 }
 
 export interface MessageRepository {

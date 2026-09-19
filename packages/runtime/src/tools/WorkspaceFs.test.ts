@@ -1,6 +1,6 @@
 // Test de WorkspaceFs: confinamiento, protected paths, .saurioignore/.gitignore, escritura atómica.
 // Define: doc 04 §4 y doc 09 §3, §7, §8.
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -98,6 +98,18 @@ describe('tools/WorkspaceFs', () => {
     await fs.deleteFile('a.txt');
     await expect(fs.readFile('a.txt')).rejects.toMatchObject({ code: 'not_found' });
     await expect(fs.deleteFile('.git/config')).rejects.toMatchObject({ code: 'path_denied' });
+  });
+
+  it('makeDir crea carpetas intermedias y es idempotente (punto 4 del encargo, make_dir)', async () => {
+    await fs.makeDir('nueva/sub/carpeta');
+    expect(existsSync(path.join(root, 'nueva/sub/carpeta'))).toBe(true);
+    await expect(fs.makeDir('nueva/sub/carpeta')).resolves.toBeUndefined();
+  });
+
+  it('makeDir rechaza rutas protegidas y paths que ya son un archivo', async () => {
+    await expect(fs.makeDir('.git/hooks')).rejects.toMatchObject({ code: 'path_denied' });
+    writeFileSync(path.join(root, 'archivo.txt'), 'x');
+    await expect(fs.makeDir('archivo.txt')).rejects.toMatchObject({ code: 'path_denied' });
   });
 
   it('listDir clampa la profundidad a 3 y respeta ignorados', async () => {

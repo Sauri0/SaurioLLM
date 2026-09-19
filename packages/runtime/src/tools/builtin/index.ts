@@ -16,6 +16,7 @@ import { createRunCommandTool } from './run_command.js';
 import { createTaskUpdateTool } from './task_update.js';
 import { createFinishTool } from './finish.js';
 import { createDelegateTool } from './delegate.js';
+import { createMakeDirTool } from './make_dir.js';
 
 export type { BuiltinToolsDeps };
 export { defaultBuiltinToolsDeps };
@@ -43,6 +44,7 @@ export function createBuiltinTools(overrides: Partial<BuiltinToolsDeps> = {}): T
     erase(createReadOutputTool(deps)),
     erase(createEditFileTool(deps)),
     erase(createWriteFileTool(deps)),
+    erase(createMakeDirTool(deps)),
     erase(createDeleteFileTool(deps)),
     erase(createRunCommandTool(deps)),
     erase(createTaskUpdateTool(deps)),

@@ -10,10 +10,11 @@ import { migration0002 } from './0002_downloads_status_and_git_head.js';
 import { migration0003 } from './0003_messages_model_ref.js';
 import { migration0004 } from './0004_agent_profiles.js';
 import { migration0005 } from './0005_delegation.js';
+import { migration0006 } from './0006_chat_preset_effort_and_project_recents.js';
 import type { Migration } from './types.js';
 
-/** Orden ascendente por versión; agregar migraciones nuevas acá cuando existan (0006, ...). */
-const MIGRATIONS: Migration[] = [migration0001, migration0002, migration0003, migration0004, migration0005];
+/** Orden ascendente por versión; agregar migraciones nuevas acá cuando existan (0007, ...). */
+const MIGRATIONS: Migration[] = [migration0001, migration0002, migration0003, migration0004, migration0005, migration0006];
 
 export class NewerSchemaError extends Error {
   constructor(public readonly dbVersion: number, public readonly codeVersion: number) {

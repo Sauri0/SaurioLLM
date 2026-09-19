@@ -6,7 +6,7 @@
 // que había a la izquierda del chat. Esa configuración vive ahora en la única barra lateral
 // (`layout/Sidebar.tsx`); acá solo queda la conversación, a todo el ancho del centro.
 import { useEffect, useState } from 'react';
-import type { Chat, Mode, ModelRef } from '@saurio/shared';
+import type { Attachment, Chat, ChatPermissionPreset, Effort, Mode, ModelRef } from '@saurio/shared';
 import { invoke } from '../../ipc/client.js';
 import { useChatStore } from '../../stores/chatStore.js';
 import { useModelsStore } from '../../stores/modelsStore.js';
@@ -20,6 +20,8 @@ import { ModelLoadingBanner } from './ModelLoadingBanner.js';
 import './chat.css';
 
 const DEFAULT_MODE: Mode = 'agent';
+const DEFAULT_EFFORT: Effort = 'balanced';
+const DEFAULT_PERMISSION_PRESET: ChatPermissionPreset = 'ask';
 
 export interface ChatPanelProps {
   projectId: string;
@@ -44,6 +46,16 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
   const mode = useChatStore((s) => (currentChatId ? (s.modeByChat[currentChatId] ?? DEFAULT_MODE) : DEFAULT_MODE));
   const setMode = useChatStore((s) => s.setMode);
   const draftModelRef = useChatStore((s) => s.draftModelRefByProject[projectId] ?? defaultModelRef);
+  // Compositor (rediseño del chat, punto 1): potencia y permisos son del CHAT (`chat:setEffort`/
+  // `chat:setPermissionPreset`, contrato aditivo), no un draft por proyecto como el modelo/modo de
+  // un chat todavía no creado — `chat?.effort`/`chat?.permissionPreset` ya vienen resueltos por el
+  // handler cuando existen; `undefined` (chats de antes de esta migración) cae al default más
+  // conservador, igual que hace el propio runtime.
+  const effort = chat?.effort ?? DEFAULT_EFFORT;
+  const permissionPreset = chat?.permissionPreset ?? DEFAULT_PERMISSION_PRESET;
+  const setChatEffort = useChatStore((s) => s.setChatEffort);
+  const setChatPermissionPreset = useChatStore((s) => s.setChatPermissionPreset);
+  const [composerError, setComposerError] = useState<string | undefined>(undefined);
 
   // Ya no dispara `models:list`/`models:loaded` (eso ahora lo hace `layout/Sidebar.tsx`, doc de la
   // pasada de diseño #1); acá solo se lee `installed` para resolver el `contextMax` del modelo
@@ -80,7 +92,7 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
   // (`provider_down`/`model_not_found`, varios segundos después). Los modelos LAN/NUBE no tienen
   // noción de "instalado" (siempre disponibles mientras el proveedor esté configurado), así que el
   // chequeo solo aplica a `locality: 'local'`.
-  async function handleSend(text: string): Promise<void> {
+  async function handleSend(text: string, attachments: Attachment[]): Promise<void> {
     if (!currentChatId) return;
     const modelRef = chat?.modelRef;
     if (modelRef?.locality === 'local' && !installedModels.some((m) => m.ref.name === modelRef.name)) {
@@ -88,7 +100,7 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
       return;
     }
     setSendError(undefined);
-    await invoke('run:start', { chatId: currentChatId, text, mode });
+    await invoke('run:start', { chatId: currentChatId, text, mode, attachments: attachments.length > 0 ? attachments : undefined });
   }
 
   async function handleCancel(): Promise<void> {
@@ -96,14 +108,40 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
     await invoke('run:cancel', { runId: activeRunId });
   }
 
+  async function handleEffortChange(next: Effort): Promise<void> {
+    if (!currentChatId) return;
+    setComposerError(undefined);
+    try {
+      await setChatEffort(currentChatId, next);
+    } catch (err) {
+      setComposerError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handlePermissionPresetChange(next: ChatPermissionPreset, confirmed?: boolean): Promise<void> {
+    if (!currentChatId) return;
+    setComposerError(undefined);
+    try {
+      await setChatPermissionPreset(currentChatId, next, confirmed);
+    } catch (err) {
+      setComposerError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   const activeModelName = chat?.modelRef?.name ?? draftModelRef?.name;
-  const activeModelInfo = installedModels.find((m) => m.ref.name === activeModelName);
+  // Rediseño del chat, punto 1 ("indicador de contexto REAL, nunca el máximo teórico del modelo"):
+  // `contextBudgetByChat` guarda el `effectiveNumCtx` real del último `context.built` de ESTE chat
+  // (runStore.ts); mientras no hubo ningún run todavía no hay valor real que mostrar, así que se
+  // omite el máximo en vez de mostrar `contextMax` del modelo (que puede ser 10x-30x más grande que
+  // lo que de verdad se manda).
+  const contextBudget = useRunStore((s) => (currentChatId ? s.contextBudgetByChat[currentChatId] : undefined));
+  const effectiveContextMax = contextBudget?.effectiveNumCtx ?? contextBudget?.numCtx;
   const lastMessageId = messages && messages.length > 0 ? messages[messages.length - 1]!.id : undefined;
   const lastMetrics = lastMessageId ? metricsByMessage[lastMessageId] : undefined;
   const contextUsed = lastMetrics?.promptTokens !== undefined && lastMetrics.evalTokens !== undefined
     ? lastMetrics.promptTokens + lastMetrics.evalTokens
     : undefined;
-  const contextLabel = formatContextPair(contextUsed, activeModelInfo?.contextMax);
+  const contextLabel = formatContextPair(contextUsed, effectiveContextMax);
   // Tarea "carga de modelo/oom_load": "cargando" = el run activo no tiene ningún `message.delta`
   // todavía (ningún `streaming` cuyo `runId` sea este) — ver ModelLoadingBanner.
   const hasFirstChunk = activeRunId !== undefined
@@ -131,11 +169,18 @@ export function ChatPanel({ projectId, chat, defaultAgentId, defaultModelRef, on
             {sendError && (
               <div className="saurio-banner danger chat-panel__send-error" role="alert">{sendError}</div>
             )}
+            {composerError && (
+              <div className="saurio-banner danger chat-panel__send-error" role="alert">{composerError}</div>
+            )}
             <ChatInput
               mode={mode}
               onModeChange={(m) => setMode(currentChatId, m)}
+              effort={effort}
+              onEffortChange={(e) => void handleEffortChange(e)}
+              permissionPreset={permissionPreset}
+              onPermissionPresetChange={(p, confirmed) => void handlePermissionPresetChange(p, confirmed)}
               isRunning={activeRunId !== undefined}
-              onSend={(text) => void handleSend(text)}
+              onSend={(text, attachments) => void handleSend(text, attachments)}
               onCancel={() => void handleCancel()}
               modelName={activeModelName ?? '(sin modelo)'}
               contextLabel={contextLabel}

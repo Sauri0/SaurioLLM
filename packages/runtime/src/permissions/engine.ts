@@ -77,9 +77,53 @@ function isUnderSrc(relPath: string): boolean {
 
 /** Default de categoría por preset (doc §2). `paths` solo importa para el caso `strict`+`read`
  *  fuera de `src/**`. */
+/** Feedback real v0.2.1, punto 1a/8: los 4 presets por-CHAT nuevos (distintos de
+ *  strict/balanced/trusting, que son por-agente). Semántica pedida:
+ *  - 'ask': preguntar todo lo que no sea lectura.
+ *  - 'edit_in_folder': ediciones (write/delete) dentro de la carpeta sin preguntar; comandos
+ *    (terminal/git_commit/git_push/network/mcp/delegate) preguntan.
+ *  - 'full_in_folder': ediciones Y comandos dentro de la carpeta sin preguntar; git_push/network
+ *    siguen preguntando (así como rutas fuera de la carpeta, que ya fallan duro en WorkspaceFs.resolve
+ *    antes de llegar acá — no hay una categoría de permiso separada para eso hoy, límite conocido).
+ *  - 'unrestricted': no pregunta nada — bypassea incluso el invariante duro de `git_push` de
+ *    `evaluate()` (ver más abajo), PERO los invariantes de comando crítico
+ *    (`isCriticalCommand`)/ruta protegida (`.git`, `.env`, etc.) siguen aplicando SIEMPRE, sin
+ *    excepción de preset (evaluate() los chequea antes de llegar acá) — es la única lectura segura de
+ *    "no pregunta nada... salvo escribir dentro de .git del proyecto" que no deja "Sin límites"
+ *    ejecutar un `rm -rf` recursivo sobre la raíz sin ni una confirmación. */
+function isNewChatPreset(preset: PermissionPolicy['preset']): preset is 'ask' | 'edit_in_folder' | 'full_in_folder' | 'unrestricted' {
+  return preset === 'ask' || preset === 'edit_in_folder' || preset === 'full_in_folder' || preset === 'unrestricted';
+}
+
+/** `AgentProfile.permissionPreset` (@saurio/shared) sigue siendo solo 'strict'|'balanced'|'trusting'
+ *  (dimensión POR AGENTE, sin relación con los 4 presets nuevos por-chat) — dos lugares necesitan
+ *  proyectar un `PermissionPolicy['preset']` (que ahora puede traer cualquiera de los 7 valores, ver
+ *  `applyChatPermissionPreset` en RunController.ts) hacia ese campo más angosto: al clonar el
+ *  `PermissionPolicy` del run actual en el worker efímero de `delegate` (RunController.ts) y al leer
+ *  `agents.permission_policy_json` de vuelta como `AgentProfile` (persistence/repositories/agent.ts).
+ *  Mapeo conservador, nunca más permisivo que el original: 'ask' -> 'strict', 'edit_in_folder'/
+ *  'full_in_folder' -> 'balanced', 'unrestricted' -> 'trusting'. */
+export function toAgentLevelPreset(preset: PermissionPolicy['preset']): 'strict' | 'balanced' | 'trusting' {
+  switch (preset) {
+    case 'strict': case 'balanced': case 'trusting': return preset;
+    case 'ask': return 'strict';
+    case 'edit_in_folder': case 'full_in_folder': return 'balanced';
+    case 'unrestricted': return 'trusting';
+  }
+}
+
 function defaultForCategory(
   category: PermissionCategory, preset: PermissionPolicy['preset'], paths: string[] | undefined,
 ): PermissionDecisionKind {
+  if (isNewChatPreset(preset)) {
+    if (category === 'read') return 'allow';
+    if (preset === 'unrestricted') return 'allow';
+    if (category === 'write' || category === 'delete') {
+      return preset === 'ask' ? 'ask' : 'allow'; // edit_in_folder | full_in_folder -> allow
+    }
+    // terminal | git_commit | git_push | network | mcp | delegate
+    return preset === 'full_in_folder' && category !== 'git_push' && category !== 'network' ? 'allow' : 'ask';
+  }
   switch (category) {
     case 'read':
       if (preset === 'strict' && paths && !paths.every(isUnderSrc)) return 'ask';
@@ -227,7 +271,10 @@ export class DefaultPermissionEngine implements PermissionEngine {
     const effectiveCategory = parsed
       ? mostRestrictiveCategory(parsed.subcommands.map((s) => s.category))
       : call.category;
-    if (effectiveCategory === 'git_push') {
+    // Feedback real v0.2.1, punto 1a: 'unrestricted' ("Sin límites") es el único preset que puede
+    // saltarse este invariante — todos los demás (incluidos los 3 presets de agente preexistentes)
+    // siguen preguntando SIEMPRE por git_push, sin excepción configurable.
+    if (effectiveCategory === 'git_push' && policy.preset !== 'unrestricted') {
       return askDecision(buildRequest(
         { ...call, category: 'git_push' },
         'categoría git_push -> ask (invariante, nunca allow)',

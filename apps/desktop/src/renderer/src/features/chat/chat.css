@@ -124,26 +124,6 @@
   padding: var(--space-3) var(--space-4);
 }
 .message-bubble--ephemeral { opacity: 0.7; }
-.message-bubble__thinking { margin-bottom: var(--space-2); }
-.message-bubble__thinking summary {
-  cursor: pointer;
-  color: var(--text-muted);
-  font-size: var(--text-sm);
-  list-style: none;
-}
-.message-bubble__thinking summary::-webkit-details-marker { display: none; }
-.message-bubble__thinking summary::before { content: '▸ '; }
-.message-bubble__thinking[open] summary::before { content: '▾ '; }
-.message-bubble__thinking pre {
-  white-space: pre-wrap;
-  color: var(--text-secondary);
-  font-size: var(--text-sm);
-  background: var(--bg-1);
-  border-left: 2px solid var(--border-strong);
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  margin: var(--space-1) 0 0;
-}
 .message-bubble__streaming-text { white-space: pre-wrap; font-family: inherit; margin: 0; }
 .message-bubble__cursor {
   display: inline-block;
@@ -155,6 +135,34 @@
 }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* Rediseño del chat, punto 3: métricas fuera del flujo — un toggle "i" tenue al pie del mensaje
+   final en vez de una fila siempre visible con "costo: no disponible" fijo en cada respuesta. */
+.message-metrics-toggle { margin-top: var(--space-1); }
+.message-metrics-toggle__button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  font-family: var(--font-mono);
+}
+.message-metrics-toggle__button:hover { color: var(--text-secondary); }
+.message-metrics-toggle__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  font-size: 9px;
+  font-style: italic;
+  font-family: var(--font-sans);
+}
 .message-metrics {
   display: flex;
   flex-wrap: wrap;
@@ -164,8 +172,8 @@
   margin-top: var(--space-1);
 }
 .message-metrics__quality { text-transform: uppercase; letter-spacing: 0.03em; }
-.message-metrics.quality-estimated .message-metrics__quality { color: var(--warning); }
-.message-metrics.quality-unavailable .message-metrics__quality { color: var(--text-muted); }
+.message-metrics-toggle.quality-estimated .message-metrics__quality { color: var(--warning); }
+.message-metrics-toggle.quality-unavailable .message-metrics__quality { color: var(--text-muted); }
 
 /* ── Tarjeta de tool call: icono, nombre, resumen, estado con color, salida colapsable ───── */
 .tool-call-card {
@@ -218,29 +226,132 @@
 .tool-call-card.status-done .tool-call-card__status svg { color: var(--success); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
-.checkpoint-card {
+/* ── Bloque "Actividad" (rediseño del chat): una línea tenue plegada, lista compacta al abrir ──
+   Referencia exacta pedida (capturas de Claude Code): sin tarjetas grandes ni colores fuertes acá
+   — el color/énfasis queda para el detalle de cada paso (ToolCallCard/DelegationCard), que solo se
+   ve si el usuario lo pide. */
+.activity-block { margin: var(--space-2) 0; }
+.activity-block__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  padding: 2px 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+}
+.activity-block__header:hover { color: var(--text-secondary); }
+.activity-block__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-block__chevron { transition: transform 120ms ease; flex: 0 0 auto; }
+.activity-block__chevron--closed { transform: rotate(-90deg); }
+.activity-block__spinner {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-subtle);
+  border-top-color: var(--text-muted);
+  animation: saurio-spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+.activity-block--live .activity-block__label { color: var(--text-secondary); }
+.activity-block__body {
+  margin-top: 4px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-1);
+}
+.activity-step { font-size: var(--text-xs); }
+.activity-step__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  padding: 3px 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+.activity-step__row:hover { color: var(--text-secondary); }
+.activity-step__label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-step__chevron { transition: transform 120ms ease; flex: 0 0 auto; opacity: 0.6; }
+.activity-step__chevron--closed { transform: rotate(-90deg); }
+.activity-step__detail { margin: 2px 0 6px; }
+.activity-step__detail pre {
+  background: var(--bg-2);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  margin: 0;
+}
+.activity-step__thinking { border-left: 2px solid var(--border-strong); }
+/* El detalle de un paso reusa ToolCallCard/DelegationCard — se les saca el margen propio para no
+   duplicar el espaciado que ya da `.activity-step__detail`. */
+.activity-step__detail .tool-call-card,
+.activity-step__detail .delegation-card { margin: 0; }
+
+/* ── Checkpoint mergeado por run (rediseño del chat, punto 4): UNA tarjeta por run ─────────── */
+.run-checkpoint-card {
   background: var(--bg-3);
   border: 1px solid var(--border-subtle);
-  border-left: 3px solid var(--success);
   border-radius: var(--radius-md);
   padding: var(--space-2) var(--space-3);
   margin: var(--space-2) 0;
   font-size: var(--text-sm);
 }
-.checkpoint-card__header { display: flex; justify-content: space-between; font-weight: 600; }
-.checkpoint-card__stats { font-weight: 400; color: var(--text-muted); font-size: var(--text-xs); }
-.checkpoint-card__added { color: var(--success); }
-.checkpoint-card__removed { color: var(--danger); }
-.checkpoint-card__files { list-style: none; margin: var(--space-1) 0 0; padding: 0; }
-.checkpoint-card__files li { display: flex; gap: var(--space-2); align-items: center; padding: 2px 0; font-size: var(--text-xs); min-width: 0; }
-.checkpoint-card__file-link {
+.run-checkpoint-card__header { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); }
+.run-checkpoint-card__added { color: var(--success); }
+.run-checkpoint-card__removed { color: var(--danger); }
+.run-checkpoint-card__undo { font-size: var(--text-xs); flex: 0 0 auto; }
+.run-checkpoint-card__reverted { font-size: var(--text-xs); color: var(--text-muted); flex: 0 0 auto; }
+.run-checkpoint-card__files { list-style: none; margin: var(--space-1) 0 0; padding: 0; }
+.run-checkpoint-card__files li { display: flex; gap: var(--space-2); align-items: center; padding: 2px 0; font-size: var(--text-xs); min-width: 0; }
+.run-checkpoint-card__file-link {
   background: none; border: none; color: var(--accent); cursor: pointer; padding: 0;
   text-decoration: underline; font-size: inherit; font-family: var(--font-mono);
   flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   text-align: left;
 }
-.checkpoint-card__change { color: var(--text-muted); font-size: 10px; text-transform: uppercase; flex: 0 0 auto; }
-.checkpoint-card__blob-missing { color: var(--warning); font-size: 10px; }
+.run-checkpoint-card__change { color: var(--text-muted); font-size: 10px; text-transform: uppercase; flex: 0 0 auto; }
+.run-checkpoint-card__blob-missing { color: var(--warning); font-size: 10px; }
+
+/* Aviso "modelo chico para modo Agente" (rediseño del chat, punto 6) — discreto, no un banner de
+   error: mismo tono tenue que el resto del chat, con un cierre manual. */
+.small-model-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  background: var(--bg-1);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.small-model-warning svg { color: var(--warning); flex: 0 0 auto; margin-top: 1px; }
+.small-model-warning__link {
+  background: none; border: none; color: var(--accent); cursor: pointer; padding: 0;
+  text-decoration: underline; font-size: inherit; font-family: inherit;
+}
+.small-model-warning__dismiss {
+  margin-left: auto;
+  background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 2px;
+  flex: 0 0 auto;
+}
+.small-model-warning__dismiss:hover { color: var(--text-primary); }
 
 .interrupted-run-card {
   background: var(--warning-subtle);
@@ -307,11 +418,31 @@
   max-width: 760px;
   margin: 0 auto;
   width: 100%;
+  position: relative;
 }
-.chat-input__toolbar { margin-bottom: var(--space-2); }
+/* "arrastrar y soltar" (rediseño del chat, punto 1) — borde de acento mientras se arrastra un
+   archivo encima del compositor, sin mover ningún otro elemento. */
+.chat-input--drag-over { outline: 2px dashed var(--accent); outline-offset: 4px; border-radius: var(--radius-md); }
+.chat-input__drop-hint {
+  position: absolute;
+  inset: var(--space-2) var(--space-5) var(--space-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-subtle);
+  border-radius: var(--radius-md);
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  pointer-events: none;
+}
 .chat-input__textarea {
   width: 100%;
-  resize: vertical;
+  /* Autoexpansivo por JS (ver ChatInput.tsx, TEXTAREA_MAX_HEIGHT_PX) — sin resize manual, que
+     quedaba inconsistente con el alto calculado en cada tecleo. */
+  resize: none;
+  overflow-y: auto;
+  min-height: 40px;
   background: var(--bg-1);
   color: var(--text-primary);
   border: 1px solid var(--border);
@@ -319,15 +450,55 @@
   padding: var(--space-2) var(--space-3);
   font-family: inherit;
   font-size: var(--text-base);
+  line-height: var(--leading-normal);
   box-sizing: border-box;
 }
 .chat-input__textarea:focus-visible { border-color: var(--accent); }
-/* `flex-wrap` + `white-space: nowrap` en el hint (ítem #7, verificado a 960x600): sin esto, el
-   hint se angostaba tanto por el resto de los ítems que el texto se partía palabra por palabra
-   ("Ctrl" / "Enter" / "para" / "enviar" en líneas separadas). Ahora, si no entra en la fila con el
-   modelo/contexto y los botones, baja entero a una segunda línea. */
-.chat-input__actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; row-gap: 6px; gap: var(--space-3); margin-top: var(--space-2); }
-.chat-input__hint { font-size: var(--text-xs); color: var(--text-muted); margin-right: auto; white-space: nowrap; }
+
+/* Chips de adjuntos (rediseño del chat, punto 1) — arriba del textarea, removibles. */
+.chat-input__attachments { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 var(--space-2); padding: 0; }
+.chat-input__attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  padding: 3px 6px 3px 8px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  max-width: 220px;
+}
+.chat-input__attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-input__attachment-size { color: var(--text-muted); white-space: nowrap; }
+.chat-input__attachment-remove {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 2px;
+  border-radius: 50%;
+}
+.chat-input__attachment-remove:hover { background: var(--bg-4); color: var(--text-primary); }
+.chat-input__attach-error { font-size: var(--text-xs); color: var(--warning); margin: var(--space-1) 0 0; }
+
+/* Barra de menús del compositor (rediseño del chat, punto 1): adjuntar + modo + potencia +
+   permisos, compacta, en una sola fila bajo el textarea; modelo/contexto a la derecha. */
+.chat-input__toolbar { display: flex; align-items: center; gap: 6px; margin-top: var(--space-2); flex-wrap: wrap; }
+.chat-input__attach-button {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  /* El reset global `button { padding: 5px 12px }` (layout/theme.css) se come casi todo el ancho
+     de un botón CUADRADO de 26px si no se pisa acá (bug real: el ícono quedaba con 0px de ancho
+     disponible — verificado con getComputedStyle en una captura, el SVG medía 0x14). */
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.chat-input__attach-button:hover:not(:disabled) { color: var(--text-primary); border-color: var(--border-strong); }
+.chat-input__attach-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.chat-input__file-input { display: none; }
+.chat-input__spacer { flex: 1 1 auto; }
 .chat-input__model {
   display: inline-flex;
   align-items: center;
@@ -338,6 +509,12 @@
   white-space: nowrap;
 }
 .chat-input__context { color: var(--text-muted); }
+
+/* `flex-wrap` + `white-space: nowrap` en el hint (ítem #7, verificado a 960x600): sin esto, el
+   hint se angostaba tanto por el resto de los ítems que el texto se partía palabra por palabra
+   ("Ctrl" / "Enter" / "para" / "enviar" en líneas separadas). */
+.chat-input__actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; row-gap: 6px; gap: var(--space-3); margin-top: var(--space-2); }
+.chat-input__hint { font-size: var(--text-xs); color: var(--text-muted); margin-right: auto; white-space: nowrap; }
 .chat-input__send, .chat-input__cancel {
   border-radius: var(--radius-md);
   padding: 6px 16px;
@@ -346,6 +523,64 @@
 .chat-input__send:disabled { opacity: 0.5; cursor: not-allowed; }
 .chat-input__cancel { background: var(--danger-subtle); color: var(--danger); border: 1px solid var(--danger); }
 .chat-input__cancel:hover { background: var(--danger); color: var(--text-on-accent); }
+
+/* ── Menús desplegables del compositor: modo / potencia / permisos (ComposerMenus.tsx) ─────── */
+.composer-menu { position: relative; }
+.composer-menu__trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 4px 8px;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.composer-menu__trigger:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text-primary); }
+.composer-menu__trigger:disabled { opacity: 0.5; cursor: not-allowed; }
+.composer-menu__trigger-label { font-weight: 500; }
+.composer-menu__panel {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 260px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 6px;
+}
+.composer-menu__heading {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 4px 8px;
+}
+.composer-menu__option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.composer-menu__option:hover { background: var(--bg-3); }
+.composer-menu__option--active { background: var(--bg-4); }
+.composer-menu__option-title { display: flex; align-items: center; gap: 6px; font-size: var(--text-sm); font-weight: 600; color: var(--text-primary); }
+.composer-menu__option-desc { font-size: var(--text-xs); color: var(--text-muted); margin-top: 1px; }
+.composer-menu__risk-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+.composer-menu__risk-dot--low { background: var(--success); }
+.composer-menu__risk-dot--medium { background: var(--warning); }
+.composer-menu__risk-dot--high { background: var(--danger); }
 
 /* DelegationCard.tsx (doc 19 §2.6, E3a delegación) — mismos tokens que .tool-call-card. */
 .delegation-card {

@@ -1,17 +1,18 @@
-// Test de integración: createBuiltinTools() + ToolRegistry — doc 04 §4 (BuiltinToolName, 10 tools) +
-// doc 19 §2.5 (E3a: `delegate` se registra siempre, pero no forma parte de `DEFAULT_ALLOWED_TOOLS`).
+// Test de integración: createBuiltinTools() + ToolRegistry — doc 04 §4 (BuiltinToolName, 10 tools
+// MVP + `make_dir`, punto 4 del encargo v0.2.1) + doc 19 §2.5 (E3a: `delegate` se registra siempre,
+// pero no forma parte de `DEFAULT_ALLOWED_TOOLS`).
 import { describe, expect, it } from 'vitest';
 import { createBuiltinTools } from './index.js';
 import { createToolRegistry } from '../ToolRegistry.js';
 
 const EXPECTED_NAMES = [
   'list_files', 'search_code', 'read_file', 'read_output',
-  'edit_file', 'write_file', 'delete_file', 'run_command',
+  'edit_file', 'write_file', 'make_dir', 'delete_file', 'run_command',
   'task_update', 'finish', 'delegate',
 ];
 
 describe('tools/builtin (integración)', () => {
-  it('createBuiltinTools() produce las 10 builtins documentadas + delegate', () => {
+  it('createBuiltinTools() produce las 11 builtins documentadas + delegate', () => {
     const tools = createBuiltinTools();
     expect(tools.map((t) => t.name).sort()).toEqual([...EXPECTED_NAMES].sort());
   });
@@ -19,7 +20,7 @@ describe('tools/builtin (integración)', () => {
   it('todas registran en ToolRegistry sin colisión de nombres', () => {
     const registry = createToolRegistry();
     for (const t of createBuiltinTools()) registry.register(t);
-    expect(registry.list()).toHaveLength(11);
+    expect(registry.list()).toHaveLength(12);
   });
 
   it('el filtro por modo plan expone las 6 tools de solo lectura + finish/task_update/delegate', () => {
@@ -29,10 +30,10 @@ describe('tools/builtin (integración)', () => {
     expect(planNames).toEqual(['delegate', 'finish', 'list_files', 'read_file', 'read_output', 'search_code', 'task_update'].sort());
   });
 
-  it('el filtro por modo agent expone las 10 builtins + delegate', () => {
+  it('el filtro por modo agent expone las 11 builtins + delegate', () => {
     const registry = createToolRegistry();
     for (const t of createBuiltinTools()) registry.register(t);
-    expect(registry.list({ mode: 'agent' })).toHaveLength(11);
+    expect(registry.list({ mode: 'agent' })).toHaveLength(12);
   });
 
   it('cada tool tiene inputSchema derivado de argsSchema (z.toJSONSchema)', () => {

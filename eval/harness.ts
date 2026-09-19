@@ -384,6 +384,98 @@ async function findAwaitingPermissionCall(
   return calls.find((c) => c.status === 'awaiting_permission');
 }
 
+/** Hallazgo real (debug de esta sesión, ver TRASPASO.md): (g.1)/(g.3)/(q) reportaban "final=timeout"
+ *  con el archivo sin tocar / la delegación sin cerrar, pero NO por un run colgado — `RunController`
+ *  maneja correctamente cualquier cantidad de rondas ask/allow dentro de un mismo run (confirmado con
+ *  instrumentación + reproducción real contra Ollama: cuando se contestan TODAS las rondas, el
+ *  archivo se edita y el run llega a `completed`; ver también `RunController.test.ts`, "segundo
+ *  permiso dentro del mismo run"). La causa real es que estos pasos solo contestaban la PRIMERA
+ *  `awaiting_permission`: si el modelo falla el primer intento (ej. `edit_file` sin `read_file` previo
+ *  → "el archivo cambió desde que lo leíste") y reintenta con una tool call nueva, esa segunda
+ *  también es 'ask' bajo el preset 'strict' — y nadie la contestaba, dejando el run legítimamente
+ *  esperando para siempre (igual que en la UI real: un segundo permiso necesita una segunda
+ *  respuesta del usuario). `waitForRunState`/`waitForRunTerminalTolerant` (arriba) no sirven para un
+ *  loop de rondas porque cada llamada abre una suscripción NUEVA — si el run ya llegó a un estado
+ *  terminal entre rondas, esa suscripción tardía nunca ve el evento (ya se emitió) y reporta un
+ *  falso "timeout" (reproducido acá mismo durante el debug). Esta función usa una ÚNICA suscripción
+ *  para toda la vida del run, así ningún evento se pierde entre rondas. */
+function watchRun(runtime: GlobalRuntime, runId: string): {
+  collected: RunEvent[];
+  waitFor(predicate: (e: RunEvent) => boolean, timeoutMs: number): Promise<RunEvent>;
+  unsubscribe(): void;
+} {
+  const collected: RunEvent[] = [];
+  let onEvent: (() => void) | undefined;
+  const unsubscribe = runtime.events.subscribe((event) => {
+    if (event.runId !== runId) return;
+    collected.push(event);
+    onEvent?.();
+  });
+  function waitFor(predicate: (e: RunEvent) => boolean, timeoutMs: number): Promise<RunEvent> {
+    const already = collected.find(predicate);
+    if (already) return Promise.resolve(already);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { onEvent = undefined; reject(new Error(`timeout esperando evento en el run ${runId} (${timeoutMs}ms)`)); }, timeoutMs);
+      onEvent = () => {
+        const hit = collected.find(predicate);
+        if (hit) { clearTimeout(timer); onEvent = undefined; resolve(hit); }
+      };
+    });
+  }
+  return { collected, waitFor, unsubscribe };
+}
+
+const TERMINAL_RUN_STATES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+
+/** Contesta TODAS las rondas de `awaiting_permission` que aparezcan en el run (no solo la primera,
+ *  ver comentario de `watchRun`) hasta que llegue a un estado terminal o se agote `maxRounds`.
+ *  `answer` decide la respuesta para cada ronda (típicamente la misma para todas, `allow_once`). */
+async function driveThroughPermissionAsks(
+  runtime: GlobalRuntime, controller: RunController, runId: string,
+  answer: (toolCallId: string) => PermissionAnswer,
+  opts: { maxRounds?: number; perRoundTimeoutMs?: number } = {},
+): Promise<{ rounds: number; firstToolCallId: string | undefined; finalState: string }> {
+  const maxRounds = opts.maxRounds ?? 5;
+  const perRoundTimeoutMs = opts.perRoundTimeoutMs ?? 90_000;
+  const watch = watchRun(runtime, runId);
+  let rounds = 0;
+  let firstToolCallId: string | undefined;
+  let finalState = 'timeout';
+  try {
+    for (let i = 0; i < maxRounds; i += 1) {
+      let ev: RunEvent;
+      try {
+        ev = await watch.waitFor(
+          (e) => e.type === 'tool.permission' || (e.type === 'run.state' && TERMINAL_RUN_STATES.has(e.to)),
+          perRoundTimeoutMs,
+        );
+      } catch {
+        finalState = 'timeout';
+        break;
+      }
+      if (ev.type === 'run.state') { finalState = ev.to; break; }
+      // ev.type === 'tool.permission': puede que ya se haya contestado (si la proyección de
+      // tool_calls todavía no vio el evento) — `findAwaitingPermissionCall` confirma el estado real.
+      const pending = await findAwaitingPermissionCall(runtime, runId);
+      if (!pending || pending.id !== ev.request.toolCallId) continue; // ya no está pendiente, sigue el loop
+      if (rounds === 0) firstToolCallId = pending.id;
+      rounds += 1;
+      await controller.answerPermission(pending.id, answer(pending.id));
+    }
+    if (!TERMINAL_RUN_STATES.has(finalState)) {
+      try {
+        const ev = await watch.waitFor((e) => e.type === 'run.state' && TERMINAL_RUN_STATES.has(e.to), perRoundTimeoutMs);
+        if (ev.type === 'run.state') finalState = ev.to;
+      } catch {
+        finalState = 'timeout';
+      }
+    }
+  } finally {
+    watch.unsubscribe();
+  }
+  return { rounds, firstToolCallId, finalState };
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
   const projectDir = makeFixtureProject();
@@ -658,20 +750,18 @@ async function main(): Promise<void> {
       });
       writeFileSync(path.join(projectDir, 'src', 'ask1.ts'), 'export const ask1 = 1;\n', 'utf8');
       const runOnce = await askController.start(chatOnce.id, 'Editá src/ask1.ts: cambiá el valor de ask1 de 1 a 2, sin tocar nada más.', 'agent');
-      const waitAskOnce = await waitForRunState(runtime.events, runOnce.runId, 'awaiting_permission', 90_000);
-      const pendingOnce = waitAskOnce.finalState === 'awaiting_permission' ? await findAwaitingPermissionCall(runtime, runOnce.runId) : undefined;
-      if (pendingOnce) {
-        await askController.answerPermission(pendingOnce.id, { toolCallId: pendingOnce.id, answer: 'allow_once' });
-      }
-      const termOnce = await waitForRunTerminalTolerant(runtime.events, runOnce.runId, 90_000);
+      const driveOnce = await driveThroughPermissionAsks(
+        runtime, askController, runOnce.runId, (id) => ({ toolCallId: id, answer: 'allow_once' }),
+      );
       const ask1Content = readFileSync(path.join(projectDir, 'src', 'ask1.ts'), 'utf8');
-      const decisionsOnce = pendingOnce ? await runtime.persistence.repositories.permissionDecisions.listByToolCall(pendingOnce.id) : [];
-      const ok = waitAskOnce.finalState === 'awaiting_permission' && pendingOnce !== undefined
-        && termOnce.finalState === 'completed' && ask1Content.includes('2') && decisionsOnce.some((d) => d.decision === 'allow');
+      const decisionsOnce = driveOnce.firstToolCallId
+        ? await runtime.persistence.repositories.permissionDecisions.listByToolCall(driveOnce.firstToolCallId) : [];
+      const ok = driveOnce.rounds > 0
+        && driveOnce.finalState === 'completed' && ask1Content.includes('2') && decisionsOnce.some((d) => d.decision === 'allow');
       report(
         '(g.1) permiso ask -> allow_once: awaiting_permission, se aplica, permission_decisions registrada',
         ok,
-        `awaitingPermission=${waitAskOnce.finalState === 'awaiting_permission'} final=${termOnce.finalState} archivo="${ask1Content.trim()}" permission_decisions=${JSON.stringify(decisionsOnce)}`,
+        `rondas de permiso contestadas=${driveOnce.rounds} final=${driveOnce.finalState} archivo="${ask1Content.trim()}" permission_decisions=${JSON.stringify(decisionsOnce)}`,
       );
     } catch (err) {
       report('(g.1) permiso ask -> allow_once: awaiting_permission, se aplica, permission_decisions registrada', false, String((err as Error).stack ?? err));
@@ -714,21 +804,18 @@ async function main(): Promise<void> {
       });
       writeFileSync(path.join(projectDir, 'src', 'ask3.ts'), 'export const ask3 = 1;\n', 'utf8');
       const runAlways = await askController.start(chatAlways.id, 'Editá src/ask3.ts: cambiá el valor de ask3 de 1 a 2, sin tocar nada más.', 'agent');
-      const waitAskAlways = await waitForRunState(runtime.events, runAlways.runId, 'awaiting_permission', 90_000);
-      const pendingAlways = waitAskAlways.finalState === 'awaiting_permission' ? await findAwaitingPermissionCall(runtime, runAlways.runId) : undefined;
-      if (pendingAlways) {
-        await askController.answerPermission(pendingAlways.id, { toolCallId: pendingAlways.id, answer: 'allow_always', rememberScope: 'project' });
-      }
-      const termAlways = await waitForRunTerminalTolerant(runtime.events, runAlways.runId, 90_000);
+      const driveAlways = await driveThroughPermissionAsks(
+        runtime, askController, runAlways.runId, (id) => ({ toolCallId: id, answer: 'allow_always', rememberScope: 'project' }),
+      );
       const ask3Content = readFileSync(path.join(projectDir, 'src', 'ask3.ts'), 'utf8');
       const rulesAfter = await runtime.persistence.repositories.permissionRules.listApplicable(project.id);
       const editRule = rulesAfter.find((r) => r.toolName === 'edit_file' && r.scope === 'project' && r.decision === 'allow');
       editRuleForNextRun = editRule;
-      const ok = pendingAlways !== undefined && termAlways.finalState === 'completed' && ask3Content.includes('2') && editRule !== undefined;
+      const ok = driveAlways.rounds > 0 && driveAlways.finalState === 'completed' && ask3Content.includes('2') && editRule !== undefined;
       report(
         '(g.3) permiso ask -> allow_always (scope project): se aplica y persiste en permission_rules',
         ok,
-        `awaitingPermission=${waitAskAlways.finalState === 'awaiting_permission'} final=${termAlways.finalState} archivo="${ask3Content.trim()}"\n` +
+        `rondas de permiso contestadas=${driveAlways.rounds} final=${driveAlways.finalState} archivo="${ask3Content.trim()}"\n` +
           `permission_rules aplicables al proyecto: ${JSON.stringify(rulesAfter)}\nregla edit_file encontrada: ${JSON.stringify(editRule)}`,
       );
     } catch (err) {
@@ -1209,15 +1296,16 @@ async function main(): Promise<void> {
       // este paso, el run queda en awaiting_permission para siempre y el hallazgo real de esta
       // sesión (visto en la primera corrida del harness) es justamente eso: el paso reportaba
       // "timeout" no porque la delegación esté rota, sino porque nadie contestaba el pedido.
-      const waitAwaitDelegate = await waitForRunState(runtime.events, runDelegator.runId, 'awaiting_permission', 60_000)
-        .catch((err) => { log('(q): no se llegó a awaiting_permission (puede que el modelo no haya llamado a delegate):', String(err)); return undefined; });
-      const pendingDelegate = waitAwaitDelegate?.finalState === 'awaiting_permission'
-        ? await findAwaitingPermissionCall(runtime, runDelegator.runId)
-        : undefined;
-      if (pendingDelegate) {
-        await delegatorController.answerPermission(pendingDelegate.id, { toolCallId: pendingDelegate.id, answer: 'allow_once' });
-      }
-      const waitDelegator = await waitForRunTerminalTolerant(runtime.events, runDelegator.runId, 180_000);
+      // (ver comentario de `driveThroughPermissionAsks`, arriba): el modelo puede llamar `delegate`
+      // más de una vez en el mismo run (ej. si no queda conforme con el resultado del primer worker),
+      // y cada llamada nueva es su propia `ask` — contestar solo la primera deja el run colgado
+      // esperando una segunda respuesta que nunca llega.
+      const driveDelegate = await driveThroughPermissionAsks(
+        runtime, delegatorController, runDelegator.runId, (id) => ({ toolCallId: id, answer: 'allow_once' }),
+        { perRoundTimeoutMs: 180_000, maxRounds: 3 },
+      ).catch((err) => { log('(q): driveThroughPermissionAsks falló:', String(err)); return { rounds: 0, firstToolCallId: undefined, finalState: 'timeout' }; });
+      const pendingDelegate = driveDelegate.firstToolCallId ? { id: driveDelegate.firstToolCallId } : undefined;
+      const waitDelegator = { finalState: driveDelegate.finalState };
       const allEventsDelegator = runtime.events.since(runDelegator.runId, 0);
       const delegatedEvent = allEventsDelegator.find((e) => e.type === 'run.delegated') as Extract<RunEvent, { type: 'run.delegated' }> | undefined;
       const delegateToolCalls = (await runtime.persistence.repositories.toolCalls.listByRun(runDelegator.runId))

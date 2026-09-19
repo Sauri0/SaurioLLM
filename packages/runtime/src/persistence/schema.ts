@@ -16,6 +16,10 @@ export const projects = sqliteTable('projects', {
   createdAt: integer('created_at').notNull(),
   lastOpenedAt: integer('last_opened_at'),
   settingsJson: text('settings_json'),
+  // Punto 12 del encargo (migración 0006): `project:remove` saca el proyecto de `project:list`/
+  // `project:recent` sin borrar archivos ni historial — reabrirlo (project:open con el mismo path)
+  // lo reingresa a la lista.
+  removedFromRecents: integer('removed_from_recents').notNull().default(0),
 });
 
 export const agents = sqliteTable('agents', {
@@ -83,6 +87,12 @@ export const chats = sqliteTable('chats', {
   archived: integer('archived').notNull().default(0),
   // Doc 19 §2.1 (E3a delegación, migración 0005): chat hijo creado por `delegate` -> run padre.
   originRunId: text('origin_run_id'),
+  // Punto 1a/1b/12 del encargo (migración 0006). permissionPreset/effort: NULL = "usar la del
+  // agente" (RunController.applyChatPermissionPreset/applyChatEffort). deletedAt: soft-delete de
+  // chat:delete (ver comentario de la migración — no es un DELETE real por las FK sin cascade).
+  permissionPreset: text('permission_preset'),
+  effort: text('effort'),
+  deletedAt: integer('deleted_at'),
 });
 
 // ── 4.2 Runs y log de eventos (fuente de verdad) ─────────────────────────────

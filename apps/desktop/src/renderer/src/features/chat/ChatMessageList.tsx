@@ -1,5 +1,8 @@
-// Lista de mensajes con streaming, tarjetas de tool/permiso/checkpoint y run interrumpido
-// (doc 01 §4.1) — apps/desktop/src/renderer/src/features/chat/ChatMessageList.tsx.
+// Lista de mensajes: UN bloque "Actividad" por run (turnos internos, thinking, tool calls y
+// checkpoints agrupados, en su lugar cronológico) + el texto final limpio de cada turno — rediseño
+// del chat (feedback real v0.2.1: "el chat es confuso y muy cargado"; burbujas "AGENTE" vacías;
+// tarjetas de tool/checkpoint amontonadas al final en vez de en orden). apps/desktop/src/renderer/
+// src/features/chat/ChatMessageList.tsx.
 import { useEffect, useMemo, useRef } from 'react';
 import type { ChatMessage, Checkpoint, Locality, PermissionAnswer, ToolCallRecord } from '@saurio/shared';
 import { invoke } from '../../ipc/client.js';
@@ -7,11 +10,14 @@ import { useRunStore } from '../../stores/runStore.js';
 import { useChatStore } from '../../stores/chatStore.js';
 import { PermissionCard } from '../permissions/PermissionCard.js';
 import { MessageBubble } from './MessageBubble.js';
-import { ToolCallCard } from './ToolCallCard.js';
-import { DelegationCard } from './DelegationCard.js';
-import { CheckpointCard } from './CheckpointCard.js';
+import { ActivityBlock } from './ActivityBlock.js';
+import { RunCheckpointCard } from './RunCheckpointCard.js';
+import { SmallModelWarningBanner } from './SmallModelWarningBanner.js';
 import { InterruptedRunCard } from './InterruptedRunCard.js';
 import { OomLoadCard } from './OomLoadCard.js';
+import { groupMessagesIntoTurns, countTurnSteps, turnElapsedMs, type ActivityStep, type ChatTurn } from './activityGrouping.js';
+import { mergeRunCheckpoints } from './runCheckpoints.js';
+import { turnSummaryLabel, toolStepLabel } from './stepLabel.js';
 
 const TERMINAL_STATES = new Set(['completed', 'cancelled', 'failed', 'interrupted']);
 
@@ -45,6 +51,8 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
   const pendingPermissions = useRunStore((s) => s.pendingPermissions);
   const interrupted = useRunStore((s) => s.interrupted);
   const errorsByRun = useRunStore((s) => s.errorsByRun);
+  const activityByRun = useRunStore((s) => s.activityByRun);
+  const smallModelWarningByRun = useRunStore((s) => s.smallModelWarningByRun);
   // Doc 19 §2.6 (E3a delegación): DelegationCard necesita el childChatId de ESTA tool call puntual
   // para "ver conversación completa" — `run.delegated` no lleva `toolCallId` (doc 19 §2.3, literal),
   // así que se correlaciona por orden de aparición entre las tool calls `delegate` del run y los
@@ -54,19 +62,18 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
   const childChatIdByRun = useRunStore((s) => s.childChatIdByRun);
   const setCurrentChat = useChatStore((s) => s.setCurrentChat);
 
-  function renderToolCall(call: ToolCallRecord): React.JSX.Element {
-    if (call.toolName !== 'delegate') return <ToolCallCard key={call.id} call={call} />;
+  function resolveDelegationChatId(call: ToolCallRecord): string | undefined {
     const orderedIds = (toolCallOrderByRun[call.runId] ?? []).filter((id) => toolCalls[id]?.toolName === 'delegate');
     const delegateIndex = orderedIds.indexOf(call.id);
     const childRunId = delegateIndex >= 0 ? (childRunsByParent[call.runId] ?? [])[delegateIndex] : undefined;
-    const childChatId = childRunId ? childChatIdByRun[childRunId] : undefined;
-    return <DelegationCard key={call.id} call={call} childChatId={childChatId} onOpenChat={setCurrentChat} />;
+    return childRunId ? childChatIdByRun[childRunId] : undefined;
   }
 
   const activeRunId = useMemo(() => {
     const candidates = Object.entries(runChatIds).filter(([, c]) => c === chatId).map(([runId]) => runId);
     return candidates.find((runId) => !TERMINAL_STATES.has(runStates[runId] ?? '')) ?? candidates.at(-1);
   }, [runChatIds, runStates, chatId]);
+  const isActiveRunLive = activeRunId !== undefined && !TERMINAL_STATES.has(runStates[activeRunId] ?? '');
 
   const streamingMessage = useMemo(
     () => Object.values(streaming).find((m) => m.chatId === chatId),
@@ -81,6 +88,39 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
       .filter((call): call is NonNullable<typeof call> =>
         call !== undefined && (call.messageId === undefined || call.messageId === streamingMessage?.id));
   }, [activeRunId, toolCallOrderByRun, toolCalls, streamingMessage]);
+
+  const turns = useMemo(
+    () => groupMessagesIntoTurns(messages, toolCalls, checkpoints),
+    [messages, toolCalls, checkpoints],
+  );
+
+  // El turno en curso todavía no pasó por `groupMessagesIntoTurns` (sus tool calls tienen
+  // `messageId` sin resolver hasta que el mensaje en streaming cierra) — se le pegan los pasos vivos
+  // al ÚLTIMO turno siempre que haya un run activo (caso normal: mismo turno que recién abrió el
+  // usuario). Caso real, no tan raro: el turno YA tiene texto final (el modelo escribió algo) pero
+  // el run sigue — otra tool call, posiblemente esperando permiso, antes de seguir. Ahí el texto
+  // final anterior se DEMUEVE a paso interno (mismo criterio que `groupMessagesIntoTurns` usa para
+  // mensajes ya cerrados) y el nuevo texto en vivo (si lo hay) pasa a ser el final visible.
+  const lastTurn = turns.at(-1);
+  const liveAttachesToLastTurn = isActiveRunLive && lastTurn !== undefined;
+
+  function buildLiveSteps(): ActivityStep[] {
+    const steps: ActivityStep[] = [];
+    if (streamingMessage?.thinking && streamingMessage.thinking.trim().length > 0) {
+      steps.push({ kind: 'thinking', messageId: streamingMessage.id, text: streamingMessage.thinking });
+    }
+    for (const call of currentRunToolCalls) steps.push({ kind: 'tool', toolCall: call });
+    return steps;
+  }
+  const liveSteps = isActiveRunLive ? buildLiveSteps() : [];
+
+  function liveHeaderLabel(): string {
+    if (activeRunId && activityByRun[activeRunId]) return activityByRun[activeRunId]!.label;
+    const runningCall = [...currentRunToolCalls].reverse().find((c) => c.status === 'running' || c.status === 'awaiting_permission');
+    if (runningCall) return toolStepLabel(runningCall);
+    if (streamingMessage?.thinking && !streamingMessage.content) return 'Pensando…';
+    return 'Trabajando…';
+  }
 
   const chatInterrupted = useMemo(
     () => Object.values(interrupted).find((i) => i.chatId === chatId),
@@ -109,8 +149,7 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
     await invoke('run:continue', { runId });
   }
 
-  const pendingPermissionCount = Object.values(pendingPermissions)
-    .filter((req) => toolCalls[req.toolCallId]?.runId === activeRunId).length;
+  const pendingForActiveRun = Object.values(pendingPermissions).filter((req) => toolCalls[req.toolCallId]?.runId === activeRunId);
 
   // Scroll automático al fondo (UX estándar de chat): sin esto, un mensaje largo o una tarjeta
   // nueva (tool call, checkpoint, permiso) puede quedar fuera de la vista sin que el usuario note
@@ -120,10 +159,10 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
   const bottomRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' });
-  }, [messages.length, streamingMessage?.content, currentRunToolCalls.length, checkpoints.length, pendingPermissionCount, chatInterrupted, oomFailure]);
+  }, [messages.length, streamingMessage?.content, currentRunToolCalls.length, checkpoints.length, pendingForActiveRun.length, chatInterrupted, oomFailure]);
 
-  const isEmpty = messages.length === 0 && !streamingMessage && currentRunToolCalls.length === 0
-    && checkpoints.length === 0 && !chatInterrupted && pendingPermissionCount === 0 && !oomFailure;
+  const isEmpty = turns.length === 0 && liveSteps.length === 0 && !streamingMessage
+    && pendingForActiveRun.length === 0 && !chatInterrupted && !oomFailure;
 
   if (isEmpty) {
     return (
@@ -133,47 +172,96 @@ export function ChatMessageList({ chatId, onOpenDiff, currentModelLocality, curr
     );
   }
 
-  return (
-    <div className="chat-message-list">
-      {messages.map((message) => (
-        <div key={message.id} className="chat-message-list__group">
-          {/* `metricsByMessage` (runStore, en vivo) tiene prioridad; si el mensaje viene de
-              `chat:history` (recargó la app, nunca pasó por un evento en vivo en esta sesión) se cae
-              a `message.metrics` — ya persistido en `messages.response_metrics_json` desde antes de
-              esta tarea, pero `ChatMessage`/`MessageRepository` no lo exponían (cambio de esta tarea,
-              punto 4 del encargo: "mostrar tokens de entrada/salida"). */}
-          <MessageBubble
-            message={message}
-            metrics={metricsByMessage[message.id] ?? message.metrics}
-            currentModelLocality={currentModelLocality}
-          />
-          {Object.values(toolCalls)
-            .filter((call) => call.messageId === message.id)
-            .map((call) => renderToolCall(call))}
-        </div>
-      ))}
+  function renderTurn(turn: ChatTurn, isLastTurn: boolean): React.JSX.Element {
+    const attachLive = isLastTurn && liveAttachesToLastTurn;
+    // Si el turno YA tenía un texto final (el modelo escribió algo y el run siguió con más tool
+    // calls después) ese texto pasa a ser un paso interno más, en su lugar cronológico — el mismo
+    // criterio que usa `groupMessagesIntoTurns` para mensajes ya cerrados.
+    const priorFinalAsStep: ActivityStep[] = attachLive && turn.finalMessage && turn.finalMessage.content.trim().length > 0
+      ? [{ kind: 'text', messageId: turn.finalMessage.id, text: turn.finalMessage.content }]
+      : [];
+    const steps = attachLive ? [...turn.steps, ...priorFinalAsStep, ...liveSteps] : turn.steps;
+    const counts = countTurnSteps(steps);
+    const elapsed = turnElapsedMs(steps);
+    const headerLabel = attachLive ? liveHeaderLabel() : turnSummaryLabel(counts, elapsed);
+    const merged = mergeRunCheckpoints(turn.checkpoints);
+    // Mientras el turno está vivo, el texto final visible es el que va llegando por streaming AHORA
+    // (con cursor) — si todavía no hay nada nuevo (esperando permiso, pensando), no se muestra
+    // ningún texto final hasta que llegue. Si el turno ya cerró, es `turn.finalMessage` tal cual.
+    const finalContent = attachLive
+      ? (streamingMessage?.content ? { id: streamingMessage.id, role: 'assistant' as const, content: streamingMessage.content } : undefined)
+      : turn.finalMessage;
+    const turnPending = turn.runId
+      ? pendingForActiveRun.filter((req) => toolCalls[req.toolCallId]?.runId === turn.runId)
+      : (attachLive ? pendingForActiveRun : []);
+    // Punto 6 del rediseño: "modelo chico para modo Agente" — una sola vez por run.
+    const turnRunId = turn.runId ?? (attachLive ? activeRunId : undefined);
+    const smallModelWarning = turnRunId ? smallModelWarningByRun[turnRunId] : undefined;
 
-      {streamingMessage && (
-        <div className="chat-message-list__group">
-          <MessageBubble
-            message={{ id: streamingMessage.id, role: 'assistant', content: streamingMessage.content, thinking: streamingMessage.thinking || undefined }}
-            streaming
-            currentModelLocality={currentModelLocality}
-          />
-        </div>
-      )}
-
-      {currentRunToolCalls.map((call) => renderToolCall(call))}
-
-      {checkpoints.map((checkpoint) => (
-        <CheckpointCard key={checkpoint.id} checkpoint={checkpoint} onOpenDiff={onOpenDiff} />
-      ))}
-
-      {Object.values(pendingPermissions)
-        .filter((req) => toolCalls[req.toolCallId]?.runId === activeRunId)
-        .map((request) => (
+    return (
+      <div key={turn.id} className="chat-message-list__group">
+        {turn.userMessage && (
+          <MessageBubble message={turn.userMessage} currentModelLocality={currentModelLocality} />
+        )}
+        <ActivityBlock
+          steps={steps}
+          headerLabel={headerLabel}
+          live={attachLive}
+          resolveDelegationChatId={resolveDelegationChatId}
+          onOpenChat={setCurrentChat}
+        />
+        {smallModelWarning && (
+          <SmallModelWarningBanner modelName={smallModelWarning.modelRef.name} parameterSize={smallModelWarning.parameterSize} />
+        )}
+        {merged && <RunCheckpointCard merged={merged} onOpenDiff={onOpenDiff} />}
+        {turnPending.map((request) => (
           <PermissionCard key={request.toolCallId} request={request} onAnswer={(a) => void answerPermission(a)} />
         ))}
+        {finalContent && (
+          <MessageBubble
+            message={finalContent}
+            streaming={attachLive}
+            metrics={attachLive ? undefined : metricsByMessage[finalContent.id] ?? turn.finalMessage?.metrics}
+            currentModelLocality={currentModelLocality}
+          />
+        )}
+      </div>
+    );
+  }
+
+  // Actividad viva SIN NINGÚN turno donde colgarla — solo pasa si `turns` está vacío (el primer
+  // mensaje del usuario todavía no volvió como `message.done`, caso breve al arrancar un chat
+  // nuevo). Se muestra aparte, sin burbuja de usuario, al final de la lista.
+  const trailingLiveSteps = isActiveRunLive && !liveAttachesToLastTurn ? liveSteps : [];
+  const trailingPending = liveAttachesToLastTurn ? [] : pendingForActiveRun;
+
+  return (
+    <div className="chat-message-list">
+      {turns.map((turn, index) => renderTurn(turn, index === turns.length - 1))}
+
+      {(trailingLiveSteps.length > 0 || trailingPending.length > 0) && (
+        <div className="chat-message-list__group">
+          {trailingLiveSteps.length > 0 && (
+            <ActivityBlock
+              steps={trailingLiveSteps}
+              headerLabel={liveHeaderLabel()}
+              live
+              resolveDelegationChatId={resolveDelegationChatId}
+              onOpenChat={setCurrentChat}
+            />
+          )}
+          {trailingPending.map((request) => (
+            <PermissionCard key={request.toolCallId} request={request} onAnswer={(a) => void answerPermission(a)} />
+          ))}
+          {streamingMessage?.content && (
+            <MessageBubble
+              message={{ id: streamingMessage.id, role: 'assistant', content: streamingMessage.content }}
+              streaming
+              currentModelLocality={currentModelLocality}
+            />
+          )}
+        </div>
+      )}
 
       {chatInterrupted && (
         <InterruptedRunCard

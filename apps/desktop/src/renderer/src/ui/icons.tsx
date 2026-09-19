@@ -109,3 +109,13 @@ export function PanelRightIcon(props: SVGProps<SVGSVGElement>): React.JSX.Elemen
 export function CloseIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
   return <Svg {...props}><path d="M18 6 6 18M6 6l12 12" /></Svg>;
 }
+
+/** Rediseño del chat, punto 1: botón "adjuntar" del compositor. */
+export function PaperclipIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
+  return <Svg {...props}><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" /></Svg>;
+}
+
+/** Rediseño del chat, punto 1: chip de un adjunto tipo imagen. */
+export function ImageIcon(props: SVGProps<SVGSVGElement>): React.JSX.Element {
+  return <Svg {...props}><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></Svg>;
+}

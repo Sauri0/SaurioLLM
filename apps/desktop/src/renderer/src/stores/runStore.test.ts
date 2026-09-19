@@ -23,6 +23,9 @@ function emptyState(): Omit<RunStoreState, 'applyEvents' | 'clearChat' | 'dismis
     lastSeqByRun: {},
     childRunsByParent: {},
     childChatIdByRun: {},
+    activityByRun: {},
+    smallModelWarningByRun: {},
+    contextBudgetByChat: {},
   };
 }
 
@@ -153,6 +156,44 @@ describe('reduceRunEvent', () => {
     const event2: RunEvent = { ...event, seq: 2, childRunId: 'run-3', childChatId: 'chat-3' };
     const next2 = reduceRunEvent(next, event2);
     expect(next2.childRunsByParent['run-1']).toEqual(['run-2', 'run-3']);
+  });
+
+  it('guarda la última run.activity por run (rediseño del chat, línea viva de "Actividad")', () => {
+    const state = emptyState() as RunStoreState;
+    const first: RunEvent = { ...base, seq: 1, type: 'run.activity', phase: 'reading', label: 'Leyendo src/a.ts' };
+    let next = reduceRunEvent(state, first);
+    expect(next.activityByRun['run-1']).toEqual({ phase: 'reading', label: 'Leyendo src/a.ts', toolCallId: undefined, ts: 0 });
+
+    const second: RunEvent = { ...base, ts: 10, seq: 2, type: 'run.activity', phase: 'running_command', label: 'Ejecutando: npm test', toolCallId: 'tc1' };
+    next = reduceRunEvent(next, second);
+    expect(next.activityByRun['run-1']).toEqual({ phase: 'running_command', label: 'Ejecutando: npm test', toolCallId: 'tc1', ts: 10 });
+  });
+
+  it('guarda context.built por chat, con effectiveNumCtx (nunca el maximo teorico del modelo)', () => {
+    const state = emptyState() as RunStoreState;
+    const budget = {
+      numCtx: 262144, effectiveNumCtx: 8192, reserveForResponse: 512,
+      used: { system: 100, tools: 50, repoMap: 0, memory: 0, history: 200 }, totalUsed: 350, fits: true,
+    };
+    const event: RunEvent = { ...base, seq: 1, type: 'context.built', budget };
+    const next = reduceRunEvent(state, event);
+    expect(next.contextBudgetByChat['chat-1']).toEqual(budget);
+  });
+
+  it('guarda run.smallModelWarning una sola vez por run, sin pisarla en iteraciones siguientes', () => {
+    const state = emptyState() as RunStoreState;
+    const modelRef = { providerId: 'ollama' as const, name: 'qwen2.5:3b', locality: 'local' as const };
+    const first: RunEvent = { ...base, seq: 1, type: 'run.smallModelWarning', modelRef, parameterSize: '3B' };
+    let next = reduceRunEvent(state, first);
+    expect(next.smallModelWarningByRun['run-1']).toEqual({ modelRef, parameterSize: '3B' });
+
+    const second: RunEvent = {
+      ...base, seq: 2, type: 'run.smallModelWarning',
+      modelRef: { providerId: 'ollama', name: 'otro:1b', locality: 'local' }, parameterSize: '1B',
+    };
+    next = reduceRunEvent(next, second);
+    // No se pisa: sigue siendo el primer aviso visto para este run.
+    expect(next.smallModelWarningByRun['run-1']?.modelRef.name).toBe('qwen2.5:3b');
   });
 });
 

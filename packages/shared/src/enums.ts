@@ -82,3 +82,19 @@ export type MemoryConfidence = z.infer<typeof MemoryConfidence>;
  *  porque `AgentProfileSchema`/`AgentCreateInputSchema` sí cruzan `agents:*` (doc 19 §1.4). */
 export const PermissionPreset = z.enum(['strict', 'balanced', 'trusting']);
 export type PermissionPreset = z.infer<typeof PermissionPreset>;
+
+// ── Feedback real v0.2.1 (usuario, modo Agente): preset de permisos POR CHAT ─────────────────────
+// Distinto de `PermissionPreset` de arriba (ese es el preset de un AgentProfile, dimensión distinta):
+// este es el control que el usuario cambia en el chat mismo. 'ask': preguntar todo lo que no sea
+// lectura. 'edit_in_folder': ediciones dentro de la carpeta del proyecto sin preguntar, comandos
+// preguntan. 'full_in_folder': ediciones Y comandos dentro de la carpeta sin preguntar; git push, red
+// y rutas fuera de la carpeta preguntan igual. 'unrestricted' ("Sin límites"): no pregunta nada salvo
+// escribir dentro de `.git` del proyecto (protected paths, ver permissions/protected.ts) — requiere
+// confirmación explícita al activarlo y queda registrado en audit_log (packages/runtime/src/permissions).
+export const ChatPermissionPreset = z.enum(['ask', 'edit_in_folder', 'full_in_folder', 'unrestricted']);
+export type ChatPermissionPreset = z.infer<typeof ChatPermissionPreset>;
+
+// ── Feedback real v0.2.1: "effort" por chat — mapea a think off/low/high (o equivalente según
+// capabilities del modelo), numPredict y maxIterations (packages/runtime/src/agent/modelPolicy.ts). ──
+export const Effort = z.enum(['fast', 'balanced', 'deep']);
+export type Effort = z.infer<typeof Effort>;

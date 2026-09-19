@@ -41,7 +41,7 @@ import {
   defaultIdGenerator, systemClock,
 } from '@saurio/runtime/agent/index';
 import type { RunControllerDeps } from '@saurio/runtime/agent/RunController';
-import type { ModelContextProbe, LastReadHashes, ModelLayerCountProbe } from '@saurio/runtime/agent/ports';
+import type { ModelContextProbe, LastReadHashes, ModelLayerCountProbe, ModelParameterSizeProbe, ModelVisionProbe } from '@saurio/runtime/agent/ports';
 import type { DefaultNumCtxFor } from '@saurio/runtime/agent/defaults';
 import { recover as recoverRuns, type RecoverResult } from '@saurio/runtime/agent/recover';
 import { ensurePersonalProject } from '@saurio/runtime/agent/personalProject';
@@ -521,6 +521,21 @@ export function createProjectRuntime(
       return extractBlockCount(desc.modelInfo as Record<string, unknown> | undefined);
     },
   };
+  // Punto 10 del encargo (feedback real v0.2.1: aviso de "modelo chico" en modo agente). Mismo
+  // criterio que los dos probes de arriba.
+  const modelParameterSizeProbe: ModelParameterSizeProbe = {
+    async getParameterSize(ref) {
+      const desc = await runtime.modelManager.describeModel(ref);
+      return desc.parameterSize;
+    },
+  };
+  // Punto 1c/9 del encargo (adjuntos de imagen): "SOLO si el modelo tiene capability vision".
+  const modelVisionProbe: ModelVisionProbe = {
+    async hasVision(ref) {
+      const desc = await runtime.modelManager.describeModel(ref);
+      return desc.capabilities.vision;
+    },
+  };
 
   const deps: RunControllerDeps = {
     gateway: runtime.gateway,
@@ -551,6 +566,8 @@ export function createProjectRuntime(
     projectId: project.id,
     modelContextProbe,
     modelLayerCountProbe,
+    modelParameterSizeProbe,
+    modelVisionProbe,
     numCtxForModel: makeNumCtxForModel(runtime),
     readHashes: readTracker satisfies LastReadHashes,
   };

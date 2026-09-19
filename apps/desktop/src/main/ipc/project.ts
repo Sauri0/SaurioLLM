@@ -1,5 +1,6 @@
 // Handlers IPC del dominio "project" (doc 02 §1: apps/desktop/src/main/ipc/project.ts, doc 01 §6).
 // project:open abre un diálogo nativo (HostAdapter.showOpenDirectoryDialog) cuando no se pasa `path`.
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { ipc } from '@saurio/shared';
 import { PERSONAL_PROJECT_ID } from '@saurio/runtime/agent/personalProject';
@@ -39,6 +40,10 @@ export function registerProjectHandlers(host: RuntimeHost): void {
       const existing = (await repo.list()).find((p) => p.path === projectPath);
       if (existing) {
         await repo.touchLastOpened(existing.id, now);
+        // Punto 12 del encargo: reabrir un proyecto que se había sacado de "recientes"
+        // (project:remove) lo reingresa a la lista — abrirlo es una señal explícita de que el
+        // usuario lo quiere ahí de nuevo.
+        await repo.setRemovedFromRecents(existing.id, false);
         project = { ...existing, name: existing.name ?? path.basename(projectPath), lastOpenedAt: now };
       } else {
         project = { ...(await repo.create(fallback)), name: fallback.name, lastOpenedAt: now };
@@ -61,5 +66,34 @@ export function registerProjectHandlers(host: RuntimeHost): void {
     // Doc 19 §0 (E2a "Mis agentes"): el proyecto personal sintético (chats directos con un agente
     // fuera de cualquier proyecto abierto) nunca aparece en el selector visible de proyectos.
     return (await repo.list()).filter((p) => p.id !== PERSONAL_PROJECT_ID);
+  });
+
+  // Punto 12 del encargo ("proyectos persistentes como Claude Code/Codex"): lista de proyectos
+  // abiertos alguna vez, más reciente primero, con cantidad de chats y si la carpeta sigue
+  // existiendo — `folderExists` se resuelve acá (fs.existsSync, síncrono y barato) porque
+  // packages/runtime/src/persistence no debe importar `node:fs` (regla de esa zona, sin fs directo).
+  registerHandler('project:recent', ipc['project:recent'], async () => {
+    const repo = host.projectRepository;
+    if (!repo) return [];
+    const rows = await repo.listRecent();
+    return rows
+      .filter((r) => r.project.id !== PERSONAL_PROJECT_ID)
+      .map((r) => ({
+        id: r.project.id, path: r.project.path, name: r.project.name,
+        lastOpenedAt: r.project.lastOpenedAt, chatCount: r.chatCount,
+        folderExists: existsSync(r.project.path),
+      }));
+  });
+
+  registerHandler('project:remove', ipc['project:remove'], async (input) => {
+    const repo = host.projectRepository;
+    if (!repo) return;
+    await repo.setRemovedFromRecents(input.id, true);
+  });
+
+  registerHandler('project:rename', ipc['project:rename'], async (input) => {
+    const repo = host.projectRepository;
+    if (!repo) throw new Error('saurio: sin runtime real, no se puede renombrar el proyecto');
+    return repo.rename(input.id, input.name);
   });
 }

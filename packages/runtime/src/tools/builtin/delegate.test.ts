@@ -12,6 +12,7 @@ function fakeCtx(): ToolContext {
       readFile: async () => { throw new Error('no fs'); },
       writeFileAtomic: async () => { throw new Error('no fs'); },
       deleteFile: async () => { throw new Error('no fs'); },
+      makeDir: async () => { throw new Error('no fs'); },
       listDir: async () => [],
       isProtected: () => false,
       isIgnored: () => false,

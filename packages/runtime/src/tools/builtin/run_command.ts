@@ -38,17 +38,52 @@ function commandExists(name: string): boolean {
 
 let cachedShell: { exe: string; buildArgs: (cmd: string) => string[] } | undefined;
 
+/** Feedback real v0.2.1, punto 6: "quitar códigos ANSI en origen" — `$PSStyle.OutputRendering` solo
+ *  existe en PowerShell 7.2+ (pwsh.exe); asignarlo contra powershell.exe 5.1 (sin `$PSStyle`) rompería
+ *  el comando, así que solo se antepone cuando de verdad se va a correr pwsh. */
+const PWSH_PLAINTEXT_PREFIX = "$PSStyle.OutputRendering='PlainText';";
+
 /** COMPROBADO EN EQUIPO (N:\saurio-smoke\RESULTADOS-electron.md): pwsh 7 no está instalado acá;
- *  usar powershell.exe por defecto y pwsh.exe solo si existe. bash en POSIX. */
-function resolveShell(): { exe: string; buildArgs: (cmd: string) => string[] } {
+ *  usar powershell.exe por defecto y pwsh.exe solo si existe. bash en POSIX. Exportada (además de
+ *  usarla `run_command` acá abajo) para que `agent/environmentPrompt.ts` describa el shell REAL en
+ *  el system prompt (punto 3 del encargo) sin duplicar la detección de `pwsh`/`where`. */
+export function resolveShell(): { exe: string; buildArgs: (cmd: string) => string[] } {
   if (cachedShell) return cachedShell;
   if (process.platform === 'win32') {
-    const exe = commandExists('pwsh') ? 'pwsh.exe' : 'powershell.exe';
-    cachedShell = { exe, buildArgs: (cmd) => ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', cmd] };
+    const isPwsh = commandExists('pwsh');
+    const exe = isPwsh ? 'pwsh.exe' : 'powershell.exe';
+    cachedShell = {
+      exe,
+      buildArgs: (cmd) => ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', isPwsh ? `${PWSH_PLAINTEXT_PREFIX}${cmd}` : cmd],
+    };
   } else {
     cachedShell = { exe: 'bash', buildArgs: (cmd) => ['-c', cmd] };
   }
   return cachedShell;
+}
+
+/** Red de seguridad además de NO_COLOR/TERM=dumb/$PSStyle (arriba): algunos programas emiten
+ *  secuencias ANSI igual (no todos respetan esas convenciones). Regex estándar (equivalente al
+ *  paquete `ansi-regex`) — feedback real v0.2.1, punto 6: "la salida de run_command llega con
+ *  códigos ANSI ([32;1m...)". */
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE_RE = /[\u001B\u009B][[\]()#;?]*(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007|(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~])/g;
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_ESCAPE_RE, '');
+}
+
+/** Feedback real v0.2.1, punto 5: "si run_command cambia archivos dentro del workspace, no se inventa
+ *  un checkpoint: se informa". `run_command` no puede detectar cambios con el mecanismo before/after
+ *  de `checkpoint.ts` (no sabe de antemano qué paths va a tocar), así que usa `git status --porcelain`
+ *  como evidencia barata y de solo lectura cuando el proyecto es un repo git; si no hay `.git` o `git`
+ *  no está instalado, no hay forma barata de saberlo y se omite la nota (limitación documentada, no se
+ *  inventa un escaneo recursivo del filesystem por costo). */
+function gitStatusSnapshot(cwd: string): string | undefined {
+  try {
+    return execFileSyncHidden('git', ['status', '--porcelain'], { cwd, stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
+  } catch {
+    return undefined;
+  }
 }
 
 const INSTALL_PATTERN = /\b(npm|pnpm|yarn|pip|pip3|cargo|go)\s+(install|add|get)\b/i;
@@ -86,7 +121,14 @@ function killTree(pid: number): void {
 
 function spawnAndCollect(exe: string, args: string[], cwd: string, timeoutMs: number, signal: AbortSignal, onChunk: (text: string) => void): Promise<RunOutcome> {
   return new Promise((resolve) => {
-    const child = spawn(exe, args, { cwd, windowsHide: true, detached: process.platform !== 'win32' });
+    // Feedback real v0.2.1, punto 6: NO_COLOR/TERM=dumb en el entorno del hijo — convención que
+    // respetan la mayoría de las CLIs modernas (npm, git, eslint, etc.) para no emitir ANSI. No es
+    // suficiente por sí sola (algunos programas la ignoran), por eso además está `$PSStyle` en pwsh
+    // (resolveShell) y el strip por regex más abajo (`stripAnsi`) como última red de seguridad.
+    const child = spawn(exe, args, {
+      cwd, windowsHide: true, detached: process.platform !== 'win32',
+      env: { ...process.env, NO_COLOR: '1', TERM: 'dumb' },
+    });
     let out = '';
     let timedOut = false;
     let cancelled = false;
@@ -101,8 +143,8 @@ function spawnAndCollect(exe: string, args: string[], cwd: string, timeoutMs: nu
     };
     signal.addEventListener('abort', onAbort, { once: true });
 
-    child.stdout.on('data', (chunk: Buffer) => { const t = chunk.toString('utf8'); out += t; onChunk(t); });
-    child.stderr.on('data', (chunk: Buffer) => { const t = chunk.toString('utf8'); out += t; onChunk(t); });
+    child.stdout.on('data', (chunk: Buffer) => { const t = stripAnsi(chunk.toString('utf8')); out += t; onChunk(t); });
+    child.stderr.on('data', (chunk: Buffer) => { const t = stripAnsi(chunk.toString('utf8')); out += t; onChunk(t); });
     child.on('close', (code, sig) => {
       clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
@@ -142,9 +184,17 @@ export function createRunCommandTool(deps: BuiltinToolsDeps): ToolDefinition<Arg
       const cwd = args.cwd ? ctx.fs.resolve(args.cwd) : ctx.cwd;
       const timeoutMs = Math.min(args.timeout ?? deps.defaultCommandTimeoutMs, deps.maxCommandTimeoutMs);
 
+      const gitStatusBefore = gitStatusSnapshot(cwd);
       const outcome = await spawnAndCollect(shell.exe, shell.buildArgs(args.command), cwd, timeoutMs, ctx.signal, (chunk) => {
         ctx.emit({ toolCallId: ctx.toolCallId, text: chunk });
       });
+      const gitStatusAfter = gitStatusSnapshot(cwd);
+      // Punto 5 del encargo: `run_command` es `mutating: true` pero nunca puebla `checkpoint.before/
+      // after` (no sabe de antemano qué paths va a tocar) — RunController ya no crea un checkpoint
+      // vacío para esto (agent/RunController.ts, gate por `checkpoint.files.length > 0`); acá se avisa
+      // con evidencia real cuando hay repo git y el estado cambió, en vez de inventar un escaneo caro
+      // del filesystem o quedarse callado.
+      const possiblyChangedFiles = gitStatusBefore !== undefined && gitStatusAfter !== undefined && gitStatusBefore !== gitStatusAfter;
 
       let fullOutputPath: string | undefined;
       const { text: preview, truncated } = truncateHeadTail(outcome.text);
@@ -158,15 +208,19 @@ export function createRunCommandTool(deps: BuiltinToolsDeps): ToolDefinition<Arg
         }
       }
 
+      const changedFilesNote = possiblyChangedFiles
+        ? '\n[Nota: este comando cambió archivos dentro del workspace; el revert de checkpoints no lo cubre.]'
+        : '';
+
       if (outcome.cancelled) {
-        return { content: [{ type: 'text', text: `comando cancelado\n${preview}` }], isError: true, truncated, fullOutputPath };
+        return { content: [{ type: 'text', text: `comando cancelado\n${preview}${changedFilesNote}` }], isError: true, truncated, fullOutputPath };
       }
       if (outcome.timedOut) {
-        return { content: [{ type: 'text', text: `comando excedió el timeout de ${timeoutMs}ms y fue terminado\n${preview}` }], isError: true, truncated, fullOutputPath };
+        return { content: [{ type: 'text', text: `comando excedió el timeout de ${timeoutMs}ms y fue terminado\n${preview}${changedFilesNote}` }], isError: true, truncated, fullOutputPath };
       }
       const isError = outcome.exitCode !== 0;
       return {
-        content: [{ type: 'text', text: `[exit ${outcome.exitCode ?? 'null'}]\n${preview}` }],
+        content: [{ type: 'text', text: `[exit ${outcome.exitCode ?? 'null'}]\n${preview}${changedFilesNote}` }],
         isError,
         truncated,
         fullOutputPath,

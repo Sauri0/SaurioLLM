@@ -256,3 +256,56 @@ describe('rememberOptions sugeridas', () => {
     }
   });
 });
+
+// Feedback real v0.2.1, punto 1a/8: los 4 presets por-CHAT nuevos (chat:setPermissionPreset),
+// distintos de strict/balanced/trusting (esos son por-agente).
+describe('preset por-chat "ask" (preguntar todo lo que no sea lectura)', () => {
+  it('read -> allow, todo lo demás -> ask', () => {
+    expect(decisionKind(engine.evaluate(call({ category: 'read', toolName: 'read_file', paths: ['x.ts'] }), 'agent', policy([], 'ask')))).toBe('allow');
+    expect(decisionKind(engine.evaluate(call({ category: 'write', toolName: 'write_file', paths: ['x.ts'] }), 'agent', policy([], 'ask')))).toBe('ask');
+    expect(decisionKind(engine.evaluate(call({ category: 'delete', toolName: 'delete_file', paths: ['x.ts'] }), 'agent', policy([], 'ask')))).toBe('ask');
+    expect(decisionKind(engine.evaluate(call({ category: 'terminal', toolName: 'run_command', command: 'ls' }), 'agent', policy([], 'ask')))).toBe('ask');
+  });
+});
+
+describe('preset por-chat "edit_in_folder" (ediciones sin preguntar, comandos preguntan)', () => {
+  it('write/delete -> allow; terminal -> ask', () => {
+    expect(decisionKind(engine.evaluate(call({ category: 'write', toolName: 'write_file', paths: ['x.ts'] }), 'agent', policy([], 'edit_in_folder')))).toBe('allow');
+    expect(decisionKind(engine.evaluate(call({ category: 'delete', toolName: 'delete_file', paths: ['x.ts'] }), 'agent', policy([], 'edit_in_folder')))).toBe('allow');
+    expect(decisionKind(engine.evaluate(call({ category: 'terminal', toolName: 'run_command', command: 'npm test' }), 'agent', policy([], 'edit_in_folder')))).toBe('ask');
+  });
+  it('escritura en protected path sigue en deny (invariante, ningún preset lo destraba)', () => {
+    const d = engine.evaluate(call({ category: 'write', toolName: 'write_file', paths: ['.env'] }), 'agent', policy([], 'edit_in_folder'));
+    expect(decisionKind(d)).toBe('deny');
+  });
+});
+
+describe('preset por-chat "full_in_folder" (ediciones Y comandos sin preguntar; git_push/red preguntan)', () => {
+  it('write/delete/terminal/git_commit -> allow', () => {
+    expect(decisionKind(engine.evaluate(call({ category: 'write', toolName: 'write_file', paths: ['x.ts'] }), 'agent', policy([], 'full_in_folder')))).toBe('allow');
+    expect(decisionKind(engine.evaluate(call({ category: 'terminal', toolName: 'run_command', command: 'npm test' }), 'agent', policy([], 'full_in_folder')))).toBe('allow');
+    expect(decisionKind(engine.evaluate(call({ category: 'git_commit', toolName: 'run_command', command: 'git commit -m x' }), 'agent', policy([], 'full_in_folder')))).toBe('allow');
+  });
+  it('git_push y network siguen en ask', () => {
+    expect(decisionKind(engine.evaluate(call({ category: 'git_push', toolName: 'run_command', command: 'git push' }), 'agent', policy([], 'full_in_folder')))).toBe('ask');
+    expect(decisionKind(engine.evaluate(call({ category: 'network', toolName: 'run_command', command: 'curl x' }), 'agent', policy([], 'full_in_folder')))).toBe('ask');
+  });
+});
+
+describe('preset por-chat "unrestricted" ("Sin límites")', () => {
+  it('no pregunta nada: write/delete/terminal/git_push/network -> allow', () => {
+    expect(decisionKind(engine.evaluate(call({ category: 'write', toolName: 'write_file', paths: ['x.ts'] }), 'agent', policy([], 'unrestricted')))).toBe('allow');
+    expect(decisionKind(engine.evaluate(call({ category: 'delete', toolName: 'delete_file', paths: ['x.ts'] }), 'agent', policy([], 'unrestricted')))).toBe('allow');
+    expect(decisionKind(engine.evaluate(call({ category: 'terminal', toolName: 'run_command', command: 'npm test' }), 'agent', policy([], 'unrestricted')))).toBe('allow');
+    expect(decisionKind(engine.evaluate(call({ category: 'git_push', toolName: 'run_command', command: 'git push' }), 'agent', policy([], 'unrestricted')))).toBe('allow');
+  });
+  it('igual bloquea escribir dentro de .git del proyecto (excepción explícita del encargo)', () => {
+    const d = engine.evaluate(call({ category: 'write', toolName: 'write_file', paths: ['.git/config'] }), 'agent', policy([], 'unrestricted'));
+    expect(decisionKind(d)).toBe('deny');
+  });
+  it('un comando crítico (rm -rf de la raíz) sigue pidiendo confirmación, incluso "sin límites"', () => {
+    const d = engine.evaluate(call({ category: 'terminal', toolName: 'run_command', command: 'rm -rf /' }), 'agent', policy([], 'unrestricted'));
+    expect(decisionKind(d)).toBe('ask');
+    if (d.decision === 'ask') expect(d.request.forceWarning).toBe(true);
+  });
+});

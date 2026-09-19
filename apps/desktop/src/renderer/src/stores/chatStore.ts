@@ -1,7 +1,7 @@
 // chatStore: chats por proyecto + historial cargado (doc 01 §4.1, doc 04 §16 `chat:create/list/history`)
 // — apps/desktop/src/renderer/src/stores/chatStore.ts.
 import { create } from 'zustand';
-import type { Chat, IpcOutput, Mode, ModelRef, ToolCallRecord } from '@saurio/shared';
+import type { Chat, ChatPermissionPreset, Effort, IpcOutput, Mode, ModelRef, ToolCallRecord } from '@saurio/shared';
 import { invoke } from '../ipc/client.js';
 import { useRunStore } from './runStore.js';
 
@@ -57,6 +57,13 @@ export interface ChatStoreState {
    *  próximo `run:start`/`run:continue` de este chat toma el valor nuevo. */
   setChatModel: (chatId: string, modelRef: ModelRef) => Promise<void>;
   setChatMode: (chatId: string, mode: Mode) => Promise<void>;
+  /** Compositor del chat (rediseño, punto 1): preset de permisos y potencia (effort) del chat.
+   *  `chat:setPermissionPreset`/`chat:setEffort` — contrato aditivo de packages/shared (feedback
+   *  real v0.2.1, puntos 1a/1b). `'unrestricted'` exige `confirmed: true` explícito del lado del
+   *  handler; acá se pide esa confirmación ANTES de invocar (nunca se manda `confirmed` a ciegas),
+   *  mismo patrón que la confirmación de modelo NUBE de `setChatModel` de arriba. */
+  setChatPermissionPreset: (chatId: string, preset: ChatPermissionPreset, confirmed?: boolean) => Promise<void>;
+  setChatEffort: (chatId: string, effort: Effort) => Promise<void>;
 }
 
 /** Reemplaza un chat por su versión actualizada dentro de `chatsByProject`, sin tocar otros proyectos. */
@@ -189,5 +196,15 @@ export const useChatStore = create<ChatStoreState>((set) => ({
       chatsByProject: replaceChat(state.chatsByProject, updated),
       modeByChat: { ...state.modeByChat, [chatId]: mode },
     }));
+  },
+
+  setChatPermissionPreset: async (chatId, preset, confirmed) => {
+    const updated = await invoke('chat:setPermissionPreset', { chatId, preset, confirmed });
+    set((state) => ({ chatsByProject: replaceChat(state.chatsByProject, updated) }));
+  },
+
+  setChatEffort: async (chatId, effort) => {
+    const updated = await invoke('chat:setEffort', { chatId, effort });
+    set((state) => ({ chatsByProject: replaceChat(state.chatsByProject, updated) }));
   },
 }));

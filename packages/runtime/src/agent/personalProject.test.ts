@@ -12,6 +12,15 @@ function fakeProjectRepository(): ProjectRepository {
     async get(id) { return store.get(id); },
     async list() { return [...store.values()]; },
     async touchLastOpened() {},
+    async listRecent() { return [...store.values()].map((project) => ({ project, chatCount: 0 })); },
+    async setRemovedFromRecents() {},
+    async rename(id, name) {
+      const current = store.get(id);
+      if (!current) throw new Error('proyecto inexistente');
+      const updated = { ...current, name };
+      store.set(id, updated);
+      return updated;
+    },
   };
 }
 

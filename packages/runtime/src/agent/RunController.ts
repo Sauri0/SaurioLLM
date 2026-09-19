@@ -14,6 +14,7 @@
 import type {
   Mode, RunState, ChatMessage, ToolCall, ToolResult, PermissionAnswer, PermissionRequest,
   RunError as RunErrorShared, ResponseMetrics, ToolTransport, DelegationRequest, DelegationResult,
+  ChatPermissionPreset, Effort, RunActivityPhase, Attachment,
 } from '@saurio/shared';
 import { DelegationRequestSchema, DelegationResultSchema } from '@saurio/shared';
 import type { ModelGateway, ChatRequest, JsonSchemaTool } from '../gateway/types.js';
@@ -22,6 +23,7 @@ import type {
   WorkspaceFs,
 } from '../tools/types.js';
 import type { PermissionEngine } from '../permissions/types.js';
+import { toAgentLevelPreset } from '../permissions/engine.js';
 import type { PermissionMemory } from '../permissions/memory.js';
 import type { CheckpointService } from '../checkpoint/types.js';
 import type { ContextBuilder, RepoMapClient, CompactionResult } from '../context/types.js';
@@ -34,7 +36,7 @@ import type {
 } from './types.js';
 import type {
   RunRepository, RunRecord, AgentConfigResolver, Clock, IdGenerator, OrphanDiagnostics, ModelContextProbe,
-  LastReadHashes, ModelLayerCountProbe, AgentProfilePort,
+  LastReadHashes, ModelLayerCountProbe, AgentProfilePort, ModelParameterSizeProbe, ModelVisionProbe,
 } from './ports.js';
 import { RunStateMachine } from './RunStateMachine.js';
 import { LoopDetector } from './LoopDetector.js';
@@ -42,6 +44,44 @@ import { DegenerationDetector } from './DegenerationDetector.js';
 import { MessageDeltaBatcher } from './deltaBatcher.js';
 import { hashArgs } from './hash.js';
 import { recover as recoverRuns, synthesizeInterruptedResultMessage, type RecoverResult } from './recover.js';
+import { buildEnvironmentPrompt } from './environmentPrompt.js';
+
+/** Punto 1c/9 del encargo: tope de caracteres por adjunto de texto (no confundir con el límite de
+ *  tamaño de ARCHIVO, que aplica el host antes de siquiera llamar a `start()` — ver
+ *  apps/desktop/src/main/ipc/run.ts). Este es el tope de lo que entra al prompt en sí. */
+const MAX_ATTACHMENT_TEXT_CHARS = 20_000;
+
+/** Construye el bloque de contexto acotado de los adjuntos `kind: 'file'` (punto 1c/9 del encargo).
+ *  Ignora silenciosamente un adjunto sin `dataBase64` (nada que insertar) en vez de fallar todo el
+ *  run por un adjunto mal formado — el host ya valida esto antes de llamar a `start()`. */
+function buildAttachmentContextBlock(attachments: Attachment[]): string {
+  const blocks = attachments
+    .filter((a) => a.kind === 'file' && a.dataBase64)
+    .map((a) => {
+      const raw = Buffer.from(a.dataBase64!, 'base64').toString('utf8');
+      const truncated = raw.length > MAX_ATTACHMENT_TEXT_CHARS;
+      const body = truncated
+        ? `${raw.slice(0, MAX_ATTACHMENT_TEXT_CHARS)}\n…[adjunto truncado, ${raw.length} chars totales]…`
+        : raw;
+      return `--- Adjunto: ${a.name} ---\n${body}\n--- fin de ${a.name} ---`;
+    });
+  return blocks.length > 0 ? `\n\n${blocks.join('\n\n')}` : '';
+}
+
+/** Punto 10 del encargo: "< ~7B parámetros" — umbral aproximado, documentado como tal (no hay una
+ *  línea oficial entre "chico" y "grande"; 7B es el tamaño de referencia que ya usa este repo para
+ *  qwen2.5-coder:7b/qwen3:8b, docs/MANUAL.md). */
+const SMALL_MODEL_THRESHOLD_B = 7;
+
+/** Parsea `ModelInfo.parameterSize` (ej. "8B", "3.8B", "270M", "1.5b") a billones de parámetros.
+ *  `undefined` ante cualquier formato no reconocido — nunca se inventa un tamaño. */
+function parseParameterSizeBillions(raw: string): number | undefined {
+  const match = /^([\d.]+)\s*([BM])$/i.exec(raw.trim());
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value)) return undefined;
+  return match[2]!.toUpperCase() === 'M' ? value / 1000 : value;
+}
 
 const MUTATING_ERROR_RETRY_CODES = new Set(['connection_refused', 'stream_cut']);
 const BUSY_RETRY_CODE = 'server_busy';
@@ -127,6 +167,14 @@ export interface RunControllerDeps {
    *  `delegate` no trae `targetAgentId` (ver `AgentProfilePort`, ports.ts). Opcional: sin esto,
    *  delegar sin destino explícito falla con un `ToolResult` de error en vez de romper el run. */
   agentProfiles?: AgentProfilePort;
+  /** Punto 10 del encargo (feedback real v0.2.1): permite emitir `run.smallModelWarning` una sola
+   *  vez por run cuando el modelo tiene < ~7B parámetros y `mode === 'agent'`. Opcional: sin esto,
+   *  el aviso nunca se emite (comportamiento previo — no existía). */
+  modelParameterSizeProbe?: ModelParameterSizeProbe;
+  /** Punto 1c/9 del encargo (feedback real v0.2.1): permite validar `ModelCapabilities.vision` antes
+   *  de aceptar un adjunto de imagen — sin este puerto, cualquier adjunto de imagen falla con un
+   *  error accionable (conservador: nunca se asume soporte de visión sin poder confirmarlo). */
+  modelVisionProbe?: ModelVisionProbe;
   /** Cambio aditivo mínimo (encargo de apps/desktop, punto 5: "numCtx por defecto por modelo desde
    *  Ajustes debe llegar al runtime"; packages/runtime no es zona de ese encargo — documentado acá y
    *  en docs/architecture/16-estado-de-implementacion.md). Se consulta en `prepareAndQueue` ANTES del
@@ -201,7 +249,7 @@ export class RunController implements RunControllerContract {
 
   // ── API pública (doc 04 §5) ────────────────────────────────────────────
 
-  async start(chatId: string, text: string, mode: Mode): Promise<{ runId: string }> {
+  async start(chatId: string, text: string, mode: Mode, attachments?: Attachment[]): Promise<{ runId: string }> {
     const chat = await this.deps.chats.get(chatId);
     if (!chat) throw new Error(`Chat inexistente: ${chatId}`);
 
@@ -214,7 +262,20 @@ export class RunController implements RunControllerContract {
     // El modelo efectivo del run sale del chat cuando el chat tiene uno elegido (doc 03 §4.1
     // `chats.model_ref_json`); si no, del agente. Antes de la integración el chat.modelRef se perdía.
     const withModel: AgentConfig = chat.modelRef ? { ...resolvedAgent, model: chat.modelRef } : resolvedAgent;
-    const agent = await this.withPersistedRules(withModel);
+    const agent = this.applyChatPermissionPreset(this.applyChatEffort(await this.withPersistedRules(withModel), chat), chat);
+
+    // Punto 1c/9 del encargo: se valida ANTES de crear la fila del run (nunca queda un run
+    // 'created' colgado por un adjunto rechazado). 'ask'/errores de capability nunca son silenciosos
+    // (regla 6 de la columna): si no se puede CONFIRMAR que el modelo tiene vision, se rechaza.
+    const imageAttachments = (attachments ?? []).filter((a) => a.kind === 'image');
+    if (imageAttachments.length > 0) {
+      const hasVision = await this.deps.modelVisionProbe?.hasVision(agent.model);
+      if (hasVision !== true) {
+        throw new Error(
+          `saurio: el modelo "${agent.model.name}" no confirma soporte de imágenes (vision) — no se puede adjuntar una imagen a este chat con este modelo.`,
+        );
+      }
+    }
     const runId = this.deps.ids.next();
 
     // Doc 19 §2.1/§2.5 (E3a delegación): un chat CREADO POR `delegate` trae `chats.origin_run_id`
@@ -245,7 +306,16 @@ export class RunController implements RunControllerContract {
     // misma fila `messages.id` dos veces y violaba la UNIQUE constraint en la primera SQLite real
     // contra la que corrió un run completo; los tests unitarios no lo detectaban porque no cruzan
     // EventStore real + MessageRepository real en el mismo run.
-    const userMessage: ChatMessage = { id: this.deps.ids.next(), role: 'user', content: text };
+    // Punto 1c/9 del encargo: adjuntos de texto se insertan como bloque de contexto acotado (con
+    // nombre y truncado, `buildAttachmentContextBlock`); imágenes van al campo `images` (formato
+    // Ollama-nativo, `gateway/providers/ollama/mappers.ts`) — openai-compat/Anthropic no mapean
+    // `ChatMessage.images` hoy (sus `mappers.ts` no lo leen); documentado como límite conocido en vez
+    // de mandar la imagen y que se pierda en silencio.
+    const attachmentBlock = buildAttachmentContextBlock(attachments ?? []);
+    const userMessage: ChatMessage = {
+      id: this.deps.ids.next(), role: 'user', content: `${text}${attachmentBlock}`,
+      ...(imageAttachments.length > 0 ? { images: imageAttachments.map((a) => a.dataBase64).filter((d): d is string => Boolean(d)) } : {}),
+    };
     this.deps.events.append({
       runId, chatId, ts: this.deps.clock.now(), type: 'message.done',
       message: userMessage, metrics: { quality: 'unavailable' },
@@ -300,7 +370,10 @@ export class RunController implements RunControllerContract {
       ...(prev.effectiveConfig ? { model: prev.effectiveConfig.model } : {}),
       maxIterations: baseAgent.maxIterations + (extraIterations ?? 0),
     };
-    const agent = await this.withPersistedRules(withModel);
+    const chatForPreset = await this.deps.chats.get(prev.chatId);
+    const agent = this.applyChatPermissionPreset(
+      this.applyChatEffort(await this.withPersistedRules(withModel), chatForPreset ?? {}), chatForPreset ?? {},
+    );
 
     const newRunId = this.deps.ids.next();
     await this.deps.runs.create({
@@ -423,8 +496,15 @@ export class RunController implements RunControllerContract {
     if (!pendingRecord) return false;
 
     const baseAgent = await this.deps.agents.resolve(run.agentId);
-    const agent = await this.withPersistedRules(
-      run.effectiveConfig ? { ...baseAgent, model: run.effectiveConfig.model } : baseAgent,
+    const chatForPreset = await this.deps.chats.get(run.chatId);
+    const agent = this.applyChatPermissionPreset(
+      this.applyChatEffort(
+        await this.withPersistedRules(
+          run.effectiveConfig ? { ...baseAgent, model: run.effectiveConfig.model } : baseAgent,
+        ),
+        chatForPreset ?? {},
+      ),
+      chatForPreset ?? {},
     );
     const effectiveConfig = run.effectiveConfig ?? buildPlaceholderConfig(agent);
     const history = await this.deps.messages.listByChat(run.chatId);
@@ -495,6 +575,40 @@ export class RunController implements RunControllerContract {
     return { ...agent, permissions: { ...agent.permissions, rules: [...agent.permissions.rules, ...persisted] } };
   }
 
+  /** Feedback real v0.2.1, punto 1a/8: `Chat.permissionPreset` (canal `chat:setPermissionPreset`,
+   *  @saurio/shared) manda por sobre el preset del AGENTE para ESTE run — es una elección explícita
+   *  del usuario en el chat, más específica que la config general del agente. Sin
+   *  `chat.permissionPreset` (chats creados antes de esta migración, o que nunca lo tocaron), el
+   *  comportamiento es el previo: se usa el preset que ya traía `agent.permissions`. */
+  private applyChatPermissionPreset(agent: AgentConfig, chat: { permissionPreset?: ChatPermissionPreset }): AgentConfig {
+    if (!chat.permissionPreset) return agent;
+    return { ...agent, permissions: { ...agent.permissions, preset: chat.permissionPreset } };
+  }
+
+  /** Punto 1b del encargo (feedback real v0.2.1): `Chat.effort` mapea a think off/on (equivalente
+   *  binario de "off/low/high" para providers cuyo `think` es booleano, como Ollama con qwen3 — no
+   *  hay chequeo de `ModelCapabilities.thinking` acá: si el modelo no soporta thinking, `think`
+   *  simplemente no tiene efecto en la respuesta, comportamiento ya existente con `agent.thinking`),
+   *  numPredict (`ContextPolicy.reserveForResponse`, lo que `buildChatRequest` usa como numPredict) y
+   *  maxIterations. 'balanced'/sin effort: sin cambios (comportamiento previo a esta tarea). */
+  private applyChatEffort(agent: AgentConfig, chat: { effort?: Effort }): AgentConfig {
+    if (!chat.effort || chat.effort === 'balanced') return agent;
+    if (chat.effort === 'fast') {
+      return {
+        ...agent,
+        thinking: 'off',
+        maxIterations: Math.max(5, Math.round(agent.maxIterations * 0.6)),
+        contextPolicy: { ...agent.contextPolicy, reserveForResponse: Math.max(256, Math.round(agent.contextPolicy.reserveForResponse * 0.6)) },
+      };
+    }
+    return {
+      ...agent,
+      thinking: 'on',
+      maxIterations: Math.round(agent.maxIterations * 1.5),
+      contextPolicy: { ...agent.contextPolicy, reserveForResponse: Math.round(agent.contextPolicy.reserveForResponse * 1.5) },
+    };
+  }
+
   // ── Preparación (doc 05 §2.2) ───────────────────────────────────────────
 
   private async prepareAndQueue(live: LiveRun): Promise<void> {
@@ -512,8 +626,26 @@ export class RunController implements RunControllerContract {
     }
     await this.deps.runs.update(live.runId, { effectiveConfig });
 
+    await this.maybeWarnSmallModel(live);
+
     this.transition(live, 'queued');
     await this.persistRunState(live);
+  }
+
+  /** Punto 10 del encargo: aviso no bloqueante de "modelo chico" en modo agente. Se evalúa una sola
+   *  vez por run (acá, en `prepareAndQueue`, que corre una única vez al preparar el run — nunca en
+   *  cada turno del loop). `parseParameterSizeBillions` devuelve `undefined` ante cualquier formato
+   *  que no reconozca (nunca afirma "es chico" sin evidencia, regla 6 de la columna). */
+  private async maybeWarnSmallModel(live: LiveRun): Promise<void> {
+    if (live.mode !== 'agent' || !this.deps.modelParameterSizeProbe) return;
+    const raw = await this.deps.modelParameterSizeProbe.getParameterSize(live.effectiveConfig.model).catch(() => undefined);
+    if (raw === undefined) return;
+    const billions = parseParameterSizeBillions(raw);
+    if (billions === undefined || billions >= SMALL_MODEL_THRESHOLD_B) return;
+    this.deps.events.append({
+      runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'run.smallModelWarning',
+      modelRef: live.effectiveConfig.model, parameterSize: raw,
+    });
   }
 
   /** ADR-7 / doc 05 §2.2 paso 7 / doc 16 §4 ítem "capado automático de numCtx": único ajuste
@@ -584,10 +716,19 @@ export class RunController implements RunControllerContract {
         agent: live.agent, mode: live.mode, history: live.history, repoMap: repoMapText,
         toolsText, turnsSinceCompaction: live.turnsSinceCompaction,
         allowCompaction: live.formatRetries === 0,
+        // Feedback real v0.2.1, punto 1e/7: numCtx REAL ya capeado contra el modelo
+        // (capNumCtxAgainstModel, más abajo en prepareAndQueue) — puede diferir de
+        // `live.agent.contextPolicy.numCtx` si el cap solo tocó `effectiveConfig`.
+        effectiveNumCtx: live.effectiveConfig.numCtx,
+        // Punto 3 del encargo: carpeta de trabajo/SO/shell reales. `buildEnvironmentPrompt` no hace
+        // I/O (la detección de shell está cacheada a nivel de módulo en run_command.ts), así que
+        // recalcularlo en cada vuelta del loop es barato — no hace falta memoizarlo en `live`.
+        environmentInfo: buildEnvironmentPrompt(live.agent.workingDir),
       };
       const willCompact = this.deps.context.willCompact(buildInput);
       if (willCompact) {
         this.transition(live, 'compacting');
+        this.emitActivity(live, 'compacting', 'Resumiendo la conversación para hacer lugar…');
         await this.persistRunState(live);
       }
 
@@ -617,6 +758,7 @@ export class RunController implements RunControllerContract {
 
       if (live.cancelRequested) { await this.finishCancelled(live); return; }
       this.transition(live, 'generating');
+      this.emitActivity(live, 'thinking', 'Pensando…');
       await this.persistRunState(live);
 
       let chatResult: { assistantMessage: ChatMessage } | 'failed' | 'cancelled';
@@ -893,6 +1035,7 @@ export class RunController implements RunControllerContract {
   // ── finish (doc 05 §2.5 "alt finish() o respuesta final") ─────────────
 
   private async runFinish(live: LiveRun, protocol: ToolProtocol, call: ToolCall): Promise<void> {
+    this.emitActivity(live, 'answering', 'Cerrando la respuesta…', call.id);
     const def = this.toolDef('finish');
     if (def) {
       const ctx = this.makeToolContext(live, call.id, noopCheckpointHandle());
@@ -922,13 +1065,19 @@ export class RunController implements RunControllerContract {
   // ── Tool calls: permisos, checkpoint, ejecución (doc 05 §2.5-2.9) ──────
 
   private async handleToolCalls(live: LiveRun, calls: ToolCall[], text: string): Promise<TurnOutcome> {
+    // Feedback real v0.2.1 (usuario, modo Agente): "a 'Hola' el run hizo 8+ turnos... y respondió DOS
+    // veces". Antes esto nudgeaba hasta 2 veces ("Elegí una tool o llamá a finish") antes de cerrar en
+    // el 3er turno sin tool call — cada nudge generaba una respuesta más del modelo, visible para el
+    // usuario, antes del cierre real (de ahí las "dos respuestas"). Ahora: una respuesta de texto sin
+    // tool calls ES la respuesta final (finish implícito), sin excepción — ver punto 2 del encargo
+    // ("saludos y preguntas conversacionales no deben disparar tools", reforzado también en el system
+    // prompt, agent/defaults.ts). `finishWithText` no vuelve a emitir el texto: `assistantMessage` ya
+    // se emitió como `message.done` en `streamChat` antes de llegar acá, así que nunca hay una segunda
+    // respuesta final por run.
     if (calls.length === 0) {
-      const verdict = live.loopDetector.recordNoToolTurn();
-      if (verdict === 'force_final') { await this.finishWithText(live, text || '(sin respuesta)'); return 'completed'; }
-      this.pushNudge(live, 'Elegí una tool o llamá a finish.');
-      this.returnToQueue(live);
-      await this.persistRunState(live);
-      return 'continue';
+      this.emitActivity(live, 'answering', 'Redactando la respuesta…');
+      await this.finishWithText(live, text || '(sin respuesta)');
+      return 'completed';
     }
 
     const protocol = this.protocolFor(live);
@@ -1036,6 +1185,7 @@ export class RunController implements RunControllerContract {
       await this.deps.toolCalls.upsert(record);
       this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'tool.permission', request: decision.request });
       this.transition(live, 'awaiting_permission');
+      this.emitActivity(live, 'waiting_permission', `Esperando permiso para "${call.name}"…`, call.id);
       await this.persistRunState(live);
 
       const answer = await new Promise<PermissionAnswer>((resolve) => {
@@ -1047,6 +1197,8 @@ export class RunController implements RunControllerContract {
     }
 
     this.transition(live, 'executing_tool');
+    const activity = this.activityForTool(call.name, call.args);
+    if (activity) this.emitActivity(live, activity.phase, activity.label, call.id);
     await this.persistRunState(live);
     return this.runHandler(live, call, record, classification);
   }
@@ -1156,8 +1308,22 @@ export class RunController implements RunControllerContract {
 
     if (checkpointHandle) {
       const checkpoint = await this.deps.checkpoints.commit(checkpointHandle);
-      this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'checkpoint.created', checkpoint });
-      record = { ...record, checkpointId: checkpoint.id };
+      // Feedback real v0.2.1, punto 5: "cada tool call (incluso run_command y list_files) genera un
+      // Checkpoint vacío '0 archivo(s) +0 −0'". `list_files`/`task_update` ya no llegan acá (no son
+      // `mutating`); pero `run_command` sí lo es (para reversibilidad futura si algún día detecta
+      // paths) y hoy nunca puebla `classification.paths`, así que `checkpoint.files` queda `[]` en
+      // cada corrida — sin este gate se emitía `checkpoint.created` igual, vacío, cada vez. Ahora solo
+      // se registra el checkpoint (evento + fila `checkpoints`) cuando de verdad hubo archivos
+      // tocados; si no, `record.checkpointId` queda sin setear (comportamiento equivalente a "esta
+      // tool call no tiene checkpoint asociado").
+      if (checkpoint.files.length > 0) {
+        this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'checkpoint.created', checkpoint });
+        record = { ...record, checkpointId: checkpoint.id };
+      }
+      // Si quedó vacío (típicamente `run_command`, que nunca puebla `classification.paths`), no se
+      // emite `checkpoint.created` ni se setea `checkpointId` — la advertencia de "esto pudo cambiar
+      // archivos y el revert no lo cubre" la agrega la tool misma cuando tiene evidencia real (ver
+      // `tools/builtin/run_command.ts`, comparación de `git status --porcelain` antes/después).
     }
 
     const finalStatus = result.isError ? 'failed' : 'done';
@@ -1254,7 +1420,7 @@ export class RunController implements RunControllerContract {
         role: args.role ?? 'custom',
         modelMode: 'fixed',
         model: live.effectiveConfig.model,
-        permissionPreset: live.agent.permissions.preset,
+        permissionPreset: toAgentLevelPreset(live.agent.permissions.preset),
         memoryScope: 'global',
       }, 'worker');
       targetAgentId = worker.id;
@@ -1470,6 +1636,37 @@ export class RunController implements RunControllerContract {
     this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'tool.status', toolCallId, status, resultPreview });
   }
 
+  /** Punto 1d del encargo (feedback real v0.2.1): línea de estado simple ("¿qué está haciendo el
+   *  agente ahora?"). Reusa RunEvent (@saurio/shared, commit de contrato) — puramente informativo
+   *  para la UI, no mueve ningún estado real. */
+  private emitActivity(live: LiveRun, phase: RunActivityPhase, label: string, toolCallId?: string): void {
+    this.deps.events.append({ runId: live.runId, chatId: live.chatId, ts: this.deps.clock.now(), type: 'run.activity', phase, label, toolCallId });
+  }
+
+  /** Mapea el nombre de una tool call a una fase de actividad + label en español. `undefined` para
+   *  `finish`/`task_update`/`delegate` (tienen su propio punto de emisión más específico, o no
+   *  ameritan una línea de estado propia). */
+  private activityForTool(name: string, args: unknown): { phase: RunActivityPhase; label: string } | undefined {
+    switch (name) {
+      case 'read_file': {
+        const p = (args as { path?: string } | undefined)?.path;
+        return { phase: 'reading', label: p ? `Leyendo ${p}…` : 'Leyendo archivo…' };
+      }
+      case 'list_files': return { phase: 'reading', label: 'Explorando carpetas…' };
+      case 'search_code': return { phase: 'searching', label: 'Buscando en el código…' };
+      case 'write_file': case 'edit_file': case 'delete_file': case 'make_dir': {
+        const p = (args as { path?: string; paths?: string[] } | undefined);
+        const target = p?.path ?? p?.paths?.[0];
+        return { phase: 'editing', label: target ? `Editando ${target}…` : 'Editando archivos…' };
+      }
+      case 'run_command': {
+        const cmd = (args as { command?: string } | undefined)?.command;
+        return { phase: 'running_command', label: cmd ? `Ejecutando: ${cmd}` : 'Ejecutando comando…' };
+      }
+      default: return undefined;
+    }
+  }
+
   private pushNudge(live: LiveRun, text: string): void {
     live.history.push({ id: this.deps.ids.next(), role: 'user', content: text, ephemeral: true });
   }
@@ -1616,6 +1813,7 @@ function unavailableWorkspaceFs(): WorkspaceFs {
   const fail = (): never => { throw new Error('WorkspaceFs no inyectado en RunControllerDeps (fuera del alcance de packages/runtime/src/agent).'); };
   return {
     readFile: async () => fail(), writeFileAtomic: async () => fail(), deleteFile: async () => fail(),
+    makeDir: async () => fail(),
     listDir: async () => fail(), isProtected: () => false, isIgnored: () => false, resolve: (p: string) => p,
   };
 }

@@ -61,7 +61,8 @@ describe('createRuntime (integración)', () => {
     const agent = await runtime.persistence.repositories.agents.get(DEFAULT_AGENT_ID);
     expect(agent?.contextPolicy.numCtx).toBe(8192);
     expect(agent?.thinking).toBe('off');
-    expect(agent?.allowedTools).toHaveLength(10);
+    // 11 desde el punto 4 del encargo (feedback real v0.2.1): se sumó `make_dir` a DEFAULT_ALLOWED_TOOLS.
+    expect(agent?.allowedTools).toHaveLength(11);
   });
 
   it('registra el provider de Ollama en 127.0.0.1:11434 con un único slot de scheduler', () => {

@@ -1,5 +1,9 @@
-// Métricas bajo cada mensaje (doc 14 §6/§9: tokens entrada/salida, tok/s, carga, cache — cada uno
-// con su badge measured/estimated) — apps/desktop/src/renderer/src/features/chat/MessageMetrics.tsx.
+// Métricas al pie del mensaje final — rediseño del chat, punto 3: "fuera del flujo; un ícono 'i' o
+// una línea tenue al pie del mensaje final que se expande (tokens, tok/s, carga, cache,
+// medido/estimado)". Antes esta fila se veía SIEMPRE bajo cada mensaje del asistente, con un texto
+// fijo "costo: no disponible" — la queja real v0.2.1 la señala explícitamente como parte de lo que
+// hace ver "cargado" al chat. apps/desktop/src/renderer/src/features/chat/MessageMetrics.tsx.
+import { useState } from 'react';
 import type { ResponseMetrics } from '@saurio/shared';
 
 export interface MessageMetricsProps {
@@ -21,31 +25,45 @@ function cacheHitRatio(m: ResponseMetrics): number | undefined {
   return m.cachedPromptTokens / m.promptTokens;
 }
 
+const QUALITY_LABEL: Record<ResponseMetrics['quality'], string> = {
+  measured: 'medido', estimated: 'estimado', unavailable: 'no disponible',
+};
+
 /** Doc 14 §4/§11: `quality` es la única etiqueta que trae `ResponseMetrics` (no hay una por campo);
- *  el badge measured/estimated/unavailable se muestra una vez para todo el bloque, como indica la
- *  fila "bajo cada mensaje" del doc 14 §6/§9 (Nota de consistencia: el `MetricSample<T>` por-campo
- *  de `packages/shared/src/telemetry.ts` que propone ese doc no existe en el contrato zod ya
- *  instalado — ver deviations). */
+ *  se muestra una vez para todo el bloque. */
 export function MessageMetrics({ metrics }: MessageMetricsProps): React.JSX.Element {
+  const [open, setOpen] = useState(false);
   const tps = genTps(metrics);
   const cache = cacheHitRatio(metrics);
   const load = fmtMs(metrics.loadMs);
+  const tokens = metrics.promptTokens !== undefined && metrics.evalTokens !== undefined
+    ? `${metrics.promptTokens} → ${metrics.evalTokens} tok`
+    : undefined;
 
   return (
-    <div className={`message-metrics quality-${metrics.quality}`}>
-      {metrics.promptTokens !== undefined && metrics.evalTokens !== undefined && (
-        <span>{metrics.promptTokens} → {metrics.evalTokens} tok</span>
+    <div className={`message-metrics-toggle quality-${metrics.quality}`}>
+      <button
+        type="button"
+        className="message-metrics-toggle__button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        title="Ver métricas de esta respuesta"
+      >
+        <span className="message-metrics-toggle__icon" aria-hidden="true">i</span>
+        {tokens ?? 'métricas'}
+      </button>
+      {open && (
+        <div className="message-metrics">
+          {tokens && <span>{tokens}</span>}
+          {tps !== undefined && <span>{tps.toFixed(1)} tok/s</span>}
+          {load && <span>carga {load}</span>}
+          {cache !== undefined && <span>cache {(cache * 100).toFixed(0)}%</span>}
+          {/* Punto 3 del encargo ("'costo' solo si el proveedor lo informa"): ningún Provider del MVP
+              (Ollama/OpenAI-compatible/Anthropic) devuelve costo en $ — se omite en vez de mostrar
+              "no disponible" fijo en cada mensaje (eso era justamente parte de la queja de ruido). */}
+          <span className="message-metrics__quality" title="Calidad del dato">{QUALITY_LABEL[metrics.quality]}</span>
+        </div>
       )}
-      {tps !== undefined && <span>{tps.toFixed(1)} tok/s</span>}
-      {load && <span>carga {load}</span>}
-      {cache !== undefined && <span>cache {(cache * 100).toFixed(0)}%</span>}
-      {/* Punto 4 del encargo ("mostrar... costo 'no disponible' salvo que el proveedor lo informe"):
-          ningún Provider del MVP (Ollama/OpenAI-compatible/Anthropic) devuelve costo en $, así que
-          esto siempre muestra "no disponible" — no hay campo de costo que inventar un valor para. */}
-      <span className="message-metrics__cost" title="Ningún proveedor del MVP informa costo en moneda">costo: no disponible</span>
-      <span className="message-metrics__quality" title="Calidad del dato">
-        {metrics.quality === 'measured' ? 'medido' : metrics.quality === 'estimated' ? 'estimado' : 'no disponible'}
-      </span>
     </div>
   );
 }

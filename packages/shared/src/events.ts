@@ -6,11 +6,18 @@ import { RunState, ToolCallStatus } from './enums.js';
 import {
   ChatMessageSchema, ResponseMetricsSchema, ToolCallRecordSchema, PermissionRequestSchema,
   PermissionDecisionSchema, PermissionAnswerSchema, CheckpointSchema, TaskSchema, AdjustmentSchema,
-  RunErrorSchema,
+  RunErrorSchema, ModelRefSchema,
 } from './domain.js';
 
 export const ContextBudgetReportSchema = z.object({
   numCtx: z.number(),
+  /** Feedback real v0.2.1, punto 1e: el numCtx REAL enviado al provider tras aplicar
+   *  `defaultNumCtxFor`/el cap (nunca el máximo teórico del modelo, ej. 262k) — antes la UI mostraba
+   *  el contexto vigente usando `contextMax` del modelo, no lo que de verdad se mandó. Opcional/aditivo
+   *  para no romper snapshots/tests existentes que arman `ContextBudgetReport` sin este campo; cuando
+   *  falta, un consumidor puede seguir cayendo a `numCtx` (mismo comportamiento previo).
+   */
+  effectiveNumCtx: z.number().optional(),
   reserveForResponse: z.number(),
   used: z.object({
     system: z.number(), tools: z.number(), repoMap: z.number(), memory: z.number(), history: z.number(),
@@ -19,6 +26,14 @@ export const ContextBudgetReportSchema = z.object({
   fits: z.boolean(),
 });
 export type ContextBudgetReport = z.infer<typeof ContextBudgetReportSchema>;
+
+/** Feedback real v0.2.1, punto 1d: fases de una línea de estado simple ("¿qué está haciendo el
+ *  agente ahora?") sin que la UI tenga que inferirlo de RunState + tool.status. */
+export const RunActivityPhase = z.enum([
+  'thinking', 'reading', 'searching', 'editing', 'running_command', 'waiting_permission',
+  'compacting', 'answering',
+]);
+export type RunActivityPhase = z.infer<typeof RunActivityPhase>;
 
 /** Campos comunes a toda variante de RunEvent (doc 04 §6). */
 const runEventBase = {
@@ -64,6 +79,18 @@ export const RunEventSchema = z.discriminatedUnion('type', [
     ...runEventBase, type: z.literal('run.delegated'),
     parentRunId: z.string(), childRunId: z.string(), childChatId: z.string(),
     targetAgentId: z.string(), task: z.string(),
+  }),
+  // Feedback real v0.2.1, punto 1d: reusa RunEvent en vez de un canal aparte — la UI arma una línea
+  // de estado simple ("Leyendo archivo.ts…", "Ejecutando comando…") sin tener que traducir RunState.
+  z.object({
+    ...runEventBase, type: z.literal('run.activity'),
+    phase: RunActivityPhase, label: z.string(), toolCallId: z.string().optional(),
+  }),
+  // Feedback real v0.2.1, punto 10: modelo chico (< ~7B) en modo agente — aviso no bloqueante, la UI
+  // lo muestra una sola vez por run (no repetido en cada iteración).
+  z.object({
+    ...runEventBase, type: z.literal('run.smallModelWarning'),
+    modelRef: ModelRefSchema, parameterSize: z.string().optional(),
   }),
 ]);
 export type RunEvent = z.infer<typeof RunEventSchema>;

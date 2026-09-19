@@ -2,6 +2,7 @@
 // — apps/desktop/src/renderer/src/features/chat/ToolCallCard.tsx.
 import type { ToolCallRecord } from '@saurio/shared';
 import { CheckIcon, CircleDotIcon, FileIcon, GitBranchIcon, ShieldIcon, TerminalIcon, WrenchIcon } from '../../ui/icons.js';
+import { stripAnsi } from './ansi.js';
 
 const STATUS_LABEL: Record<ToolCallRecord['status'], string> = {
   pending: 'Pendiente', awaiting_permission: 'Esperando permiso', approved: 'Aprobada',
@@ -40,10 +41,13 @@ function summarizeArgs(args: unknown): string {
 }
 
 /** "salida truncada" (doc 01 §4.1): acá se corta a nivel de UI ademas del truncado nivel 0 que ya
- *  aplica ToolSystem (doc 01 §4.3) antes de guardar `resultPreview`. */
+ *  aplica ToolSystem (doc 01 §4.3) antes de guardar `resultPreview`. Se trunca DESPUÉS de quitar
+ *  ANSI (feedback real v0.2.1: "salida de comandos con códigos ANSI") para no gastar el límite de
+ *  caracteres en secuencias de escape invisibles. */
 function truncatePreview(preview: string | undefined): string | undefined {
-  if (preview === undefined) return undefined;
-  return preview.length > 400 ? `${preview.slice(0, 400)}…` : preview;
+  const clean = stripAnsi(preview);
+  if (clean === undefined) return undefined;
+  return clean.length > 400 ? `${clean.slice(0, 400)}…` : clean;
 }
 
 export function ToolCallCard({ call }: ToolCallCardProps): React.JSX.Element {

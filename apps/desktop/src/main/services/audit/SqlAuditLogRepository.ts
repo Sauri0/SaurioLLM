@@ -33,6 +33,17 @@ export class SqlAuditLogRepository {
     });
   }
 
+  /** Punto 1a del encargo (feedback real v0.2.1): "unrestricted... queda en audit_log" — genérico a
+   *  propósito (`kind`/`payload`) para no tener que sumar un método dedicado por cada evento de
+   *  auditoría futuro que solo necesite `{ ts, kind, payload }`. */
+  record(entry: { kind: string; payload: unknown; ts?: number }): void {
+    this.driver.prepare('INSERT INTO audit_log (ts, kind, payload_json) VALUES (@ts, @kind, @payload)').run({
+      ts: entry.ts ?? Date.now(),
+      kind: entry.kind,
+      payload: JSON.stringify(entry.payload),
+    });
+  }
+
   listNonLocalCalls(limit = 200): NonLocalCallAuditEntry[] {
     const rows = this.driver.prepare<AuditLogRow>(
       'SELECT * FROM audit_log WHERE kind = ? ORDER BY ts DESC LIMIT ?',

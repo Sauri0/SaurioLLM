@@ -64,6 +64,18 @@ export interface ContextBuilderInputBase {
    *  `build` disparan compactación en esta llamada puntual, sin importar el ratio de tokens ni
    *  `turnsSinceCompaction`. Default `true` (comportamiento previo si se omite). */
   allowCompaction?: boolean;
+  /** Feedback real v0.2.1, punto 1e/7 ("el indicador de contexto muestra 2.3k / 262k" — el 262k era
+   *  el máximo teórico del modelo, no lo que de verdad se mandó): numCtx REAL que va a viajar al
+   *  provider en esta request, ya capeado (`RunController.capNumCtxAgainstModel`, ADR-7) — puede
+   *  diferir de `agent.contextPolicy.numCtx` (el que usa `computeBudget` para repartir el presupuesto
+   *  por bloque) cuando el cap corrigió `effectiveConfig` sin mutar `agent.contextPolicy`. Opcional:
+   *  sin esto, `report.effectiveNumCtx` cae a `budget.numCtx` (comportamiento previo). */
+  effectiveNumCtx?: number;
+  /** Punto 3 del encargo: bloque de entorno real (carpeta de trabajo, SO, shell) que se concatena
+   *  al final de `agent.systemPrompt` (antes del sufijo de modo plan). Ver
+   *  `agent/environmentPrompt.ts`. Opcional/aditivo: sin esto, el system message queda igual que
+   *  antes de esta tarea. */
+  environmentInfo?: string;
 }
 
 /** Ensamblador del prompt: system inmutable -> few-shot -> repo map -> memoria -> resumen ->

@@ -94,6 +94,24 @@ export interface ModelLayerCountProbe {
   getBlockCount(ref: ModelRef): Promise<number | undefined>;
 }
 
+/** Puerto local (punto 10 del encargo, feedback real v0.2.1: aviso de "modelo chico" en modo
+ *  agente). `ModelInfo.parameterSize` (@saurio/shared, ej. "8B"/"3.8B"/"270M") vive en
+ *  `packages/runtime/src/models` (fuera de esta zona) — mismo criterio que `ModelContextProbe`.
+ *  Opcional: sin este puerto, nunca se emite `run.smallModelWarning` (comportamiento previo: no
+ *  existía el aviso). */
+export interface ModelParameterSizeProbe {
+  getParameterSize(ref: ModelRef): Promise<string | undefined>;
+}
+
+/** Puerto local (punto 1c/9 del encargo, feedback real v0.2.1: adjuntos de imagen). Mismo criterio
+ *  que `ModelContextProbe`/`ModelParameterSizeProbe`: `ModelCapabilities.vision` vive en
+ *  `packages/runtime/src/models` (fuera de esta zona). `undefined` = "no se pudo determinar" — se
+ *  trata igual que `false` (conservador: nunca se manda una imagen a un modelo cuya capability no
+ *  se pudo confirmar, regla 6 de la columna "nunca una cifra/afirmación sin evidencia"). */
+export interface ModelVisionProbe {
+  hasVision(ref: ModelRef): Promise<boolean | undefined>;
+}
+
 /** Puerto local (doc 16 §4 ítem 16 / doc 10 §3, §5.2: "expected_pre_hash sobrevive a un reinicio"):
  *  al registrar (write-ahead) una tool call mutante de archivo (`edit_file`/`write_file`/
  *  `delete_file`), `RunController` necesita saber "¿cuál fue el último hash que ESTE run vio para

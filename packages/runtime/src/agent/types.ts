@@ -5,6 +5,7 @@
 // cruzan IPC/RunEvent — doc 02 §3.
 import type {
   RunState, ModelRef, AgentRole, Mode, ToolTransport, Adjustment, RunError, ToolCallRecord, ModelMode,
+  Attachment,
 } from '@saurio/shared';
 import type { ChatRequest } from '../gateway/types.js';
 import type { PermissionPolicy } from '../permissions/types.js';
@@ -72,7 +73,11 @@ export const RUN_TRANSITIONS: Record<RunState, RunState[]> = {
 /** El RunController orquesta ContextManager, ToolSystem, PermissionEngine, CheckpointService,
  *  TaskManager y ModelGateway; ver flujo completo en la columna §6. Firma resumida: */
 export interface RunController {
-  start(chatId: string, text: string, mode: Mode): Promise<{ runId: string }>;
+  /** `attachments`: punto 1c/9 del encargo (feedback real v0.2.1). Ya resueltos a `dataBase64`
+   *  (el host es quien lee un `path` de disco y respeta los límites de tamaño, doc de la tarea —
+   *  packages/runtime no toca fs arbitrario fuera de WorkspaceFs); `path` sin `dataBase64` en este
+   *  punto se ignora. */
+  start(chatId: string, text: string, mode: Mode, attachments?: Attachment[]): Promise<{ runId: string }>;
   cancel(runId: string): Promise<void>;
   continueRun(runId: string, extraIterations?: number): Promise<{ runId: string }>;   // crea un run nuevo
   recover(): Promise<{ orphaned: ToolCallRecord[]; abandoned: ToolCallRecord[] }>;      // al arrancar la app

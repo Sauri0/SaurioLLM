@@ -87,6 +87,43 @@ export function registerChatHandlers(host: RuntimeHost): void {
   registerHandler('chat:setMode', ipc['chat:setMode'], async (input) =>
     host.chatRepository.update(input.chatId, { mode: input.mode, updatedAt: Date.now() }));
 
+  // Punto 1a del encargo (feedback real v0.2.1): `unrestricted` ("Sin límites") exige confirmación
+  // explícita al activarlo (input.confirmed) y queda auditado — reusa `audit_log` genérica (doc 03)
+  // con `kind: 'permission.unrestricted_enabled'`, mismo mecanismo que
+  // `NonLocalCallAuditEntry`/`providers:auditLog` para llamadas no locales.
+  registerHandler('chat:setPermissionPreset', ipc['chat:setPermissionPreset'], async (input) => {
+    const chat = await host.chatRepository.get(input.chatId);
+    if (!chat) throw new Error(`saurio: no existe el chat "${input.chatId}"`);
+    if (input.preset === 'unrestricted' && !input.confirmed) {
+      throw new Error(
+        'saurio: activar "Sin límites" requiere confirmación explícita (confirmed: true) — este preset no pregunta nada, ' +
+          'salvo escribir dentro de .git del proyecto o un comando crítico.',
+      );
+    }
+    if (input.preset === 'unrestricted') {
+      host.auditLog.record({
+        kind: 'permission.unrestricted_enabled',
+        payload: { chatId: input.chatId, projectId: chat.projectId },
+      });
+    }
+    return host.chatRepository.update(input.chatId, { permissionPreset: input.preset, updatedAt: Date.now() });
+  });
+
+  registerHandler('chat:setEffort', ipc['chat:setEffort'], async (input) =>
+    host.chatRepository.update(input.chatId, { effort: input.effort, updatedAt: Date.now() }));
+
+  registerHandler('chat:rename', ipc['chat:rename'], async (input) =>
+    host.chatRepository.update(input.chatId, { title: input.title, updatedAt: Date.now() }));
+
+  registerHandler('chat:archive', ipc['chat:archive'], async (input) =>
+    host.chatRepository.update(input.chatId, { archived: input.archived, updatedAt: Date.now() }));
+
+  // Punto 12 del encargo: soft-delete (ver comentario de la migración 0006 sobre por qué no es un
+  // DELETE real de la fila) — el chat deja de aparecer en chat:list, el historial queda en disco.
+  registerHandler('chat:delete', ipc['chat:delete'], async (input) => {
+    await host.chatRepository.softDelete(input.chatId, Date.now());
+  });
+
   registerHandler('chat:history', ipc['chat:history'], async (input) => {
     // `ToolCallRepository` (packages/runtime/src/persistence/types.ts) solo expone `listByRun`, y un
     // chat tiene varios runs en el tiempo (doc 01 §7.a): la integración resuelve primero los runs del

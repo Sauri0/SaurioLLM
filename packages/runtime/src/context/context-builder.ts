@@ -77,7 +77,7 @@ export class DefaultContextBuilder implements ContextBuilder {
   async build(input: ContextBuilderInputBase): Promise<{
     messages: ChatMessage[]; report: ContextBudgetReport; compaction?: CompactionResult;
   }> {
-    const { agent, mode, history, repoMap, projectMemory, toolsText } = input;
+    const { agent, mode, history, repoMap, projectMemory, toolsText, environmentInfo } = input;
     const budget = computeBudget(agent.contextPolicy);
 
     // Doc 16 §4 ítem 6 ("plan mode: instrucción explícita de task_update + finish"): el modo ya
@@ -89,7 +89,7 @@ export class DefaultContextBuilder implements ContextBuilder {
     const modeSuffix = mode === 'plan'
       ? '\n\nEstás en modo PLAN: antes de llamar a `finish`, llamá a `task_update` con el checklist completo de pasos del plan (uno por tarea, estado inicial "pending"). Recién después llamá a `finish` con el resumen. No edites ni ejecutes nada.'
       : '';
-    const systemMessage: ChatMessage = { id: SYSTEM_MESSAGE_ID, role: 'system', content: `${agent.systemPrompt}${modeSuffix}` };
+    const systemMessage: ChatMessage = { id: SYSTEM_MESSAGE_ID, role: 'system', content: `${agent.systemPrompt}${environmentInfo ?? ''}${modeSuffix}` };
     const fewShot: ChatMessage[] = []; // ver nota de alcance histórica: sin fuente real de few-shot en el MVP
     const projectIntro = buildProjectIntroMessage(repoMap, projectMemory);
     const { rest: restHistory, ephemeral } = splitEphemeral(history);
@@ -140,6 +140,7 @@ export class DefaultContextBuilder implements ContextBuilder {
     const totalUsed = fixedTokens + historyTokens;
     const report: ContextBudgetReport = {
       numCtx: budget.numCtx,
+      effectiveNumCtx: input.effectiveNumCtx ?? budget.numCtx,
       reserveForResponse: budget.reserveForResponse,
       used: {
         system: this.tokenCounter.estimate(systemMessage.content, 'prose'),

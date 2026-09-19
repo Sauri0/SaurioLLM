@@ -184,6 +184,26 @@ export class WorkspaceFsImpl implements WorkspaceFsContract {
     }
   }
 
+  /** Punto 4 del encargo (tool `make_dir`): crea la carpeta (y sus intermedias) sin pasar por un
+   *  comando de shell. Si `relPath` ya existe como ARCHIVO (no directorio), `fs.mkdir(...,
+   *  {recursive:true})` falla con `EEXIST` — se traduce a un error accionable en vez de dejarlo
+   *  crudo. Si ya existe como directorio, no es un error (idempotente). */
+  async makeDir(relPath: string): Promise<void> {
+    const abs = this.resolve(relPath);
+    if (this.isProtected(relPath)) {
+      throw new ToolExecutionError('path_denied', `ruta protegida: "${relPath}"`);
+    }
+    try {
+      await fs.mkdir(abs, { recursive: true });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') {
+        throw new ToolExecutionError('path_denied', `"${relPath}" ya existe y no es una carpeta`);
+      }
+      throw err;
+    }
+  }
+
   async listDir(relPath: string, depth: number): Promise<{ path: string; isDir: boolean }[]> {
     const abs = this.resolve(relPath);
     // depth<=3 (doc 07 §3): cuántos niveles de listado de directorio se hacen a partir de `relPath`;

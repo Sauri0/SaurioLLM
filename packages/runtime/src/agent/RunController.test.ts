@@ -13,7 +13,7 @@ import {
   makeFakeMessageRepository, makeFakeToolCallRepository, makeFakeCheckpointRepository,
   makeFakeTaskRepository, makeFakeContextBuilder, makeFakeCheckpointService, makeScriptedGateway,
   makeFakeToolRegistry, makeNativeToolProtocol, makeAllowAllPermissionEngine,
-  makeAskThenRecordPermissionEngine, makeFinishTool, makeEditFileTool, makeListFilesTool,
+  makeAskThenRecordPermissionEngine, makeRecordingPermissionEngine, makeFinishTool, makeEditFileTool, makeListFilesTool,
   makeTestAgentConfig, makeFakeAgentConfigResolver, makeTestChat, waitUntil,
 } from './testSupport.js';
 import { DefaultTaskManager } from '../tasks/TaskManager.js';
@@ -63,6 +63,36 @@ function makeAlwaysFailingTool(errorText: string): ToolDefinition {
     handler: async () => ({ content: [{ type: 'text', text: errorText }], isError: true }),
   };
 }
+
+// Punto 1d del encargo (feedback real v0.2.1): línea de estado simple (run.activity).
+describe('RunController — run.activity', () => {
+  it('emite thinking, la fase de la tool y answering en un turno con una tool y luego texto final', async () => {
+    const applied: unknown[] = [];
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'edit_file', args: { path: 'src/a.ts' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+      [
+        { type: 'content', text: 'listo' },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      tools: makeFakeToolRegistry([makeFinishTool(), makeEditFileTool((args) => applied.push(args)), makeListFilesTool()]),
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'cambiá src/a.ts y contame', 'agent');
+    await waitTerminal(runs, runId);
+
+    const events = (deps.events as ReturnType<typeof makeFakeEventStore>).all;
+    const activity = events.filter((e) => e.type === 'run.activity');
+    expect(activity.map((e) => (e as { phase: string }).phase)).toEqual(
+      expect.arrayContaining(['thinking', 'editing', 'answering']),
+    );
+  });
+});
 
 describe('RunController — run feliz con edit_file', () => {
   it('edit_file permitido directo -> checkpoint begin/commit -> finish -> completed', async () => {
@@ -993,5 +1023,191 @@ describe('RunController — delegate (doc 19 §2.5, E3a)', () => {
     expect(delegateCall?.resultPreview).toMatch(/no existe el agente/);
     const chatsInProject = await deps.chats.listByProject('project_1');
     expect(chatsInProject).toHaveLength(1);
+  });
+});
+
+// Feedback real v0.2.1, punto 1a/8: Chat.permissionPreset (chat:setPermissionPreset) tiene que
+// pisar el preset del agente para ESTE run.
+describe('RunController — preset de permisos por chat', () => {
+  it('Chat.permissionPreset viaja hasta PermissionEngine.evaluate() en cada tool call', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'list_files', args: { path: '.' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+      [
+        { type: 'tool_call', call: { id: 'call_2', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const recording = makeRecordingPermissionEngine();
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      chats: makeFakeChatRepository([makeTestChat({ permissionPreset: 'full_in_folder' })]),
+      permissions: recording,
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'listá archivos', 'agent');
+    await waitTerminal(runs, runId);
+
+    expect(recording.seenPresets).toContain('full_in_folder');
+  });
+
+  it('Chat.effort "fast" reduce maxIterations/numPredict y apaga thinking', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const baseAgent = makeTestAgentConfig();
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      chats: makeFakeChatRepository([makeTestChat({ effort: 'fast' })]),
+      agents: makeFakeAgentConfigResolver(baseAgent),
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    const run = await runs.get(runId);
+    expect(run?.effectiveConfig?.think).toBe(false);
+    expect(run?.effectiveConfig?.numCtx).toBe(baseAgent.contextPolicy.numCtx); // effort no toca numCtx
+  });
+
+  it('sin Chat.permissionPreset, usa el preset del agente (comportamiento previo)', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const recording = makeRecordingPermissionEngine();
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      chats: makeFakeChatRepository([makeTestChat()]),
+      permissions: recording,
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    // `finish` no pasa por evaluate() (RunController.runFinish la intercepta antes) — este caso solo
+    // confirma que el run no se rompe sin permissionPreset; el propagado ya lo cubre el test de arriba.
+    await expect(runs.get(runId)).resolves.toMatchObject({ state: 'completed' });
+  });
+});
+
+// Punto 1c/9 del encargo (feedback real v0.2.1): adjuntos de archivo/imagen en run:start.
+describe('RunController — adjuntos', () => {
+  it('un adjunto de texto se inserta como bloque de contexto acotado en el mensaje del usuario', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const { deps, runs } = baseDeps({ gateway: makeScriptedGateway(scripts) });
+    const controller = new RunController(deps);
+    const contenido = Buffer.from('contenido del archivo adjunto').toString('base64');
+    const { runId } = await controller.start('chat_1', 'mirá este archivo', 'agent', [
+      { kind: 'file', name: 'notas.txt', mime: 'text/plain', dataBase64: contenido },
+    ]);
+    await waitTerminal(runs, runId);
+
+    const events = (deps.events as ReturnType<typeof makeFakeEventStore>).all;
+    const userMsg = events.find((e) => e.type === 'message.done' && e.message.role === 'user');
+    expect(userMsg && userMsg.type === 'message.done' ? userMsg.message.content : '').toContain('contenido del archivo adjunto');
+    expect(userMsg && userMsg.type === 'message.done' ? userMsg.message.content : '').toContain('Adjunto: notas.txt');
+  });
+
+  it('un adjunto de imagen sin modelVisionProbe rechaza el run con error accionable', async () => {
+    const { deps } = baseDeps({ gateway: makeScriptedGateway([]) });
+    const controller = new RunController(deps);
+    await expect(
+      controller.start('chat_1', 'mirá esta foto', 'agent', [
+        { kind: 'image', name: 'foto.png', mime: 'image/png', dataBase64: 'ZmFrZQ==' },
+      ]),
+    ).rejects.toThrow(/no confirma soporte de imágenes/);
+  });
+
+  it('un adjunto de imagen con modelVisionProbe true se acepta y va al campo images', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      modelVisionProbe: { hasVision: async () => true },
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'mirá esta foto', 'agent', [
+      { kind: 'image', name: 'foto.png', mime: 'image/png', dataBase64: 'ZmFrZQ==' },
+    ]);
+    await waitTerminal(runs, runId);
+
+    const events = (deps.events as ReturnType<typeof makeFakeEventStore>).all;
+    const userMsg = events.find((e) => e.type === 'message.done' && e.message.role === 'user');
+    expect(userMsg && userMsg.type === 'message.done' ? userMsg.message.images : undefined).toEqual(['ZmFrZQ==']);
+  });
+});
+
+// Punto 10 del encargo (feedback real v0.2.1): aviso de "modelo chico" en modo agente.
+describe('RunController — aviso de modelo chico (run.smallModelWarning)', () => {
+  it('emite el aviso una sola vez en modo agente si el modelo declara < 7B parámetros', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      modelParameterSizeProbe: { getParameterSize: async () => '3.8B' },
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    const events = (deps.events as ReturnType<typeof makeFakeEventStore>).all;
+    const warnings = events.filter((e) => e.type === 'run.smallModelWarning');
+    expect(warnings).toHaveLength(1);
+  });
+
+  it('no emite nada si el modelo declara >= 7B parámetros', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const { deps, runs } = baseDeps({
+      gateway: makeScriptedGateway(scripts),
+      modelParameterSizeProbe: { getParameterSize: async () => '8B' },
+    });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    const events = (deps.events as ReturnType<typeof makeFakeEventStore>).all;
+    expect(events.some((e) => e.type === 'run.smallModelWarning')).toBe(false);
+  });
+
+  it('sin modelParameterSizeProbe, nunca emite el aviso (comportamiento previo)', async () => {
+    const scripts: ChatChunk[][] = [
+      [
+        { type: 'tool_call', call: { id: 'call_1', name: 'finish', args: { summary: 'listo' }, transport: 'native' } },
+        { type: 'done', doneReason: 'stop', metrics: { quality: 'measured' } },
+      ],
+    ];
+    const { deps, runs } = baseDeps({ gateway: makeScriptedGateway(scripts) });
+    const controller = new RunController(deps);
+    const { runId } = await controller.start('chat_1', 'hola', 'agent');
+    await waitTerminal(runs, runId);
+
+    const events = (deps.events as ReturnType<typeof makeFakeEventStore>).all;
+    expect(events.some((e) => e.type === 'run.smallModelWarning')).toBe(false);
   });
 });

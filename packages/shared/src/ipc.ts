@@ -3,7 +3,7 @@
 // tipados (para que el resto del monorepo compile contra ellos) pero sin handler real todavía
 // (principio 8 de la columna vertebral).
 import { z } from 'zod';
-import { Mode } from './enums.js';
+import { Mode, ChatPermissionPreset, Effort } from './enums.js';
 import {
   ProjectSchema, ChatSchema, ChatMessageSchema, ToolCallRecordSchema, CheckpointSchema, TaskSchema,
   ModelRefSchema, ModelInfoSchema, ModelDescriptionSchema, LoadedModelSchema, MemoryEstimateSchema,
@@ -14,7 +14,7 @@ import {
   ProviderConfigSchema, ProviderPresetSchema, ProviderTestResultSchema, NonLocalCallAuditEntrySchema,
   AgentProfileSchema, AgentMemorySchema, AgentCreateInputSchema,
   HuggingFaceSearchResultSchema, HuggingFaceGgufFileSchema, LibraryCatalogResultSchema, ResolveModelByNameResultSchema,
-  ModelTierSchema,
+  ModelTierSchema, AttachmentSchema, ProjectRecentSchema,
 } from './domain.js';
 import { RunEventSchema } from './events.js';
 
@@ -62,6 +62,16 @@ export const ipc = {
   'ollama:ensureRunning':  { input: z.void(), output: OllamaEnsureRunningOutputSchema },
   'project:open':          { input: z.object({ path: z.string().optional() }), output: ProjectSchema },
   'project:list':          { input: z.void(), output: z.array(ProjectSchema) },
+  // Feedback real v0.2.1, punto 12 ("proyectos persistentes como Claude Code/Codex"): lista de
+  // proyectos abiertos alguna vez, más reciente primero, con cantidad de chats y si la carpeta sigue
+  // existiendo — abrir uno de acá NO debe requerir el diálogo de carpeta (`project:open` ya acepta
+  // `path` opcional para esto).
+  'project:recent':        { input: z.void(), output: z.array(ProjectRecentSchema) },
+  // Saca el proyecto de la lista de recientes; nunca borra la carpeta ni el historial (eso requiere
+  // una confirmación/acción aparte que no existe en el MVP — doc del encargo: "sin borrar archivos ni
+  // historial salvo confirmación aparte").
+  'project:remove':        { input: z.object({ id: z.string() }), output: z.void() },
+  'project:rename':        { input: z.object({ id: z.string(), name: z.string() }), output: ProjectSchema },
   // `confirmed`: mismo mecanismo que `chat:setModel` (frontera local/nube, punto 4 del encargo) —
   // crear un chat nuevo directamente con un modelRef NUBE es otra forma de "elegir un modelo NUBE
   // para un chat", así que pasa por la misma confirmación explícita la primera vez por proyecto.
@@ -79,7 +89,18 @@ export const ipc = {
   // `providers.cloudConsent`) para no volver a preguntar. Sin efecto para modelos `local`.
   'chat:setModel':         { input: z.object({ chatId: z.string(), modelRef: ModelRefSchema, confirmed: z.boolean().optional() }), output: ChatSchema },
   'chat:setMode':          { input: z.object({ chatId: z.string(), mode: Mode }), output: ChatSchema },
-  'run:start':             { input: z.object({ chatId: z.string(), text: z.string(), mode: Mode }), output: z.object({ runId: z.string() }) },
+  // Feedback real v0.2.1, punto 1a/1b: preset de permisos y effort por chat. `unrestricted` exige
+  // `confirmed: true` explícito (doc del encargo: "requiere confirmación explícita al activarlo") —
+  // sin eso el handler devuelve error accionable en vez de aplicarlo en silencio.
+  'chat:setPermissionPreset': { input: z.object({ chatId: z.string(), preset: ChatPermissionPreset, confirmed: z.boolean().optional() }), output: ChatSchema },
+  'chat:setEffort':        { input: z.object({ chatId: z.string(), effort: Effort }), output: ChatSchema },
+  // Feedback real v0.2.1, punto 12: renombrar/archivar/borrar un chat (la UI de renderer va a dibujar
+  // la lista anidada proyecto -> chats con estas acciones).
+  'chat:rename':           { input: z.object({ chatId: z.string(), title: z.string() }), output: ChatSchema },
+  'chat:archive':          { input: z.object({ chatId: z.string(), archived: z.boolean() }), output: ChatSchema },
+  'chat:delete':           { input: z.object({ chatId: z.string() }), output: z.void() },
+  // Feedback real v0.2.1, punto 1c: adjuntos de archivo/imagen junto con el mensaje del usuario.
+  'run:start':             { input: z.object({ chatId: z.string(), text: z.string(), mode: Mode, attachments: z.array(AttachmentSchema).optional() }), output: z.object({ runId: z.string() }) },
   'run:cancel':            { input: z.object({ runId: z.string() }), output: z.void() },
   'run:continue':          { input: z.object({ runId: z.string(), extraIterations: z.number().optional() }), output: z.object({ runId: z.string() }) },
   'permission:answer':     { input: PermissionAnswerSchema, output: z.void() },

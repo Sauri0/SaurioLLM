@@ -101,16 +101,29 @@ export const DEFAULT_SYSTEM_PROMPT = [
   // las coincidencias numeradas cuando falla por ambigüedad (packages/runtime/src/tools/matching.ts);
   // esta oración le dice al modelo qué hacer con esa información en vez de reintentar igual.
   'Si `edit_file` falla porque `old_string` es ambiguo (matchea más de una vez), no repitas la misma llamada: mirá las coincidencias numeradas que te devuelve el error y agregá más líneas de contexto (antes y/o después) al `old_string`, o usá `replace_all: true` si de verdad querés reemplazar todas las ocurrencias.',
+  // Feedback real v0.2.1 (usuario, modo Agente, qwen3.5:4b): "a 'Hola' el run hizo 8+ turnos... llamó
+  // list_files varias veces y respondió DOS veces". Parte del arreglo es de runtime (RunController ya
+  // no nudgea: una respuesta de texto sin tool calls cierra el run — ver RunController.handleToolCalls);
+  // esta oración ataca la otra mitad, que el modelo ni siquiera intente usar tools cuando no hace falta.
+  'Si el usuario solo está conversando (saludo, agradecimiento, pregunta general que no requiere mirar el proyecto), respondé directamente con texto, SIN llamar a ninguna tool. Usá tools únicamente cuando de verdad necesites leer, buscar, modificar algo del proyecto o ejecutar un comando.',
+  // Punto 3 del encargo ("preferir tools de archivos antes que comandos"): un modelo chico tiende a
+  // resolver todo con run_command (ej. `cat`/`Get-Content`, `mkdir`) en vez de las tools dedicadas,
+  // que ya validan permisos/paths/checkpoints de forma más segura y sin depender de la sintaxis del
+  // shell real de esta PC.
+  'Para leer, crear, editar o borrar archivos y carpetas, preferí siempre las tools dedicadas (`read_file`, `write_file`, `edit_file`, `delete_file`, `make_dir`, `list_files`) en vez de `run_command`. Usá `run_command` solo para lo que esas tools no cubren (instalar dependencias, correr tests, git, scripts).',
+  'Reportá solo lo que verificaste con una tool en este run: si no leíste o ejecutaste algo, no afirmes que existe, que funciona o que se hizo.',
 ].join('\n');
 
 export function hashSystemPrompt(prompt: string): string {
   return createHash('sha256').update(prompt, 'utf8').digest('hex');
 }
 
-/** Las 10 builtins del MVP (doc 04 §4 BuiltinToolName). */
+/** Las builtins del MVP (doc 04 §4 BuiltinToolName) + `make_dir` (punto 4 del encargo, feedback
+ *  real v0.2.1: "creá 5 carpetas" terminó en `mkdir -p` por run_command, sintaxis inválida en
+ *  PowerShell). */
 export const DEFAULT_ALLOWED_TOOLS = [
   'list_files', 'search_code', 'read_file', 'read_output', 'edit_file',
-  'write_file', 'delete_file', 'run_command', 'task_update', 'finish',
+  'write_file', 'make_dir', 'delete_file', 'run_command', 'task_update', 'finish',
 ];
 
 /** Agente builtin que usa el MVP cuando el usuario todavía no creó ninguno (doc 03 §4.1,

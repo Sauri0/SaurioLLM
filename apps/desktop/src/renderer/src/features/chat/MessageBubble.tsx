@@ -1,6 +1,7 @@
-// Mensaje de chat con streaming (content y thinking colapsable) — doc 01 §4.1
-// — apps/desktop/src/renderer/src/features/chat/MessageBubble.tsx.
-import { useState } from 'react';
+// Mensaje de chat, con streaming — doc 01 §4.1. Rediseño del chat: el `thinking` de un mensaje ya
+// NO se muestra acá — vive dentro del bloque "Actividad" de su turno (ActivityBlock.tsx), agrupado
+// con los tool calls en vez de como un `<details>` suelto debajo de cada burbuja.
+// apps/desktop/src/renderer/src/features/chat/MessageBubble.tsx.
 import ReactMarkdown from 'react-markdown';
 import type { ChatMessage, Locality, ResponseMetrics } from '@saurio/shared';
 import { MessageMetrics } from './MessageMetrics.js';
@@ -25,7 +26,6 @@ export interface MessageBubbleProps {
 }
 
 export function MessageBubble({ message, metrics, streaming, currentModelLocality }: MessageBubbleProps): React.JSX.Element {
-  const [thinkingOpen, setThinkingOpen] = useState(false);
   // `message.modelRef` (dato histórico real, migración 0003) tiene prioridad sobre el modelo VIGENTE
   // del chat — solo cae a este último para mensajes de antes de esa migración (sin `modelRef`).
   const effectiveLocality = message.modelRef?.locality ?? currentModelLocality;
@@ -44,13 +44,6 @@ export function MessageBubble({ message, metrics, streaming, currentModelLocalit
           </span>
         )}
       </div>
-
-      {message.thinking && (
-        <details className="message-bubble__thinking" open={thinkingOpen} onToggle={(e) => setThinkingOpen(e.currentTarget.open)}>
-          <summary>Razonamiento{streaming ? ' (en curso)' : ''}</summary>
-          <pre>{message.thinking}</pre>
-        </details>
-      )}
 
       <div className="message-bubble__content">
         {streaming ? (
